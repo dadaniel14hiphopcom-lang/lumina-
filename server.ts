@@ -6,13 +6,12 @@ import path from 'node:path';
 import dotenv from 'dotenv';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
-import { createServer as createViteServer } from 'vite';
 import { createZipBuffer } from './server/zip.ts';
 import type { ZipEntryInput } from './server/zip.ts';
 
 dotenv.config();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const ROOT_DIR = path.resolve(process.cwd());
 const ADMIN_AUTH_FILE = path.join(ROOT_DIR, '.lumina-admin-auth.json');
 const ADMIN_STATE_FILE = path.join(ROOT_DIR, '.lumina-admin-state.json');
@@ -330,6 +329,9 @@ function collectAllowlistedProjectFiles(): ZipEntryInput[] {
     'tsconfig.json',
     'vite.config.ts',
     '.env.example',
+    '.gitignore',
+    '.nvmrc',
+    '.node-version',
     'server.ts',
   ];
 
@@ -906,6 +908,7 @@ Este pacote dá controle total da infraestrutura ao administrador:
       res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
