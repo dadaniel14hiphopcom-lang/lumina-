@@ -161,6 +161,7 @@ export function MessagesView() {
     setSelectedPostId,
     openProfile,
     showToast,
+    siteMeta,
   } = useSocial();
 
   const [selectedRecipientId, setSelectedRecipientId] = useState<string | null>(
@@ -365,6 +366,15 @@ export function MessagesView() {
     e.target.value = '';
     setVideoMenuOpen(false);
     if (!file || !selectedRecipientId) return;
+
+    const maxBytes = siteMeta.videoRules.maxVideoSizeMB * 1024 * 1024;
+    if (file.size > maxBytes) {
+      const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+      showToast(
+        `Vídeo (${sizeMb} MB) excede o limite de ${siteMeta.videoRules.maxVideoSizeMB} MB configurado no painel admin.`
+      );
+      return;
+    }
 
     const videoUrl =
       file.size <= 2_500_000 ? await readBlobAsDataUrl(file) : URL.createObjectURL(file);

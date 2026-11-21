@@ -10,6 +10,7 @@ import {
 import { useMemo, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { PostCategory } from '../types';
+import { isVideoAsset } from '../utils/media';
 import { formatCompactCount } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -211,11 +212,21 @@ export function ExploreView() {
                   isFeatured ? 'row-span-2' : ''
                 }`}
               >
-                <MediaImage
-                  src={post.media[0]?.url}
-                  alt={post.media[0]?.alt || post.caption}
-                  className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-                />
+                {isVideoAsset(post.media[0]) ? (
+                  <video
+                    src={post.media[0]?.url}
+                    muted
+                    playsInline
+                    preload="metadata"
+                    className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                  />
+                ) : (
+                  <MediaImage
+                    src={post.media[0]?.url}
+                    alt={post.media[0]?.alt || post.caption}
+                    className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                  />
+                )}
 
                 {/* Type indicator */}
                 {(post.isReel || post.media.length > 1) && (

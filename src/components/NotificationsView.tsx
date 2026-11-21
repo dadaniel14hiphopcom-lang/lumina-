@@ -74,7 +74,8 @@ export function NotificationsView() {
                       {item.type === 'comment' &&
                         `comentou: "${item.text || ''}"`}
                       {item.type === 'follow' && 'começou a seguir você.'}
-                      {item.type === 'mention' && 'mencionou você.'}
+                      {item.type === 'mention' &&
+                        (item.text ? `enviou mensagem: "${item.text}"` : 'mencionou você.')}
                     </span>{' '}
                     <span className="text-xs text-zinc-400">
                       · {formatRelativeTime(item.createdAt)}

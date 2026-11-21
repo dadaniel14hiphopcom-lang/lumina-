@@ -5,6 +5,7 @@ import {
   Ban,
   CheckCircle2,
   Cloud,
+  Copy,
   Database,
   Download,
   FileCode2,
@@ -12,20 +13,27 @@ import {
   KeyRound,
   Lock,
   LogOut,
+  Mail,
   RefreshCw,
   Search,
+  Send,
   Server,
   Shield,
+  Trash2,
   TrendingUp,
   Upload,
+  UserPlus,
+  Users,
+  Video,
 } from 'lucide-react';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useSocial } from '../context/SocialContext';
+import { DEFAULT_VIDEO_RULES, encodeInviteMeta, useSocial } from '../context/SocialContext';
+import { InviteRecord, VideoRulesConfig } from '../types';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { buildWordPressKitEntries, createBrowserZipBlob } from '../utils/zipClient';
 import { AvatarRing } from './AvatarRing';
 
-type AdminTab = 'users' | 'integrations' | 'updates' | 'wordpress';
+type AdminTab = 'users' | 'invites' | 'integrations' | 'updates' | 'wordpress';
 
 interface ServerOverview {
   state: {
@@ -68,6 +76,8 @@ interface ServerOverview {
       channel: 'stable' | 'beta';
       announcementBanner: string;
       maintenanceMode: boolean;
+      realUsersOnly: boolean;
+      videoRules: VideoRulesConfig;
       updateHistory: {
         id: string;
         version: string;
@@ -76,6 +86,7 @@ interface ServerOverview {
         appliedAt: number;
       }[];
     };
+    invites?: InviteRecord[];
   };
   envStatus: {
     awsCredentialsConfigured: boolean;
@@ -164,6 +175,8 @@ const DEFAULT_LOCAL_STATE: ServerOverview['state'] = {
     channel: 'stable',
     announcementBanner: '',
     maintenanceMode: false,
+    realUsersOnly: false,
+    videoRules: DEFAULT_VIDEO_RULES,
     updateHistory: [
       {
         id: 'upd_init',
@@ -189,7 +202,15 @@ function loadLocalAdminState(): ServerOverview['state'] {
         aws: { ...DEFAULT_LOCAL_STATE.aws, ...(parsed.aws || {}) },
         supabase: { ...DEFAULT_LOCAL_STATE.supabase, ...(parsed.supabase || {}) },
         wordpress: { ...DEFAULT_LOCAL_STATE.wordpress, ...(parsed.wordpress || {}) },
-        site: { ...DEFAULT_LOCAL_STATE.site, ...(parsed.site || {}) },
+        site: {
+          ...DEFAULT_LOCAL_STATE.site,
+          ...(parsed.site || {}),
+          realUsersOnly: Boolean(parsed.site?.realUsersOnly),
+          videoRules: {
+            ...DEFAULT_VIDEO_RULES,
+            ...(parsed.site?.videoRules || {}),
+          },
+        },
       };
     }
   } catch {
@@ -232,8 +253,8 @@ function generateHexSalt(): string {
 
 export function AdminPanelView() {
   const {
-    users,
-    posts,
+    allUsers,
+    allPosts,
     currentUser,
     toggleRestrictUser,
     toggleBoostUser,
@@ -241,6 +262,11 @@ export function AdminPanelView() {
     openProfile,
     showToast,
     setSiteMeta,
+    invites,
+    setInvites,
+    createInvite,
+    revokeInvite,
+    purgeDemoUsers,
   } = useSocial();
 
   // Auth held strictly in React memory (never localStorage)
@@ -266,6 +292,13 @@ export function AdminPanelView() {
   const [userFilter, setUserFilter] = useState<
     'all' | 'verified' | 'boosted' | 'restricted'
   >('all');
+
+  // Invites tab state
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteName, setInviteName] = useState('');
+  const [inviteDays, setInviteDays] = useState(7);
+  const [inviteVerified, setInviteVerified] = useState(false);
+  const [sendingInvite, setSendingInvite] = useState(false);
 
   // Integrations test feedback
   const [awsTestStatus, setAwsTestStatus] = useState<string | null>(null);
@@ -346,6 +379,16 @@ export function AdminPanelView() {
     return res;
   };
 
+  const syncMetaFromSiteState = (site: ServerOverview['state']['site']) => {
+    setSiteMeta({
+      version: site.version,
+      announcementBanner: site.announcementBanner,
+      maintenanceMode: site.maintenanceMode,
+      realUsersOnly: Boolean(site.realUsersOnly),
+      videoRules: site.videoRules || DEFAULT_VIDEO_RULES,
+    });
+  };
+
   const loadLocalOverview = () => {
     const localState = loadLocalAdminState();
     setOverview({
@@ -358,11 +401,7 @@ export function AdminPanelView() {
         wordpressEnv: false,
       },
     });
-    setSiteMeta({
-      version: localState.site.version,
-      announcementBanner: localState.site.announcementBanner,
-      maintenanceMode: localState.site.maintenanceMode,
-    });
+    syncMetaFromSiteState(localState.site);
   };
 
   const loadOverview = async (tokenOverride?: string, serverMode = authStatus.serverAvailable) => {
@@ -380,11 +419,10 @@ export function AdminPanelView() {
       if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
         const data = (await res.json()) as ServerOverview;
         setOverview(data);
-        setSiteMeta({
-          version: data.state.site.version,
-          announcementBanner: data.state.site.announcementBanner,
-          maintenanceMode: data.state.site.maintenanceMode,
-        });
+        if (Array.isArray(data.state.invites)) {
+          setInvites(data.state.invites);
+        }
+        syncMetaFromSiteState(data.state.site);
       }
     } finally {
       setLoadingOverview(false);
@@ -474,7 +512,7 @@ export function AdminPanelView() {
 
   const filteredUsers = useMemo(() => {
     const q = userSearch.trim().toLowerCase();
-    return users.filter((u) => {
+    return allUsers.filter((u) => {
       if (userFilter === 'verified' && !u.verified) return false;
       if (userFilter === 'boosted' && !u.boosted) return false;
       if (userFilter === 'restricted' && !u.restricted) return false;
@@ -484,17 +522,136 @@ export function AdminPanelView() {
         u.displayName.toLowerCase().includes(q)
       );
     });
-  }, [users, userSearch, userFilter]);
+  }, [allUsers, userSearch, userFilter]);
 
   const userStats = useMemo(
     () => ({
-      total: users.length,
-      verified: users.filter((u) => u.verified).length,
-      boosted: users.filter((u) => u.boosted).length,
-      restricted: users.filter((u) => u.restricted).length,
+      total: allUsers.length,
+      verified: allUsers.filter((u) => u.verified).length,
+      boosted: allUsers.filter((u) => u.boosted).length,
+      restricted: allUsers.filter((u) => u.restricted).length,
     }),
-    [users]
+    [allUsers]
   );
+
+  const persistSiteRulesAndFlags = async (nextSitePatch: Partial<ServerOverview['state']['site']>) => {
+    if (!overview?.state) return;
+    const mergedSite: ServerOverview['state']['site'] = {
+      ...overview.state.site,
+      ...nextSitePatch,
+      announcementBanner: (
+        nextSitePatch.announcementBanner ?? overview.state.site.announcementBanner
+      ).slice(0, 220),
+      videoRules: {
+        ...overview.state.site.videoRules,
+        ...(nextSitePatch.videoRules || {}),
+      },
+    };
+    const nextState: ServerOverview['state'] = {
+      ...overview.state,
+      site: mergedSite,
+    };
+
+    saveLocalAdminState(nextState);
+    setOverview((prev) => (prev ? { ...prev, state: nextState } : prev));
+    syncMetaFromSiteState(mergedSite);
+
+    if (!authStatus.serverAvailable) {
+      showToast('Regras e configurações aplicadas');
+      return;
+    }
+
+    const res = await authFetch('/api/admin/updates/site-flags', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        announcementBanner: mergedSite.announcementBanner,
+        maintenanceMode: mergedSite.maintenanceMode,
+        realUsersOnly: mergedSite.realUsersOnly,
+        videoRules: mergedSite.videoRules,
+      }),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as {
+        site: ServerOverview['state']['site'];
+      };
+      setOverview((prev) =>
+        prev ? { ...prev, state: { ...prev.state, site: data.site } } : prev
+      );
+      syncMetaFromSiteState(data.site);
+      showToast('Regras e controles salvos no servidor');
+    } else {
+      showToast('Regras aplicadas localmente');
+    }
+  };
+
+  const buildInviteShareUrl = (inv: InviteRecord) => {
+    const metaToken = encodeInviteMeta({
+      code: inv.code,
+      email: inv.email,
+      invitedName: inv.invitedName,
+      grantVerified: inv.grantVerified,
+      expiresAt: inv.expiresAt,
+    });
+    const base = typeof window !== 'undefined' ? window.location.origin : '';
+    return `${base}/?invite=${encodeURIComponent(inv.code)}&meta=${encodeURIComponent(metaToken)}`;
+  };
+
+  const handleCreateInvite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanEmail = inviteEmail.trim().toLowerCase();
+    if (!cleanEmail.includes('@')) {
+      showToast('Informe um e-mail válido para enviar o convite');
+      return;
+    }
+
+    setSendingInvite(true);
+    try {
+      if (authStatus.serverAvailable) {
+        const res = await authFetch('/api/admin/invites', {
+          method: 'POST',
+          body: JSON.stringify({
+            email: cleanEmail,
+            invitedName: inviteName.trim(),
+            grantVerified: inviteVerified,
+            expiresInDays: inviteDays,
+          }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { invite?: InviteRecord };
+          if (data.invite) {
+            setInvites((prev) => [data.invite!, ...prev.filter((i) => i.id !== data.invite!.id)]);
+            setInviteEmail('');
+            setInviteName('');
+            setInviteVerified(false);
+            showToast(`Convite ${data.invite.code} gerado para ${cleanEmail}`);
+            return;
+          }
+        }
+      }
+
+      const created = createInvite({
+        email: cleanEmail,
+        invitedName: inviteName.trim(),
+        grantVerified: inviteVerified,
+        expiresInDays: inviteDays,
+      });
+      setInviteEmail('');
+      setInviteName('');
+      setInviteVerified(false);
+      showToast(`Convite ${created.code} criado e pronto para envio`);
+    } finally {
+      setSendingInvite(false);
+    }
+  };
+
+  const handleRevokeInvite = async (inviteId: string) => {
+    if (authStatus.serverAvailable) {
+      await authFetch(`/api/admin/invites/${inviteId}/revoke`, {
+        method: 'PATCH',
+      }).catch(() => {});
+    }
+    revokeInvite(inviteId);
+  };
 
   const saveIntegrations = async (
     patch: Partial<Pick<ServerOverview['state'], 'aws' | 'supabase' | 'wordpress'>>
@@ -725,11 +882,7 @@ export function AdminPanelView() {
       };
       const nextState = { ...prev.state, site: nextSite };
       saveLocalAdminState(nextState);
-      setSiteMeta({
-        version: nextSite.version,
-        announcementBanner: nextSite.announcementBanner,
-        maintenanceMode: nextSite.maintenanceMode,
-      });
+      syncMetaFromSiteState(nextSite);
       setUpdateCheck((uc) =>
         uc ? { ...uc, currentVersion: nextSite.version, hasUpdate: false } : uc
       );
@@ -772,11 +925,7 @@ export function AdminPanelView() {
         setOverview((prev) =>
           prev ? { ...prev, state: { ...prev.state, site: data.site } } : prev
         );
-        setSiteMeta({
-          version: data.site.version,
-          announcementBanner: data.site.announcementBanner,
-          maintenanceMode: data.site.maintenanceMode,
-        });
+        syncMetaFromSiteState(data.site);
         setUpdateCheck((prev) =>
           prev ? { ...prev, currentVersion: data.site.version, hasUpdate: false } : prev
         );
@@ -817,11 +966,7 @@ export function AdminPanelView() {
       setOverview((prev) =>
         prev ? { ...prev, state: { ...prev.state, site: data.site! } } : prev
       );
-      setSiteMeta({
-        version: data.site.version,
-        announcementBanner: data.site.announcementBanner,
-        maintenanceMode: data.site.maintenanceMode,
-      });
+      syncMetaFromSiteState(data.site);
       showToast(`Pacote v${data.site.version} instalado com sucesso`);
     } catch {
       showToast('Envie um arquivo de atualização .json válido');
@@ -896,9 +1041,9 @@ create policy "Publicações de contas ativas"
     const siteUrl = overview?.state.wordpress.siteUrl || 'https://meudominio.com.br';
     const title = overview?.state.wordpress.siteTitle || 'Lumina Editorial WP';
 
-    const itemsXml = posts
+    const itemsXml = allPosts
       .map((post) => {
-        const author = users.find((u) => u.id === post.authorId);
+        const author = allUsers.find((u) => u.id === post.authorId);
         const pubDate = new Date(post.createdAt).toUTCString();
         const imgTag = post.media[0]?.url
           ? `<p><img src="${escapeXml(post.media[0].url)}" alt="${escapeXml(post.caption.slice(0, 60))}" /></p>`
@@ -1086,6 +1231,7 @@ ${itemsXml}
       >
         {[
           { id: 'users' as const, label: 'Usuários', icon: Shield },
+          { id: 'invites' as const, label: 'Convites & Regras', icon: UserPlus },
           { id: 'integrations' as const, label: 'AWS & Supabase', icon: Database },
           { id: 'updates' as const, label: 'Atualizações do Site', icon: ArrowDownToLine },
           { id: 'wordpress' as const, label: 'WordPress Auto-Hospedado', icon: Server },
@@ -1186,7 +1332,7 @@ ${itemsXml}
                 </thead>
                 <tbody className="divide-y divide-zinc-100 dark:divide-zinc-900">
                   {filteredUsers.map((user) => {
-                    const userPostsCount = posts.filter((p) => p.authorId === user.id).length;
+                    const userPostsCount = allPosts.filter((p) => p.authorId === user.id).length;
                     const statusParts: string[] = [];
                     statusParts.push(user.restricted ? 'Restrito' : 'Ativo');
                     if (user.verified) statusParts.push('Selo verificado');
@@ -1296,6 +1442,378 @@ ${itemsXml}
                 </tbody>
               </table>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 1B: INVITES, VIDEO RULES & REAL USERS TARGETING */}
+      {activeTab === 'invites' && state && (
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+          {/* Left 2 Columns: Send Invites & History */}
+          <div className="space-y-6 lg:col-span-2">
+            {/* Create & Send Invite Card */}
+            <section className="space-y-4 rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
+              <div className="flex items-center gap-3 border-b border-zinc-100 pb-4 dark:border-zinc-900">
+                <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 text-sky-600 dark:text-sky-400">
+                  <UserPlus className="h-5 w-5" />
+                </span>
+                <div>
+                  <h2 className="text-base font-bold text-zinc-950 dark:text-white">
+                    Enviar Convites para Novos Usuários
+                  </h2>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                    Gere links exclusivos de cadastro com código e e-mail pré-preenchidos para novos membros reais.
+                  </p>
+                </div>
+              </div>
+
+              <form onSubmit={handleCreateInvite} className="space-y-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  <label className="block space-y-1 sm:col-span-2">
+                    <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                      E-mail do convidado
+                    </span>
+                    <input
+                      type="email"
+                      required
+                      value={inviteEmail}
+                      onChange={(e) => setInviteEmail(e.target.value)}
+                      placeholder="novo.membro@dominio.com.br"
+                      className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                    />
+                  </label>
+
+                  <label className="block space-y-1">
+                    <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                      Validade (dias)
+                    </span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={90}
+                      value={inviteDays}
+                      onChange={(e) => setInviteDays(Math.max(1, Number(e.target.value) || 7))}
+                      className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 tabular-nums dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                    />
+                  </label>
+                </div>
+
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <label className="block space-y-1">
+                    <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                      Nome sugerido (opcional)
+                    </span>
+                    <input
+                      type="text"
+                      value={inviteName}
+                      onChange={(e) => setInviteName(e.target.value)}
+                      placeholder="Ex: Juliana Martins"
+                      className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                    />
+                  </label>
+
+                  <label className="flex cursor-pointer items-center justify-between self-end rounded-xl border border-zinc-200 px-3 py-2.5 text-xs font-medium text-zinc-800 dark:border-zinc-800 dark:text-zinc-200">
+                    <span>Conceder selo verificado ao cadastrar</span>
+                    <input
+                      type="checkbox"
+                      checked={inviteVerified}
+                      onChange={(e) => setInviteVerified(e.target.checked)}
+                      className="h-4 w-4 accent-sky-600"
+                    />
+                  </label>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={sendingInvite || !inviteEmail.trim()}
+                  className="inline-flex h-10 items-center gap-2 rounded-xl bg-sky-600 px-5 text-xs font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
+                >
+                  <Send className="h-3.5 w-3.5" />
+                  <span>{sendingInvite ? 'Gerando convite...' : 'Gerar convite de cadastro'}</span>
+                </button>
+              </form>
+            </section>
+
+            {/* Invites List */}
+            <section className="rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
+              <div className="mb-4 flex items-center justify-between">
+                <h3 className="text-sm font-bold text-zinc-950 dark:text-white">
+                  Convites Emitidos ({invites.length})
+                </h3>
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                  Link funciona mesmo em hospedagem estática
+                </span>
+              </div>
+
+              {invites.length === 0 ? (
+                <p className="py-6 text-center text-xs text-zinc-500 dark:text-zinc-400">
+                  Nenhum convite gerado ainda. Preencha o e-mail acima para convidar um usuário real.
+                </p>
+              ) : (
+                <div className="divide-y divide-zinc-100 dark:divide-zinc-900">
+                  {invites.map((inv) => {
+                    const shareUrl = buildInviteShareUrl(inv);
+                    const expired = inv.status === 'pending' && Date.now() > inv.expiresAt;
+                    const statusText =
+                      inv.status === 'accepted'
+                        ? 'Cadastrado'
+                        : inv.status === 'revoked'
+                        ? 'Revogado'
+                        : expired
+                        ? 'Expirado'
+                        : 'Pendente';
+                    const mailSubject = encodeURIComponent('Convite para participar da Lumina');
+                    const mailBody = encodeURIComponent(
+                      `Olá${inv.invitedName ? ` ${inv.invitedName}` : ''}!\n\nVocê recebeu um convite para criar sua conta na Lumina.\n\nCódigo: ${inv.code}\nAcesse pelo link direto:\n${shareUrl}\n`
+                    );
+
+                    return (
+                      <div
+                        key={inv.id}
+                        className="flex flex-wrap items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
+                      >
+                        <div className="min-w-0 space-y-0.5">
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-xs font-bold text-zinc-950 dark:text-white">
+                              {inv.code}
+                            </span>
+                            <span
+                              className={`text-[11px] font-semibold ${
+                                inv.status === 'accepted'
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : inv.status === 'revoked' || expired
+                                  ? 'text-rose-600 dark:text-rose-400'
+                                  : 'text-sky-600 dark:text-sky-400'
+                              }`}
+                            >
+                              {statusText}
+                            </span>
+                            {inv.grantVerified && (
+                              <BadgeCheck className="h-3.5 w-3.5 text-sky-500" />
+                            )}
+                          </div>
+                          <p className="truncate text-xs text-zinc-600 dark:text-zinc-300">
+                            {inv.email}
+                            {inv.invitedName ? ` · ${inv.invitedName}` : ''}
+                          </p>
+                        </div>
+
+                        {inv.status === 'pending' && !expired && (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                navigator.clipboard?.writeText(shareUrl).catch(() => {});
+                                showToast(`Link do convite ${inv.code} copiado`);
+                              }}
+                              className="inline-flex h-8 items-center gap-1 rounded-lg border border-zinc-200 px-2.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                            >
+                              <Copy className="h-3.5 w-3.5" />
+                              <span>Copiar link</span>
+                            </button>
+                            <a
+                              href={`mailto:${inv.email}?subject=${mailSubject}&body=${mailBody}`}
+                              className="inline-flex h-8 items-center gap-1 rounded-lg bg-zinc-950 px-2.5 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
+                            >
+                              <Mail className="h-3.5 w-3.5" />
+                              <span>Enviar e-mail</span>
+                            </a>
+                            <button
+                              type="button"
+                              onClick={() => handleRevokeInvite(inv.id)}
+                              className="inline-flex h-8 items-center gap-1 rounded-lg border border-rose-200 px-2.5 text-xs font-semibold text-rose-600 hover:bg-rose-50 dark:border-rose-900/40 dark:text-rose-400 dark:hover:bg-rose-950/30"
+                            >
+                              <Ban className="h-3.5 w-3.5" />
+                              <span>Revogar</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          </div>
+
+          {/* Right Column: Video Rules & Real Users Targeting */}
+          <div className="space-y-6">
+            {/* Video Size & Duration Rules */}
+            <section className="space-y-4 rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
+              <div className="flex items-center gap-2.5 border-b border-zinc-100 pb-3 dark:border-zinc-900">
+                <Video className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                <h2 className="text-sm font-bold text-zinc-950 dark:text-white">
+                  Regras de Tamanho de Vídeo
+                </h2>
+              </div>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Tamanho máximo por vídeo (MB)
+                </span>
+                <input
+                  type="number"
+                  min={1}
+                  max={250}
+                  value={state.site.videoRules.maxVideoSizeMB}
+                  onChange={(e) =>
+                    setOverview((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            state: {
+                              ...prev.state,
+                              site: {
+                                ...prev.state.site,
+                                videoRules: {
+                                  ...prev.state.site.videoRules,
+                                  maxVideoSizeMB: Math.min(250, Math.max(1, Number(e.target.value) || 25)),
+                                },
+                              },
+                            },
+                          }
+                        : prev
+                    )
+                  }
+                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 tabular-nums dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                />
+              </label>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Duração máxima nos Reels (segundos)
+                </span>
+                <input
+                  type="number"
+                  min={5}
+                  max={300}
+                  value={state.site.videoRules.maxReelDurationSec}
+                  onChange={(e) =>
+                    setOverview((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            state: {
+                              ...prev.state,
+                              site: {
+                                ...prev.state.site,
+                                videoRules: {
+                                  ...prev.state.site.videoRules,
+                                  maxReelDurationSec: Math.min(
+                                    300,
+                                    Math.max(5, Number(e.target.value) || 60)
+                                  ),
+                                },
+                              },
+                            },
+                          }
+                        : prev
+                    )
+                  }
+                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 tabular-nums dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                />
+              </label>
+
+              <label className="flex cursor-pointer items-center justify-between rounded-xl border border-zinc-200 px-3 py-2.5 text-xs font-medium text-zinc-800 dark:border-zinc-800 dark:text-zinc-200">
+                <span>Permitir vídeos curtos nos Reels</span>
+                <input
+                  type="checkbox"
+                  checked={state.site.videoRules.allowVideoReels}
+                  onChange={(e) =>
+                    setOverview((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            state: {
+                              ...prev.state,
+                              site: {
+                                ...prev.state.site,
+                                videoRules: {
+                                  ...prev.state.site.videoRules,
+                                  allowVideoReels: e.target.checked,
+                                },
+                              },
+                            },
+                          }
+                        : prev
+                    )
+                  }
+                  className="h-4 w-4 accent-sky-600"
+                />
+              </label>
+
+              <button
+                type="button"
+                onClick={() =>
+                  persistSiteRulesAndFlags({ videoRules: state.site.videoRules })
+                }
+                className="h-10 w-full rounded-xl bg-zinc-950 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
+              >
+                Salvar regras de vídeo
+              </button>
+            </section>
+
+            {/* Real Users Only Targeting */}
+            <section className="space-y-4 rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
+              <div className="flex items-center gap-2.5 border-b border-zinc-100 pb-3 dark:border-zinc-900">
+                <Users className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                <h2 className="text-sm font-bold text-zinc-950 dark:text-white">
+                  Apontamento para Usuários Reais
+                </h2>
+              </div>
+
+              <p className="rounded-xl border border-emerald-500/25 bg-emerald-50 px-3 py-2.5 text-xs text-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300">
+                Respostas automáticas no chat foram desativadas permanentemente. Todas as mensagens agora ocorrem somente entre contas reais (com sincronização entre sessões/abas).
+              </p>
+
+              <label className="flex cursor-pointer items-center justify-between rounded-xl border border-zinc-200 px-3 py-2.5 text-xs font-medium text-zinc-800 dark:border-zinc-800 dark:text-zinc-200">
+                <span>Ocultar perfis fictícios de demonstração</span>
+                <input
+                  type="checkbox"
+                  checked={state.site.realUsersOnly}
+                  onChange={(e) =>
+                    setOverview((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            state: {
+                              ...prev.state,
+                              site: {
+                                ...prev.state.site,
+                                realUsersOnly: e.target.checked,
+                              },
+                            },
+                          }
+                        : prev
+                    )
+                  }
+                  className="h-4 w-4 accent-emerald-600"
+                />
+              </label>
+
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    persistSiteRulesAndFlags({ realUsersOnly: state.site.realUsersOnly })
+                  }
+                  className="h-10 w-full rounded-xl bg-zinc-950 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
+                >
+                  Aplicar apontamento
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    purgeDemoUsers();
+                    await persistSiteRulesAndFlags({ realUsersOnly: true });
+                  }}
+                  className="inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-rose-200 text-xs font-semibold text-rose-600 hover:bg-rose-50 dark:border-rose-900/40 dark:text-rose-400 dark:hover:bg-rose-950/30"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>Limpar perfis fictícios permanentemente</span>
+                </button>
+              </div>
+            </section>
           </div>
         </div>
       )}
@@ -1879,43 +2397,12 @@ ${itemsXml}
 
               <button
                 type="button"
-                onClick={async () => {
-                  if (!authStatus.serverAvailable) {
-                    const nextState: ServerOverview['state'] = {
-                      ...state,
-                      site: {
-                        ...state.site,
-                        announcementBanner: state.site.announcementBanner.slice(0, 220),
-                      },
-                    };
-                    saveLocalAdminState(nextState);
-                    setSiteMeta({
-                      version: nextState.site.version,
-                      announcementBanner: nextState.site.announcementBanner,
-                      maintenanceMode: nextState.site.maintenanceMode,
-                    });
-                    showToast('Controles do site atualizados');
-                    return;
-                  }
-                  const res = await authFetch('/api/admin/updates/site-flags', {
-                    method: 'PATCH',
-                    body: JSON.stringify({
-                      announcementBanner: state.site.announcementBanner,
-                      maintenanceMode: state.site.maintenanceMode,
-                    }),
-                  });
-                  if (res.ok) {
-                    const data = (await res.json()) as {
-                      site: ServerOverview['state']['site'];
-                    };
-                    setSiteMeta({
-                      version: data.site.version,
-                      announcementBanner: data.site.announcementBanner,
-                      maintenanceMode: data.site.maintenanceMode,
-                    });
-                    showToast('Controles do site atualizados');
-                  }
-                }}
+                onClick={() =>
+                  persistSiteRulesAndFlags({
+                    announcementBanner: state.site.announcementBanner,
+                    maintenanceMode: state.site.maintenanceMode,
+                  })
+                }
                 className="h-10 w-full rounded-xl bg-zinc-950 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
               >
                 Aplicar no site

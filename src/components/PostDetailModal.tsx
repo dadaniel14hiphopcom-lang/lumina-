@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import React, { useEffect, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
+import { isVideoAsset } from '../utils/media';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -91,11 +92,23 @@ export function PostDetailModal() {
       >
         {/* Left: Media Viewer */}
         <div className="relative flex aspect-square w-full shrink-0 items-center justify-center bg-black md:aspect-auto md:h-full md:flex-1">
-          <MediaImage
-            src={post.media[slide]?.url}
-            alt={post.media[slide]?.alt || post.caption}
-            className="max-h-full w-full object-contain"
-          />
+          {isVideoAsset(post.media[slide]) ? (
+            <video
+              src={post.media[slide]?.url}
+              controls
+              autoPlay
+              playsInline
+              loop
+              className="max-h-full w-full object-contain"
+              style={{ filter: post.media[slide]?.filterCss || 'none' }}
+            />
+          ) : (
+            <MediaImage
+              src={post.media[slide]?.url}
+              alt={post.media[slide]?.alt || post.caption}
+              className="max-h-full w-full object-contain"
+            />
+          )}
 
           {post.media.length > 1 && (
             <>

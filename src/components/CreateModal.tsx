@@ -1,4 +1,5 @@
 import {
+  AlertCircle,
   Check,
   Film,
   ImagePlus,
@@ -6,10 +7,12 @@ import {
   MapPin,
   SlidersHorizontal,
   Sparkles,
+  Square,
   Upload,
+  Video,
   X,
 } from 'lucide-react';
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { STUDIO_SAMPLE_IMAGES } from '../data/seed';
 import { PostCategory, StudioAdjustments } from '../types';
@@ -25,6 +28,12 @@ interface CreateModalProps {
   initialMode?: 'post' | 'story' | 'reel';
 }
 
+interface DraftMediaItem {
+  url: string;
+  mediaType: 'image' | 'video';
+  durationSec?: number;
+}
+
 const CATEGORIES: PostCategory[] = [
   'Fotografia',
   'Arquitetura',
@@ -34,14 +43,37 @@ const CATEGORIES: PostCategory[] = [
   'Arte',
 ];
 
+function readBlobAsDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('Falha ao ler mídia'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function readVideoDuration(url: string): Promise<number> {
+  return new Promise((resolve) => {
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      const d = Number.isFinite(video.duration) ? video.duration : 0;
+      resolve(d);
+    };
+    video.onerror = () => resolve(0);
+    video.src = url;
+  });
+}
+
 export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
-  const { isCreateOpen, setIsCreateOpen, publishPost, publishStory, showToast } =
+  const { isCreateOpen, setIsCreateOpen, publishPost, publishStory, showToast, siteMeta } =
     useSocial();
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const videoInputRef = useRef<HTMLInputElement | null>(null);
   const [mode, setMode] = useState<'post' | 'story' | 'reel'>(initialMode);
   const [step, setStep] = useState<'pick' | 'edit' | 'details'>('pick');
-  const [sourceUrls, setSourceUrls] = useState<string[]>([]);
+  const [mediaItems, setMediaItems] = useState<DraftMediaItem[]>([]);
   const [activeIdx, setActiveIdx] = useState(0);
   const [aspectRatio, setAspectRatio] = useState<'1:1' | '4:5' | '16:9' | '9:16'>('4:5');
   const [adjustments, setAdjustments] = useState<StudioAdjustments>(DEFAULT_ADJUSTMENTS);
@@ -51,78 +83,287 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
   const [category, setCategory] = useState<PostCategory>('Fotografia');
   const [audioTrack, setAudioTrack] = useState('Luz Natural · Instrumental');
   const [isPublishing, setIsPublishing] = useState(false);
+  const [mediaError, setMediaError] = useState<string | null>(null);
+
+  // Short-video camera recorder for Reels
+  const [camOpen, setCamOpen] = useState(false);
+  const [camRecording, setCamRecording] = useState(false);
+  const [camSec, setCamSec] = useState(0);
+  const camVideoRef = useRef<HTMLVideoElement | null>(null);
+  const camStreamRef = useRef<MediaStream | null>(null);
+  const camRecorderRef = useRef<MediaRecorder | null>(null);
+  const camChunksRef = useRef<Blob[]>([]);
+  const camTimerRef = useRef<number | null>(null);
+
+  const stopCamera = () => {
+    if (camTimerRef.current) {
+      window.clearInterval(camTimerRef.current);
+      camTimerRef.current = null;
+    }
+    if (camRecorderRef.current && camRecorderRef.current.state !== 'inactive') {
+      camRecorderRef.current.onstop = null;
+      camRecorderRef.current.stop();
+    }
+    if (camStreamRef.current) {
+      camStreamRef.current.getTracks().forEach((t) => t.stop());
+      camStreamRef.current = null;
+    }
+    camRecorderRef.current = null;
+    setCamRecording(false);
+    setCamOpen(false);
+  };
+
+  useEffect(() => {
+    return () => stopCamera();
+  }, []);
 
   if (!isCreateOpen) return null;
 
+  const { maxVideoSizeMB, maxReelDurationSec, allowVideoReels } = siteMeta.videoRules;
+
   const resetAndClose = () => {
+    stopCamera();
     setStep('pick');
-    setSourceUrls([]);
+    setMediaItems([]);
     setActiveIdx(0);
     setAdjustments(DEFAULT_ADJUSTMENTS);
     setCaption('');
     setLocation('');
+    setMediaError(null);
     setIsCreateOpen(false);
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const validateAndLoadVideoFile = async (file: File) => {
+    setMediaError(null);
+    if (!allowVideoReels) {
+      const msg = 'Envio de vídeos nos Reels está desativado nas regras do painel admin.';
+      setMediaError(msg);
+      showToast(msg);
+      return;
+    }
+    const maxBytes = maxVideoSizeMB * 1024 * 1024;
+    if (file.size > maxBytes) {
+      const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+      const msg = `O vídeo tem ${sizeMb} MB e excede o limite de ${maxVideoSizeMB} MB definido no painel admin.`;
+      setMediaError(msg);
+      showToast(msg);
+      return;
+    }
+
+    const tempUrl = URL.createObjectURL(file);
+    const duration = await readVideoDuration(tempUrl);
+    if (duration > maxReelDurationSec + 0.5) {
+      URL.revokeObjectURL(tempUrl);
+      const msg = `O vídeo dura ${Math.ceil(duration)}s e excede o máximo permitido de ${maxReelDurationSec}s para Reels.`;
+      setMediaError(msg);
+      showToast(msg);
+      return;
+    }
+
+    let finalUrl = tempUrl;
+    if (file.size <= 3_500_000) {
+      try {
+        finalUrl = await readBlobAsDataUrl(file);
+        URL.revokeObjectURL(tempUrl);
+      } catch {
+        // Keep object URL fallback
+      }
+    }
+
+    setMediaItems([
+      {
+        url: finalUrl,
+        mediaType: 'video',
+        durationSec: duration > 0 ? Math.round(duration) : undefined,
+      },
+    ]);
+    setActiveIdx(0);
+    setAspectRatio('9:16');
+    setAudioTrack(`Áudio original · ${file.name.replace(/\.[^.]+$/, '')}`);
+    setStep('edit');
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    setMediaError(null);
     const files = Array.from(e.target.files || []).slice(0, 5);
+    e.target.value = '';
     if (files.length === 0) return;
 
-    Promise.all(
-      files.map(
-        (file) =>
-          new Promise<string>((resolve) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(String(reader.result || ''));
-            reader.readAsDataURL(file);
-          })
-      )
-    ).then((urls) => {
-      const valid = urls.filter(Boolean);
-      if (valid.length > 0) {
-        setSourceUrls(valid);
-        setActiveIdx(0);
-        if (mode === 'story' || mode === 'reel') setAspectRatio('9:16');
-        setStep('edit');
+    const firstVideo = files.find((f) => f.type.startsWith('video/'));
+    if (firstVideo) {
+      if (mode !== 'reel') {
+        setMediaError('Vídeos curtos devem ser publicados no modo Reel.');
+        showToast('Selecione o modo Reel para enviar vídeos curtos');
+        return;
       }
-    });
+      await validateAndLoadVideoFile(firstVideo);
+      return;
+    }
+
+    const urls = await Promise.all(
+      files.map((file) => readBlobAsDataUrl(file).catch(() => ''))
+    );
+    const valid = urls.filter(Boolean).map((url) => ({
+      url,
+      mediaType: 'image' as const,
+    }));
+    if (valid.length > 0) {
+      setMediaItems(valid);
+      setActiveIdx(0);
+      if (mode === 'story' || mode === 'reel') setAspectRatio('9:16');
+      setStep('edit');
+    }
+  };
+
+  const handleVideoFileOnly = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    await validateAndLoadVideoFile(file);
+  };
+
+  const openReelCamera = async () => {
+    setMediaError(null);
+    if (!allowVideoReels) {
+      const msg = 'Gravação de vídeo para Reels está desativada no painel admin.';
+      setMediaError(msg);
+      showToast(msg);
+      return;
+    }
+    try {
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+        throw new Error('Câmera indisponível');
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user' },
+        audio: true,
+      });
+      camStreamRef.current = stream;
+      setCamOpen(true);
+      setCamSec(0);
+      window.setTimeout(() => {
+        if (camVideoRef.current) {
+          camVideoRef.current.srcObject = stream;
+        }
+      }, 50);
+    } catch {
+      const msg = 'Não foi possível abrir a câmera. Envie um arquivo de vídeo curto do dispositivo.';
+      setMediaError(msg);
+      showToast(msg);
+    }
+  };
+
+  const startReelRecording = () => {
+    if (!camStreamRef.current) return;
+    camChunksRef.current = [];
+    const rec = new MediaRecorder(camStreamRef.current);
+    camRecorderRef.current = rec;
+    const startMs = Date.now();
+
+    rec.ondataavailable = (ev) => {
+      if (ev.data.size > 0) camChunksRef.current.push(ev.data);
+    };
+    rec.onstop = async () => {
+      const blob = new Blob(camChunksRef.current, { type: rec.mimeType || 'video/webm' });
+      const recordedSec = Math.max(1, Math.round((Date.now() - startMs) / 1000));
+      stopCamera();
+
+      if (blob.size > maxVideoSizeMB * 1024 * 1024) {
+        setMediaError(`Gravação excedeu o limite de ${maxVideoSizeMB} MB.`);
+        return;
+      }
+
+      const url =
+        blob.size <= 3_500_000
+          ? await readBlobAsDataUrl(blob)
+          : URL.createObjectURL(blob);
+
+      setMediaItems([
+        {
+          url,
+          mediaType: 'video',
+          durationSec: recordedSec,
+        },
+      ]);
+      setActiveIdx(0);
+      setAspectRatio('9:16');
+      setAudioTrack('Áudio original · Câmera');
+      setStep('edit');
+    };
+
+    rec.start();
+    setCamRecording(true);
+    setCamSec(0);
+
+    camTimerRef.current = window.setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startMs) / 1000);
+      setCamSec(elapsed);
+      if (elapsed >= maxReelDurationSec && rec.state === 'recording') {
+        rec.stop();
+      }
+    }, 250);
+  };
+
+  const stopReelRecording = () => {
+    if (camRecorderRef.current && camRecorderRef.current.state === 'recording') {
+      camRecorderRef.current.stop();
+    }
   };
 
   const handlePickSample = (url: string) => {
-    setSourceUrls((prev) => {
-      if (mode !== 'post') return [url];
-      if (prev.includes(url)) return prev.filter((item) => item !== url);
-      return [...prev, url].slice(0, 5);
+    setMediaError(null);
+    setMediaItems((prev) => {
+      if (mode !== 'post') return [{ url, mediaType: 'image' }];
+      const exists = prev.some((item) => item.url === url);
+      if (exists) return prev.filter((item) => item.url !== url);
+      return [...prev, { url, mediaType: 'image' as const }].slice(0, 5);
     });
   };
 
   const handleProceedFromSamples = () => {
-    if (sourceUrls.length === 0) return;
+    if (mediaItems.length === 0) return;
     setActiveIdx(0);
     if (mode === 'story' || mode === 'reel') setAspectRatio('9:16');
     setStep('edit');
   };
 
   const filterCss = buildFilterString(adjustments);
+  const activeItem = mediaItems[activeIdx];
+  const isActiveVideo = activeItem?.mediaType === 'video';
 
   const handlePublish = async () => {
-    if (sourceUrls.length === 0 || isPublishing) return;
+    if (mediaItems.length === 0 || isPublishing) return;
     setIsPublishing(true);
     try {
       const targetRatio = mode === 'story' || mode === 'reel' ? '9:16' : aspectRatio;
-      const rendered = await Promise.all(
-        sourceUrls.map((url) => renderFilteredImage(url, filterCss, targetRatio))
+      const renderedAssets = await Promise.all(
+        mediaItems.map(async (item) => {
+          if (item.mediaType === 'video') {
+            return {
+              url: item.url,
+              mediaType: 'video' as const,
+              durationSec: item.durationSec,
+              filterCss: filterCss || undefined,
+            };
+          }
+          const processed = await renderFilteredImage(item.url, filterCss, targetRatio);
+          return {
+            url: processed,
+            mediaType: 'image' as const,
+          };
+        })
       );
 
       if (mode === 'story') {
         publishStory({
-          mediaUrl: rendered[0],
+          mediaUrl: renderedAssets[0].url,
           caption,
           location,
         });
       } else {
         publishPost({
-          mediaUrls: rendered,
+          mediaUrls: renderedAssets.map((a) => a.url),
+          mediaAssets: renderedAssets,
           caption,
           location,
           category,
@@ -133,7 +374,7 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
       }
       resetAndClose();
     } catch {
-      showToast('Não foi possível processar a imagem');
+      showToast('Não foi possível processar a mídia');
     } finally {
       setIsPublishing(false);
     }
@@ -178,7 +419,9 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
             {step === 'pick'
               ? 'Criar novo conteúdo'
               : step === 'edit'
-              ? 'Filtros e recorte'
+              ? isActiveVideo
+                ? 'Filtros e prévia do vídeo'
+                : 'Filtros e recorte'
               : mode === 'story'
               ? 'Publicar Story'
               : mode === 'reel'
@@ -224,7 +467,11 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
             <div className="mx-auto mb-6 flex max-w-md items-center gap-1 rounded-xl bg-zinc-100 p-1 dark:bg-zinc-900">
               <button
                 type="button"
-                onClick={() => setMode('post')}
+                onClick={() => {
+                  stopCamera();
+                  setMode('post');
+                  setMediaError(null);
+                }}
                 className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg py-2 text-xs font-semibold transition-colors ${
                   mode === 'post'
                     ? 'bg-white text-zinc-950 shadow-xs dark:bg-zinc-800 dark:text-white'
@@ -236,7 +483,11 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
               </button>
               <button
                 type="button"
-                onClick={() => setMode('story')}
+                onClick={() => {
+                  stopCamera();
+                  setMode('story');
+                  setMediaError(null);
+                }}
                 className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg py-2 text-xs font-semibold transition-colors ${
                   mode === 'story'
                     ? 'bg-white text-zinc-950 shadow-xs dark:bg-zinc-800 dark:text-white'
@@ -248,7 +499,10 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
               </button>
               <button
                 type="button"
-                onClick={() => setMode('reel')}
+                onClick={() => {
+                  setMode('reel');
+                  setMediaError(null);
+                }}
                 className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg py-2 text-xs font-semibold transition-colors ${
                   mode === 'reel'
                     ? 'bg-white text-zinc-950 shadow-xs dark:bg-zinc-800 dark:text-white'
@@ -260,36 +514,135 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
               </button>
             </div>
 
-            {/* Device Upload Zone */}
-            <div className="mb-6 flex flex-col items-center justify-center rounded-2xl border border-dashed border-zinc-300 bg-zinc-50/70 px-6 py-8 text-center dark:border-zinc-700 dark:bg-zinc-900/40">
-              <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-zinc-200/80 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200">
-                <Upload className="h-5 w-5" />
+            {mediaError && (
+              <div className="mb-4 flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-50 px-4 py-3 text-xs font-medium text-rose-700 dark:bg-rose-950/30 dark:text-rose-300">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                <span>{mediaError}</span>
               </div>
-              <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-                Envie fotos do seu dispositivo
-              </p>
-              <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                {mode === 'post'
-                  ? 'Selecione até 5 imagens para criar um carrossel'
-                  : 'Selecione uma imagem vertical ou horizontal para editar'}
-              </p>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                multiple={mode === 'post'}
-                onChange={handleFileChange}
-                className="hidden"
-              />
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="mt-4 inline-flex h-10 items-center gap-2 rounded-xl bg-zinc-900 px-5 text-sm font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
-              >
-                <ImagePlus className="h-4 w-4" />
-                <span>Selecionar do computador</span>
-              </button>
-            </div>
+            )}
+
+            {/* Live Short Video Camera Stage for Reels */}
+            {camOpen && mode === 'reel' ? (
+              <div className="mb-6 overflow-hidden rounded-2xl border border-zinc-200 bg-black dark:border-zinc-800">
+                <div className="relative mx-auto aspect-[9/16] max-h-[340px] w-full max-w-[260px] bg-black">
+                  <video
+                    ref={camVideoRef}
+                    autoPlay
+                    muted
+                    playsInline
+                    className="h-full w-full object-cover"
+                  />
+                  <div className="absolute top-3 right-3 left-3 flex items-center justify-between text-xs font-semibold text-white">
+                    <span className="rounded-md bg-black/60 px-2 py-1 font-mono tabular-nums">
+                      {camSec}s / {maxReelDurationSec}s
+                    </span>
+                    <button
+                      type="button"
+                      onClick={stopCamera}
+                      className="rounded-md bg-black/60 px-2 py-1 hover:bg-black/80"
+                    >
+                      Cancelar
+                    </button>
+                  </div>
+                </div>
+                <div className="flex justify-center bg-zinc-950 p-3">
+                  {camRecording ? (
+                    <button
+                      type="button"
+                      onClick={stopReelRecording}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl bg-rose-600 px-5 text-xs font-semibold text-white hover:bg-rose-700"
+                    >
+                      <Square className="h-3.5 w-3.5 fill-white" />
+                      <span>Parar e usar vídeo ({camSec}s)</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={startReelRecording}
+                      className="inline-flex h-10 items-center gap-2 rounded-xl bg-sky-600 px-5 text-xs font-semibold text-white hover:bg-sky-700"
+                    >
+                      <Video className="h-4 w-4" />
+                      <span>Iniciar gravação (máx {maxReelDurationSec}s)</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              /* Device Upload Zone */
+              <div className="mb-6 flex flex-col items-center justify-center rounded-2xl border border-dashed border-zinc-300 bg-zinc-50/70 px-6 py-8 text-center dark:border-zinc-700 dark:bg-zinc-900/40">
+                <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-zinc-200/80 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200">
+                  {mode === 'reel' ? (
+                    <Video className="h-5 w-5" />
+                  ) : (
+                    <Upload className="h-5 w-5" />
+                  )}
+                </div>
+                <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                  {mode === 'reel'
+                    ? 'Envie um vídeo curto ou foto para o seu Reel'
+                    : 'Envie fotos do seu dispositivo'}
+                </p>
+                <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                  {mode === 'reel'
+                    ? allowVideoReels
+                      ? `Regras do site: vídeos até ${maxVideoSizeMB} MB e máximo de ${maxReelDurationSec}s (MP4, WebM, MOV)`
+                      : 'Vídeos nos Reels desativados pelo administrador — apenas imagens no momento'
+                    : mode === 'post'
+                    ? 'Selecione até 5 imagens para criar um carrossel'
+                    : 'Selecione uma imagem vertical ou horizontal para editar'}
+                </p>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept={mode === 'reel' && allowVideoReels ? 'video/*,image/*' : 'image/*'}
+                  multiple={mode === 'post'}
+                  onChange={handleFileChange}
+                  className="hidden"
+                />
+                <input
+                  ref={videoInputRef}
+                  type="file"
+                  accept="video/*"
+                  onChange={handleVideoFileOnly}
+                  className="hidden"
+                />
+
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+                  {mode === 'reel' && allowVideoReels && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => videoInputRef.current?.click()}
+                        className="inline-flex h-10 items-center gap-2 rounded-xl bg-sky-600 px-5 text-sm font-semibold text-white hover:bg-sky-700"
+                      >
+                        <Film className="h-4 w-4" />
+                        <span>Selecionar vídeo curto</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={openReelCamera}
+                        className="inline-flex h-10 items-center gap-2 rounded-xl border border-zinc-300 bg-white px-4 text-sm font-semibold text-zinc-900 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                      >
+                        <Video className="h-4 w-4" />
+                        <span>Gravar agora</span>
+                      </button>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className={`inline-flex h-10 items-center gap-2 rounded-xl px-5 text-sm font-semibold ${
+                      mode === 'reel' && allowVideoReels
+                        ? 'border border-zinc-300 bg-white text-zinc-900 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
+                        : 'bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950'
+                    }`}
+                  >
+                    <ImagePlus className="h-4 w-4" />
+                    <span>{mode === 'reel' ? 'Selecionar foto' : 'Selecionar do computador'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Curated Studio Picker */}
             <div>
@@ -297,20 +650,20 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                 <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
                   Ou escolha do acervo do estúdio
                 </h3>
-                {sourceUrls.length > 0 && (
+                {mediaItems.length > 0 && (
                   <button
                     type="button"
                     onClick={handleProceedFromSamples}
                     className="rounded-lg bg-sky-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-sky-700"
                   >
-                    Editar selecionadas ({sourceUrls.length})
+                    Editar selecionadas ({mediaItems.length})
                   </button>
                 )}
               </div>
 
               <div className="grid grid-cols-3 gap-2.5 sm:grid-cols-6">
                 {STUDIO_SAMPLE_IMAGES.map((sample) => {
-                  const selectedIndex = sourceUrls.indexOf(sample.url);
+                  const selectedIndex = mediaItems.findIndex((i) => i.url === sample.url);
                   const isSelected = selectedIndex >= 0;
                   return (
                     <button
@@ -349,19 +702,30 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
               <div
                 className={`relative w-full max-w-[380px] overflow-hidden rounded-xl bg-black shadow-sm ${previewRatioClass}`}
               >
-                <MediaImage
-                  src={sourceUrls[activeIdx]}
-                  alt="Pré-visualização da edição"
-                  className="h-full w-full object-cover transition-all duration-150"
-                  style={{ filter: filterCss || 'none' }}
-                />
+                {isActiveVideo ? (
+                  <video
+                    src={activeItem.url}
+                    controls
+                    playsInline
+                    loop
+                    className="h-full w-full object-cover transition-all duration-150"
+                    style={{ filter: filterCss || 'none' }}
+                  />
+                ) : (
+                  <MediaImage
+                    src={activeItem?.url}
+                    alt="Pré-visualização da edição"
+                    className="h-full w-full object-cover transition-all duration-150"
+                    style={{ filter: filterCss || 'none' }}
+                  />
+                )}
               </div>
 
-              {sourceUrls.length > 1 && (
+              {mediaItems.length > 1 && (
                 <div className="mt-3 flex items-center gap-2">
-                  {sourceUrls.map((url, idx) => (
+                  {mediaItems.map((item, idx) => (
                     <button
-                      key={`${url}_${idx}`}
+                      key={`${item.url}_${idx}`}
                       type="button"
                       onClick={() => setActiveIdx(idx)}
                       className={`h-11 w-11 overflow-hidden rounded-lg border-2 ${
@@ -371,7 +735,7 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                       }`}
                     >
                       <MediaImage
-                        src={url}
+                        src={item.url}
                         alt={`Slide ${idx + 1}`}
                         className="h-full w-full object-cover"
                         style={{ filter: filterCss || 'none' }}
@@ -451,18 +815,27 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                             className="flex flex-col items-center gap-1.5"
                           >
                             <div
-                              className={`aspect-square w-full overflow-hidden rounded-xl border-2 ${
-                                active
-                                  ? 'border-sky-500'
-                                  : 'border-transparent'
+                              className={`aspect-square w-full overflow-hidden rounded-xl border-2 bg-zinc-900 ${
+                                active ? 'border-sky-500' : 'border-transparent'
                               }`}
                             >
-                              <MediaImage
-                                src={sourceUrls[activeIdx]}
-                                alt={preset.name}
-                                className="h-full w-full object-cover"
-                                style={{ filter: preset.css || 'none' }}
-                              />
+                              {isActiveVideo ? (
+                                <video
+                                  src={activeItem.url}
+                                  muted
+                                  playsInline
+                                  preload="metadata"
+                                  className="h-full w-full object-cover"
+                                  style={{ filter: preset.css || 'none' }}
+                                />
+                              ) : (
+                                <MediaImage
+                                  src={activeItem?.url}
+                                  alt={preset.name}
+                                  className="h-full w-full object-cover"
+                                  style={{ filter: preset.css || 'none' }}
+                                />
+                              )}
                             </div>
                             <span
                               className={`text-xs ${
@@ -614,3 +987,4 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     </div>
   );
 }
+

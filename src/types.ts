@@ -20,20 +20,43 @@ export interface UserProfile {
   username: string;
   displayName: string;
   avatarUrl: string;
+  coverUrl?: string;
   bio: string;
+  email?: string;
   website?: string;
   verified?: boolean;
   isOnline?: boolean;
+  isDemoSeed?: boolean;
   restricted?: boolean;
   boosted?: boolean;
   followers: string[];
   following: string[];
 }
 
+export interface VideoRulesConfig {
+  maxVideoSizeMB: number;
+  maxReelDurationSec: number;
+  allowVideoReels: boolean;
+}
+
+export interface InviteRecord {
+  id: string;
+  code: string;
+  email: string;
+  invitedName?: string;
+  grantVerified: boolean;
+  status: 'pending' | 'accepted' | 'revoked';
+  createdAt: number;
+  expiresAt: number;
+  acceptedByUserId?: string;
+}
+
 export interface SiteMeta {
   version: string;
   announcementBanner: string;
   maintenanceMode: boolean;
+  realUsersOnly: boolean;
+  videoRules: VideoRulesConfig;
 }
 
 export interface CommentReply {
@@ -58,6 +81,8 @@ export interface MediaAsset {
   url: string;
   alt: string;
   filterCss?: string;
+  mediaType?: 'image' | 'video';
+  durationSec?: number;
 }
 
 export interface Post {

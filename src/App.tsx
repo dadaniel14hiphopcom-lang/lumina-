@@ -3,6 +3,7 @@ import { useMemo, useState } from 'react';
 import { AdminPanelView } from './components/AdminPanelView';
 import { CreateModal } from './components/CreateModal';
 import { ExploreView } from './components/ExploreView';
+import { InviteRegisterModal } from './components/InviteRegisterModal';
 import { MessagesView } from './components/MessagesView';
 import { Navigation } from './components/Navigation';
 import { NotificationsView } from './components/NotificationsView';
@@ -164,6 +165,7 @@ function LuminaShell() {
       <StoryViewer />
       <PostDetailModal />
       <ShareSheetModal />
+      <InviteRegisterModal />
       {isCreateOpen && <CreateModal key={createMode} initialMode={createMode} />}
 
       {/* Subtle Toast Notification */}

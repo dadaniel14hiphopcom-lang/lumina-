@@ -4,6 +4,7 @@ import {
   Film,
   Grid3X3,
   Heart,
+  ImagePlus,
   Layers,
   Link as LinkIcon,
   MessageCircle,
@@ -15,6 +16,8 @@ import {
 } from 'lucide-react';
 import React, { useMemo, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
+import { ASSETS, STUDIO_SAMPLE_IMAGES } from '../data/seed';
+import { isVideoAsset } from '../utils/media';
 import { formatCompactCount } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -52,7 +55,10 @@ export function ProfileView() {
   const [editBio, setEditBio] = useState(targetUser.bio);
   const [editWebsite, setEditWebsite] = useState(targetUser.website || '');
   const [editAvatar, setEditAvatar] = useState(targetUser.avatarUrl);
+  const [editCover, setEditCover] = useState(targetUser.coverUrl || ASSETS.postArchitecture);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const coverInputRef = useRef<HTMLInputElement | null>(null);
+  const quickCoverInputRef = useRef<HTMLInputElement | null>(null);
 
   const userPosts = useMemo(
     () => posts.filter((p) => p.authorId === targetUser.id),
@@ -86,6 +92,7 @@ export function ProfileView() {
     setEditBio(targetUser.bio);
     setEditWebsite(targetUser.website || '');
     setEditAvatar(targetUser.avatarUrl);
+    setEditCover(targetUser.coverUrl || ASSETS.postArchitecture);
     setEditOpen(true);
   };
 
@@ -97,16 +104,35 @@ export function ProfileView() {
       bio: editBio.trim(),
       website: editWebsite.trim() || undefined,
       avatarUrl: editAvatar,
+      coverUrl: editCover,
     });
     setEditOpen(false);
   };
 
   const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
       if (reader.result) setEditAvatar(String(reader.result));
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleCoverUpload = (e: React.ChangeEvent<HTMLInputElement>, applyImmediately = false) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (reader.result) {
+        const dataUrl = String(reader.result);
+        setEditCover(dataUrl);
+        if (applyImmediately) {
+          updateProfile({ coverUrl: dataUrl });
+        }
+      }
     };
     reader.readAsDataURL(file);
   };
@@ -117,22 +143,55 @@ export function ProfileView() {
 
   return (
     <div className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
-      {/* Profile Header */}
-      <header className="flex flex-col gap-6 border-b border-zinc-200 pb-8 dark:border-zinc-800 sm:flex-row sm:items-start sm:gap-10">
-        <div className="flex items-center gap-6 sm:block">
-          <AvatarRing
-            src={targetUser.avatarUrl}
-            alt={targetUser.username}
-            size="xl"
-            hasStory={hasStory}
-            hasUnseenStory={hasUnseenStory}
-            onClick={() => {
-              if (hasStory) setActiveStoryAuthorId(targetUser.id);
-            }}
-          />
+      {/* Cover Banner behind Profile Photo */}
+      <div className="relative h-36 w-full overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 sm:h-48">
+        <MediaImage
+          src={targetUser.coverUrl || ASSETS.postArchitecture}
+          alt={`Capa de ${targetUser.username}`}
+          className="h-full w-full object-cover"
+        />
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-black/15" />
+
+        {isOwnProfile && (
+          <>
+            <input
+              ref={quickCoverInputRef}
+              type="file"
+              accept="image/*"
+              onChange={(e) => handleCoverUpload(e, true)}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={() => quickCoverInputRef.current?.click()}
+              className="absolute top-3 right-3 inline-flex items-center gap-1.5 rounded-lg bg-black/60 px-3 py-1.5 text-xs font-semibold text-white backdrop-blur-xs transition-colors hover:bg-black/80"
+            >
+              <ImagePlus className="h-3.5 w-3.5" />
+              <span>Alterar capa</span>
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* Profile Header overlapping Cover */}
+      <header className="relative z-10 -mt-11 flex flex-col gap-5 border-b border-zinc-200 px-2 pb-8 dark:border-zinc-800 sm:-mt-14 sm:flex-row sm:items-end sm:gap-8 sm:px-5">
+        <div className="flex items-end gap-5 sm:block">
+          <div className="inline-block rounded-full bg-white p-1 ring-2 ring-white dark:bg-[#050505] dark:ring-[#050505]">
+            <AvatarRing
+              src={targetUser.avatarUrl}
+              alt={targetUser.username}
+              size="xl"
+              hasStory={hasStory}
+              hasUnseenStory={hasUnseenStory}
+              showOnlineIndicator={Boolean(targetUser.isOnline)}
+              onClick={() => {
+                if (hasStory) setActiveStoryAuthorId(targetUser.id);
+              }}
+            />
+          </div>
 
           {/* Mobile compact metrics next to avatar */}
-          <div className="grid flex-1 grid-cols-3 gap-2 text-center sm:hidden">
+          <div className="grid flex-1 grid-cols-3 gap-2 pb-2 text-center sm:hidden">
             <div>
               <p className="text-base font-bold text-zinc-950 tabular-nums dark:text-white">
                 {userPosts.length}
@@ -363,11 +422,21 @@ export function ProfileView() {
                 onClick={() => setSelectedPostId(post.id)}
                 className="group relative aspect-square overflow-hidden bg-zinc-100 dark:bg-zinc-900 sm:rounded-md"
               >
-                <MediaImage
-                  src={post.media[0]?.url}
-                  alt={post.caption}
-                  className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-                />
+                {isVideoAsset(post.media[0]) ? (
+                  <video
+                    src={post.media[0]?.url}
+                    muted
+                    playsInline
+                    preload="metadata"
+                    className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                  />
+                ) : (
+                  <MediaImage
+                    src={post.media[0]?.url}
+                    alt={post.caption}
+                    className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+                  />
+                )}
                 {(post.isReel || post.media.length > 1) && (
                   <span className="absolute top-2 right-2 rounded-full bg-black/55 p-1 text-white">
                     {post.isReel ? (
@@ -423,7 +492,50 @@ export function ProfileView() {
               </button>
             </div>
 
-            <form onSubmit={handleSaveProfile} className="space-y-4 p-5">
+            <form onSubmit={handleSaveProfile} className="max-h-[78vh] space-y-4 overflow-y-auto p-5">
+              {/* Cover editor */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                    Imagem de capa
+                  </span>
+                  <input
+                    ref={coverInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => handleCoverUpload(e, false)}
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => coverInputRef.current?.click()}
+                    className="inline-flex items-center gap-1 text-xs font-semibold text-sky-600 hover:underline dark:text-sky-400"
+                  >
+                    <ImagePlus className="h-3.5 w-3.5" />
+                    <span>Enviar capa</span>
+                  </button>
+                </div>
+                <div className="relative h-24 w-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
+                  <MediaImage src={editCover} alt="Prévia da capa" className="h-full w-full object-cover" />
+                </div>
+                <div className="flex items-center gap-1.5">
+                  {STUDIO_SAMPLE_IMAGES.slice(0, 4).map((sample) => (
+                    <button
+                      key={sample.url}
+                      type="button"
+                      onClick={() => setEditCover(sample.url)}
+                      className={`h-8 flex-1 overflow-hidden rounded-lg border ${
+                        editCover === sample.url
+                          ? 'border-sky-500 ring-2 ring-sky-500/30'
+                          : 'border-zinc-200 opacity-75 hover:opacity-100 dark:border-zinc-800'
+                      }`}
+                    >
+                      <MediaImage src={sample.url} alt={sample.label} className="h-full w-full object-cover" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="flex items-center gap-4">
                 <AvatarRing src={editAvatar} alt={editHandle} size="lg" />
                 <div>

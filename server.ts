@@ -67,6 +67,12 @@ interface IntegrationState {
     channel: 'stable' | 'beta';
     announcementBanner: string;
     maintenanceMode: boolean;
+    realUsersOnly: boolean;
+    videoRules: {
+      maxVideoSizeMB: number;
+      maxReelDurationSec: number;
+      allowVideoReels: boolean;
+    };
     updateHistory: {
       id: string;
       version: string;
@@ -75,6 +81,17 @@ interface IntegrationState {
       appliedAt: number;
     }[];
   };
+  invites: {
+    id: string;
+    code: string;
+    email: string;
+    invitedName?: string;
+    grantVerified: boolean;
+    status: 'pending' | 'accepted' | 'revoked';
+    createdAt: number;
+    expiresAt: number;
+    acceptedByUserId?: string;
+  }[];
 }
 
 const DEFAULT_ADMIN_STATE: IntegrationState = {
@@ -117,6 +134,12 @@ const DEFAULT_ADMIN_STATE: IntegrationState = {
     channel: 'stable',
     announcementBanner: '',
     maintenanceMode: false,
+    realUsersOnly: false,
+    videoRules: {
+      maxVideoSizeMB: 25,
+      maxReelDurationSec: 60,
+      allowVideoReels: true,
+    },
     updateHistory: [
       {
         id: 'upd_init',
@@ -131,6 +154,7 @@ const DEFAULT_ADMIN_STATE: IntegrationState = {
       },
     ],
   },
+  invites: [],
 };
 
 function readAdminState(): IntegrationState {
@@ -145,7 +169,15 @@ function readAdminState(): IntegrationState {
         aws: { ...DEFAULT_ADMIN_STATE.aws, ...(parsed.aws || {}) },
         supabase: { ...DEFAULT_ADMIN_STATE.supabase, ...(parsed.supabase || {}) },
         wordpress: { ...DEFAULT_ADMIN_STATE.wordpress, ...(parsed.wordpress || {}) },
-        site: { ...DEFAULT_ADMIN_STATE.site, ...(parsed.site || {}) },
+        site: {
+          ...DEFAULT_ADMIN_STATE.site,
+          ...(parsed.site || {}),
+          videoRules: {
+            ...DEFAULT_ADMIN_STATE.site.videoRules,
+            ...(parsed.site?.videoRules || {}),
+          },
+        },
+        invites: Array.isArray(parsed.invites) ? parsed.invites : [],
       };
     }
   } catch {
@@ -459,13 +491,15 @@ async function startServer() {
     res.json({ token });
   });
 
-  // Public lightweight site metadata (version + announcement banner)
+  // Public lightweight site metadata (version, banner, realUsersOnly, videoRules)
   app.get('/api/site/meta', (_req, res) => {
     const state = readAdminState();
     res.json({
       version: state.site.version,
       announcementBanner: state.site.announcementBanner,
       maintenanceMode: state.site.maintenanceMode,
+      realUsersOnly: Boolean(state.site.realUsersOnly),
+      videoRules: state.site.videoRules,
     });
   });
 
@@ -761,7 +795,7 @@ async function startServer() {
     res.json({ ok: true, site: state.site });
   });
 
-  // Update site banner / maintenance mode directly
+  // Update site banner / maintenance mode / realUsersOnly / video rules directly
   app.patch('/api/admin/updates/site-flags', requireAdminAuth, (req, res) => {
     const state = readAdminState();
     if (typeof req.body?.announcementBanner === 'string') {
@@ -770,8 +804,99 @@ async function startServer() {
     if (typeof req.body?.maintenanceMode === 'boolean') {
       state.site.maintenanceMode = req.body.maintenanceMode;
     }
+    if (typeof req.body?.realUsersOnly === 'boolean') {
+      state.site.realUsersOnly = req.body.realUsersOnly;
+    }
+    if (req.body?.videoRules && typeof req.body.videoRules === 'object') {
+      const vr = req.body.videoRules;
+      if (typeof vr.maxVideoSizeMB === 'number' && Number.isFinite(vr.maxVideoSizeMB)) {
+        state.site.videoRules.maxVideoSizeMB = Math.min(250, Math.max(1, Math.round(vr.maxVideoSizeMB)));
+      }
+      if (typeof vr.maxReelDurationSec === 'number' && Number.isFinite(vr.maxReelDurationSec)) {
+        state.site.videoRules.maxReelDurationSec = Math.min(300, Math.max(5, Math.round(vr.maxReelDurationSec)));
+      }
+      if (typeof vr.allowVideoReels === 'boolean') {
+        state.site.videoRules.allowVideoReels = vr.allowVideoReels;
+      }
+    }
     writeAdminState(state);
     res.json({ ok: true, site: state.site });
+  });
+
+  // Admin User Invitations
+  app.get('/api/admin/invites', requireAdminAuth, (_req, res) => {
+    const state = readAdminState();
+    res.json({ invites: state.invites });
+  });
+
+  app.post('/api/admin/invites', requireAdminAuth, (req, res) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().slice(0, 140) : '';
+    const invitedName =
+      typeof req.body?.invitedName === 'string' ? req.body.invitedName.trim().slice(0, 80) : '';
+    const grantVerified = Boolean(req.body?.grantVerified);
+    const expiresDays =
+      typeof req.body?.expiresDays === 'number'
+        ? Math.min(90, Math.max(1, Math.round(req.body.expiresDays)))
+        : 7;
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'Informe um e-mail válido para o convite.' });
+      return;
+    }
+
+    const code = `LUM-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    const now = Date.now();
+    const invite = {
+      id: `inv_${now}`,
+      code,
+      email,
+      invitedName: invitedName || undefined,
+      grantVerified,
+      status: 'pending' as const,
+      createdAt: now,
+      expiresAt: now + expiresDays * 86_400_000,
+    };
+
+    const state = readAdminState();
+    state.invites.unshift(invite);
+    state.invites = state.invites.slice(0, 100);
+    writeAdminState(state);
+    res.json({ ok: true, invite, invites: state.invites });
+  });
+
+  app.patch('/api/admin/invites/:id/revoke', requireAdminAuth, (req, res) => {
+    const state = readAdminState();
+    const target = state.invites.find((i) => i.id === req.params.id);
+    if (!target) {
+      res.status(404).json({ error: 'Convite não encontrado.' });
+      return;
+    }
+    target.status = 'revoked';
+    writeAdminState(state);
+    res.json({ ok: true, invites: state.invites });
+  });
+
+  app.post('/api/invites/accept', (req, res) => {
+    const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase() : '';
+    const userId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+    if (!code) {
+      res.status(400).json({ error: 'Código de convite obrigatório.' });
+      return;
+    }
+    const state = readAdminState();
+    const invite = state.invites.find((i) => i.code.toUpperCase() === code);
+    if (!invite) {
+      res.status(404).json({ error: 'Convite não encontrado.' });
+      return;
+    }
+    if (invite.status !== 'pending' || invite.expiresAt < Date.now()) {
+      res.status(409).json({ error: 'Este convite já foi usado, revogado ou expirou.' });
+      return;
+    }
+    invite.status = 'accepted';
+    invite.acceptedByUserId = userId || undefined;
+    writeAdminState(state);
+    res.json({ ok: true, invite });
   });
 
   // Download Complete Self-Hosted WordPress Kit (.zip)

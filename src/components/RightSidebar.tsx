@@ -12,6 +12,7 @@ export function RightSidebar() {
     switchUser,
     createAccount,
     resetDemoData,
+    setIsInviteModalOpen,
   } = useSocial();
 
   const [switchModalOpen, setSwitchModalOpen] = useState(false);
@@ -128,6 +129,14 @@ export function RightSidebar() {
               className="hover:underline"
             >
               Contas
+            </button>
+            <span aria-hidden="true">·</span>
+            <button
+              type="button"
+              onClick={() => setIsInviteModalOpen(true)}
+              className="hover:underline"
+            >
+              Entrar com convite
             </button>
             <span aria-hidden="true">·</span>
             <button

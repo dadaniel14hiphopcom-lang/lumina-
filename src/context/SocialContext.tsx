@@ -1,6 +1,7 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DirectThread,
+  InviteRecord,
   NavSection,
   NotificationItem,
   Post,
@@ -8,6 +9,7 @@ import {
   SiteMeta,
   StoryItem,
   UserProfile,
+  VideoRulesConfig,
 } from '../types';
 import {
   SEED_NOTIFICATIONS,
@@ -28,7 +30,72 @@ interface PersistedState {
   theme: 'light' | 'dark';
 }
 
+export interface PendingInviteMeta {
+  code: string;
+  email?: string;
+  invitedName?: string;
+  grantVerified?: boolean;
+  expiresAt?: number;
+}
+
 const STORAGE_KEY = 'lumina_social_v1';
+const INVITES_KEY = 'lumina_invites_v1';
+const REALTIME_CHANNEL = 'lumina_realtime_sync_v1';
+
+export const DEFAULT_VIDEO_RULES: VideoRulesConfig = {
+  maxVideoSizeMB: 25,
+  maxReelDurationSec: 60,
+  allowVideoReels: true,
+};
+
+const DEFAULT_SITE_META: SiteMeta = {
+  version: '2.4.0',
+  announcementBanner: '',
+  maintenanceMode: false,
+  realUsersOnly: false,
+  videoRules: DEFAULT_VIDEO_RULES,
+};
+
+function decodeInviteMeta(rawMeta: string | null): PendingInviteMeta | null {
+  if (!rawMeta) return null;
+  try {
+    const base64 = rawMeta.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = base64.length % 4 === 0 ? '' : '='.repeat(4 - (base64.length % 4));
+    const binary = atob(base64 + pad);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    const json = new TextDecoder().decode(bytes);
+    const parsed = JSON.parse(json) as PendingInviteMeta;
+    if (parsed && typeof parsed.code === 'string') {
+      return parsed;
+    }
+  } catch {
+    // Ignore malformed invite token metadata
+  }
+  return null;
+}
+
+export function encodeInviteMeta(meta: PendingInviteMeta): string {
+  const json = JSON.stringify(meta);
+  const bytes = new TextEncoder().encode(json);
+  let binary = '';
+  bytes.forEach((b) => {
+    binary += String.fromCharCode(b);
+  });
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function loadInitialInvites(): InviteRecord[] {
+  try {
+    const raw = localStorage.getItem(INVITES_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    // Ignore storage error
+  }
+  return [];
+}
 
 function loadInitialState(): PersistedState {
   try {
@@ -39,9 +106,18 @@ function loadInitialState(): PersistedState {
         return {
           ...parsed,
           users: parsed.users.map((u) => {
-            if (u.isOnline !== undefined) return u;
             const seedMatch = SEED_USERS.find((s) => s.id === u.id);
-            return { ...u, isOnline: seedMatch?.isOnline ?? true };
+            return {
+              ...u,
+              isOnline: u.isOnline !== undefined ? u.isOnline : seedMatch?.isOnline ?? true,
+              coverUrl: u.coverUrl || seedMatch?.coverUrl,
+              isDemoSeed:
+                u.isDemoSeed !== undefined
+                  ? u.isDemoSeed
+                  : seedMatch
+                  ? seedMatch.isDemoSeed
+                  : false,
+            };
           }),
         };
       }
@@ -64,7 +140,9 @@ function loadInitialState(): PersistedState {
 interface SocialContextValue {
   currentUser: UserProfile;
   users: UserProfile[];
+  allUsers: UserProfile[];
   posts: Post[];
+  allPosts: Post[];
   stories: StoryItem[];
   threads: DirectThread[];
   notifications: NotificationItem[];
@@ -82,6 +160,31 @@ interface SocialContextValue {
   setSiteMeta: (meta: SiteMeta) => void;
   refreshSiteMeta: () => Promise<void>;
 
+  invites: InviteRecord[];
+  setInvites: React.Dispatch<React.SetStateAction<InviteRecord[]>>;
+  pendingInviteCode: string | null;
+  setPendingInviteCode: (code: string | null) => void;
+  pendingInviteMeta: PendingInviteMeta | null;
+  isInviteModalOpen: boolean;
+  setIsInviteModalOpen: (open: boolean) => void;
+  createInvite: (payload: {
+    email: string;
+    invitedName?: string;
+    grantVerified?: boolean;
+    expiresInDays?: number;
+  }) => InviteRecord;
+  revokeInvite: (inviteId: string) => void;
+  registerWithInvite: (payload: {
+    code: string;
+    username: string;
+    displayName: string;
+    email: string;
+    bio: string;
+    avatarUrl?: string;
+    coverUrl?: string;
+  }) => Promise<{ ok: boolean; error?: string }>;
+  purgeDemoUsers: () => void;
+
   setActiveNav: (nav: NavSection) => void;
   openProfile: (userId: string) => void;
   openHashtagInExplore: (tag: string) => void;
@@ -94,8 +197,19 @@ interface SocialContextValue {
   showToast: (msg: string) => void;
 
   switchUser: (userId: string) => void;
-  createAccount: (data: { username: string; displayName: string; bio: string }) => void;
-  updateProfile: (updates: Partial<Pick<UserProfile, 'displayName' | 'username' | 'bio' | 'website' | 'avatarUrl'>>) => void;
+  createAccount: (data: {
+    username: string;
+    displayName: string;
+    bio: string;
+    email?: string;
+    avatarUrl?: string;
+    coverUrl?: string;
+  }) => void;
+  updateProfile: (
+    updates: Partial<
+      Pick<UserProfile, 'displayName' | 'username' | 'bio' | 'website' | 'avatarUrl' | 'coverUrl' | 'email'>
+    >
+  ) => void;
 
   toggleFollow: (targetUserId: string) => void;
   toggleLikePost: (postId: string) => void;
@@ -106,6 +220,12 @@ interface SocialContextValue {
 
   publishPost: (payload: {
     mediaUrls: string[];
+    mediaAssets?: {
+      url: string;
+      mediaType?: 'image' | 'video';
+      durationSec?: number;
+      filterCss?: string;
+    }[];
     caption: string;
     location?: string;
     category: PostCategory;
@@ -147,15 +267,26 @@ interface SocialContextValue {
 
 const SocialContext = createContext<SocialContextValue | null>(null);
 
-const AUTO_REPLIES = [
-  'Que legal! Adorei isso.',
-  'Acabei de ver aqui — ficou excelente!',
-  'Vamos combinar sim, essa semana estou livre.',
-  'Boa! Manda mais detalhes quando puder.',
-];
+function normalizeVideoRules(raw?: Partial<VideoRulesConfig>): VideoRulesConfig {
+  return {
+    maxVideoSizeMB:
+      typeof raw?.maxVideoSizeMB === 'number' && raw.maxVideoSizeMB > 0
+        ? Math.min(250, Math.max(1, raw.maxVideoSizeMB))
+        : DEFAULT_VIDEO_RULES.maxVideoSizeMB,
+    maxReelDurationSec:
+      typeof raw?.maxReelDurationSec === 'number' && raw.maxReelDurationSec > 0
+        ? Math.min(300, Math.max(5, raw.maxReelDurationSec))
+        : DEFAULT_VIDEO_RULES.maxReelDurationSec,
+    allowVideoReels:
+      typeof raw?.allowVideoReels === 'boolean'
+        ? raw.allowVideoReels
+        : DEFAULT_VIDEO_RULES.allowVideoReels,
+  };
+}
 
 export function SocialProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<PersistedState>(loadInitialState);
+  const [invites, setInvites] = useState<InviteRecord[]>(loadInitialInvites);
   const [activeNav, setActiveNav] = useState<NavSection>('feed');
   const [viewingProfileId, setViewingProfileId] = useState<string | null>(null);
   const [exploreQuery, setExploreQuery] = useState('');
@@ -164,20 +295,42 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [sharePostId, setSharePostId] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [siteMeta, setSiteMeta] = useState<SiteMeta>({
-    version: '2.4.0',
-    announcementBanner: '',
-    maintenanceMode: false,
+  const [siteMeta, setSiteMeta] = useState<SiteMeta>(DEFAULT_SITE_META);
+
+  const [pendingInviteCode, setPendingInviteCode] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    return params.get('invite')?.trim().toUpperCase() || null;
   });
+  const [pendingInviteMeta, setPendingInviteMeta] = useState<PendingInviteMeta | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    return decodeInviteMeta(params.get('meta'));
+  });
+  const [isInviteModalOpen, setIsInviteModalOpen] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return Boolean(new URLSearchParams(window.location.search).get('invite')?.trim());
+  });
+
+  const channelRef = useRef<BroadcastChannel | null>(null);
+  const tabIdRef = useRef<string>(`tab_${Math.random().toString(36).slice(2, 10)}`);
+  const skipNextStateBroadcastRef = useRef(false);
+  const skipNextInvitesBroadcastRef = useRef(false);
 
   const refreshSiteMeta = async () => {
     try {
       const res = await fetch('/api/site/meta');
       const contentType = res.headers.get('content-type') || '';
       if (res.ok && contentType.includes('application/json')) {
-        const data = (await res.json()) as SiteMeta;
+        const data = (await res.json()) as Partial<SiteMeta>;
         if (data && typeof data.version === 'string') {
-          setSiteMeta(data);
+          setSiteMeta({
+            version: data.version,
+            announcementBanner: data.announcementBanner || '',
+            maintenanceMode: Boolean(data.maintenanceMode),
+            realUsersOnly: Boolean(data.realUsersOnly),
+            videoRules: normalizeVideoRules(data.videoRules),
+          });
           return;
         }
       }
@@ -199,6 +352,11 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
               typeof parsed.site?.maintenanceMode === 'boolean'
                 ? parsed.site.maintenanceMode
                 : prev.maintenanceMode,
+            realUsersOnly:
+              typeof parsed.site?.realUsersOnly === 'boolean'
+                ? parsed.site.realUsersOnly
+                : prev.realUsersOnly,
+            videoRules: normalizeVideoRules(parsed.site?.videoRules || prev.videoRules),
           }));
         }
       }
@@ -211,6 +369,86 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     refreshSiteMeta();
   }, []);
 
+  // Cross-tab real-time synchronization for real user messages, posts, and profiles
+  useEffect(() => {
+    if (typeof BroadcastChannel !== 'undefined') {
+      const ch = new BroadcastChannel(REALTIME_CHANNEL);
+      channelRef.current = ch;
+      ch.onmessage = (event: MessageEvent) => {
+        const payload = event.data as {
+          senderTabId?: string;
+          type?: string;
+          users?: UserProfile[];
+          posts?: Post[];
+          stories?: StoryItem[];
+          threads?: DirectThread[];
+          notifications?: NotificationItem[];
+          invites?: InviteRecord[];
+          siteMeta?: SiteMeta;
+        };
+        if (!payload || payload.senderTabId === tabIdRef.current) return;
+        if (payload.type === 'state_sync') {
+          skipNextStateBroadcastRef.current = true;
+          setState((prev) => ({
+            ...prev,
+            users: Array.isArray(payload.users) ? payload.users : prev.users,
+            posts: Array.isArray(payload.posts) ? payload.posts : prev.posts,
+            stories: Array.isArray(payload.stories) ? payload.stories : prev.stories,
+            threads: Array.isArray(payload.threads) ? payload.threads : prev.threads,
+            notifications: Array.isArray(payload.notifications)
+              ? payload.notifications
+              : prev.notifications,
+          }));
+        } else if (payload.type === 'invites_sync' && Array.isArray(payload.invites)) {
+          skipNextInvitesBroadcastRef.current = true;
+          setInvites(payload.invites);
+        } else if (payload.type === 'sitemeta_sync' && payload.siteMeta) {
+          setSiteMeta(payload.siteMeta);
+        }
+      };
+    }
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === STORAGE_KEY && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue) as PersistedState;
+          if (parsed && Array.isArray(parsed.users)) {
+            skipNextStateBroadcastRef.current = true;
+            setState((prev) => ({
+              ...prev,
+              users: parsed.users,
+              posts: parsed.posts,
+              stories: parsed.stories,
+              threads: parsed.threads,
+              notifications: parsed.notifications,
+            }));
+          }
+        } catch {
+          // Ignore malformed storage event
+        }
+      } else if (e.key === INVITES_KEY && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          if (Array.isArray(parsed)) {
+            skipNextInvitesBroadcastRef.current = true;
+            setInvites(parsed);
+          }
+        } catch {
+          // Ignore
+        }
+      } else if (e.key === 'lumina_admin_local_state_v1') {
+        refreshSiteMeta();
+      }
+    };
+
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      channelRef.current?.close();
+      channelRef.current = null;
+    };
+  }, []);
+
   useEffect(() => {
     const root = document.documentElement;
     if (state.theme === 'dark') {
@@ -221,12 +459,26 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   }, [state.theme]);
 
   useEffect(() => {
+    if (skipNextStateBroadcastRef.current) {
+      skipNextStateBroadcastRef.current = false;
+      return;
+    }
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } catch {
       try {
         const compactState: PersistedState = {
           ...state,
+          posts: state.posts.map((p) => ({
+            ...p,
+            media: p.media.map((m) => ({
+              ...m,
+              url:
+                m.url.startsWith('data:video/') && m.url.length > 750_000
+                  ? SEED_POSTS[0].media[0].url
+                  : m.url,
+            })),
+          })),
           threads: state.threads.map((t) => ({
             ...t,
             messages: t.messages.map((m) => ({
@@ -241,7 +493,34 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         // Keep running smoothly in memory
       }
     }
+
+    channelRef.current?.postMessage({
+      senderTabId: tabIdRef.current,
+      type: 'state_sync',
+      users: state.users,
+      posts: state.posts,
+      stories: state.stories,
+      threads: state.threads,
+      notifications: state.notifications,
+    });
   }, [state]);
+
+  useEffect(() => {
+    if (skipNextInvitesBroadcastRef.current) {
+      skipNextInvitesBroadcastRef.current = false;
+      return;
+    }
+    try {
+      localStorage.setItem(INVITES_KEY, JSON.stringify(invites));
+    } catch {
+      // Ignore quota errors
+    }
+    channelRef.current?.postMessage({
+      senderTabId: tabIdRef.current,
+      type: 'invites_sync',
+      invites,
+    });
+  }, [invites]);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -254,6 +533,26 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     () => state.users.find((u) => u.id === state.currentUserId) || state.users[0],
     [state.users, state.currentUserId]
   );
+
+  const visibleUsers = useMemo(() => {
+    if (!siteMeta.realUsersOnly) return state.users;
+    return state.users.filter((u) => !u.isDemoSeed || u.id === state.currentUserId);
+  }, [state.users, state.currentUserId, siteMeta.realUsersOnly]);
+
+  const visibleUserIds = useMemo(
+    () => new Set(visibleUsers.map((u) => u.id)),
+    [visibleUsers]
+  );
+
+  const visiblePosts = useMemo(() => {
+    if (!siteMeta.realUsersOnly) return state.posts;
+    return state.posts.filter((p) => visibleUserIds.has(p.authorId));
+  }, [state.posts, visibleUserIds, siteMeta.realUsersOnly]);
+
+  const visibleStories = useMemo(() => {
+    if (!siteMeta.realUsersOnly) return state.stories;
+    return state.stories.filter((s) => visibleUserIds.has(s.authorId));
+  }, [state.stories, visibleUserIds, siteMeta.realUsersOnly]);
 
   const getUserById = (id: string) => state.users.find((u) => u.id === id);
 
@@ -286,18 +585,30 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     if (u) showToast(`Conectado como @${u.username}`);
   };
 
-  const createAccount = (data: { username: string; displayName: string; bio: string }) => {
-    const cleanHandle = data.username.toLowerCase().replace(/[^a-z0-9._]/g, '') || `usuario.${Date.now()}`;
+  const createAccount = (data: {
+    username: string;
+    displayName: string;
+    bio: string;
+    email?: string;
+    avatarUrl?: string;
+    coverUrl?: string;
+  }) => {
+    const cleanHandle =
+      data.username.toLowerCase().replace(/[^a-z0-9._]/g, '') || `usuario.${Date.now()}`;
     const newId = `user_${Date.now()}`;
     const newUser: UserProfile = {
       id: newId,
       username: cleanHandle,
       displayName: data.displayName.trim() || cleanHandle,
-      avatarUrl: SEED_USERS[0].avatarUrl,
-      bio: data.bio.trim() || 'Novo perfil na Lumina.',
+      avatarUrl: data.avatarUrl || SEED_USERS[0].avatarUrl,
+      coverUrl: data.coverUrl || SEED_USERS[0].coverUrl,
+      bio: data.bio.trim() || 'Novo perfil real na Lumina.',
+      email: data.email?.trim() || undefined,
       verified: false,
+      isOnline: true,
+      isDemoSeed: false,
       followers: [],
-      following: ['user_clara', 'user_lucas'],
+      following: [],
     };
     setState((prev) => ({
       ...prev,
@@ -308,8 +619,202 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     showToast(`Conta @${cleanHandle} criada com sucesso`);
   };
 
+  const createInvite = (payload: {
+    email: string;
+    invitedName?: string;
+    grantVerified?: boolean;
+    expiresInDays?: number;
+  }): InviteRecord => {
+    const cleanCode = `LUM-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+    const days = Math.min(90, Math.max(1, payload.expiresInDays || 7));
+    const record: InviteRecord = {
+      id: `inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      code: cleanCode,
+      email: payload.email.trim().toLowerCase(),
+      invitedName: payload.invitedName?.trim() || undefined,
+      grantVerified: Boolean(payload.grantVerified),
+      status: 'pending',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + days * 24 * 60 * 60 * 1000,
+    };
+    setInvites((prev) => [record, ...prev]);
+    return record;
+  };
+
+  const revokeInvite = (inviteId: string) => {
+    setInvites((prev) =>
+      prev.map((inv) =>
+        inv.id === inviteId ? { ...inv, status: 'revoked' } : inv
+      )
+    );
+    showToast('Convite revogado');
+  };
+
+  const registerWithInvite = async (payload: {
+    code: string;
+    username: string;
+    displayName: string;
+    email: string;
+    bio: string;
+    avatarUrl?: string;
+    coverUrl?: string;
+  }): Promise<{ ok: boolean; error?: string }> => {
+    const cleanCode = payload.code.trim().toUpperCase();
+    if (!cleanCode) {
+      return { ok: false, error: 'Informe o código de convite recebido.' };
+    }
+    const cleanHandle = payload.username
+      .trim()
+      .toLowerCase()
+      .replace(/^@/, '')
+      .replace(/[^a-z0-9._]/g, '');
+
+    if (cleanHandle.length < 3) {
+      return { ok: false, error: 'Escolha um @usuario com pelo menos 3 caracteres.' };
+    }
+
+    if (state.users.some((u) => u.username.toLowerCase() === cleanHandle)) {
+      return { ok: false, error: `O nome @${cleanHandle} já está em uso.` };
+    }
+
+    const newId = `user_${Date.now()}`;
+    let grantVerified = false;
+    const localMatch = invites.find((i) => i.code.toUpperCase() === cleanCode);
+
+    if (localMatch) {
+      if (localMatch.status === 'revoked') {
+        return { ok: false, error: 'Este convite foi revogado pelo administrador.' };
+      }
+      if (localMatch.status === 'accepted') {
+        return { ok: false, error: 'Este convite já foi utilizado.' };
+      }
+      if (Date.now() > localMatch.expiresAt) {
+        return { ok: false, error: 'Este convite expirou. Solicite um novo link ao admin.' };
+      }
+      grantVerified = localMatch.grantVerified;
+    } else if (pendingInviteMeta && pendingInviteMeta.code.toUpperCase() === cleanCode) {
+      if (pendingInviteMeta.expiresAt && Date.now() > pendingInviteMeta.expiresAt) {
+        return { ok: false, error: 'Este link de convite expirou.' };
+      }
+      grantVerified = Boolean(pendingInviteMeta.grantVerified);
+    } else {
+      // Check backend if available
+      try {
+        const res = await fetch('/api/invites/accept', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: cleanCode, userId: newId }),
+        });
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          return { ok: false, error: 'Código de convite não encontrado ou inválido.' };
+        }
+        const data = (await res.json()) as {
+          ok?: boolean;
+          error?: string;
+          grantVerified?: boolean;
+        };
+        if (!res.ok || !data.ok) {
+          return { ok: false, error: data.error || 'Código de convite inválido.' };
+        }
+        grantVerified = Boolean(data.grantVerified);
+      } catch {
+        return { ok: false, error: 'Código de convite não encontrado ou inválido.' };
+      }
+    }
+
+    // Notify server too if localMatch existed and server is reachable
+    if (localMatch) {
+      fetch('/api/invites/accept', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: cleanCode, userId: newId }),
+      }).catch(() => {});
+    }
+
+    const newUser: UserProfile = {
+      id: newId,
+      username: cleanHandle,
+      displayName: payload.displayName.trim() || cleanHandle,
+      avatarUrl: payload.avatarUrl || SEED_USERS[0].avatarUrl,
+      coverUrl: payload.coverUrl || SEED_USERS[0].coverUrl,
+      bio: payload.bio.trim() || 'Novo membro convidado na Lumina.',
+      email: payload.email.trim() || localMatch?.email || pendingInviteMeta?.email,
+      verified: grantVerified,
+      isOnline: true,
+      isDemoSeed: false,
+      followers: [],
+      following: [],
+    };
+
+    setState((prev) => ({
+      ...prev,
+      users: [newUser, ...prev.users],
+      currentUserId: newId,
+    }));
+
+    if (localMatch) {
+      setInvites((prev) =>
+        prev.map((i) =>
+          i.id === localMatch.id
+            ? { ...i, status: 'accepted', acceptedByUserId: newId }
+            : i
+        )
+      );
+    }
+
+    setPendingInviteCode(null);
+    setPendingInviteMeta(null);
+    setIsInviteModalOpen(false);
+    setViewingProfileId(null);
+    setActiveNav('feed');
+
+    if (typeof window !== 'undefined' && window.location.search) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('invite');
+      url.searchParams.delete('meta');
+      window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+    }
+
+    showToast(`Bem-vindo(a), @${cleanHandle}! Cadastro por convite concluído.`);
+    return { ok: true };
+  };
+
+  const purgeDemoUsers = () => {
+    setState((prev) => {
+      const realUsers = prev.users.filter((u) => !u.isDemoSeed);
+      const keptUsers =
+        realUsers.length > 0
+          ? realUsers
+          : prev.users.filter((u) => u.id === prev.currentUserId);
+      const keptIds = new Set(keptUsers.map((u) => u.id));
+      const nextCurrentId = keptIds.has(prev.currentUserId)
+        ? prev.currentUserId
+        : keptUsers[0]?.id || prev.currentUserId;
+
+      return {
+        ...prev,
+        currentUserId: nextCurrentId,
+        users: keptUsers.map((u) => ({
+          ...u,
+          followers: u.followers.filter((id) => keptIds.has(id)),
+          following: u.following.filter((id) => keptIds.has(id)),
+        })),
+        posts: prev.posts.filter((p) => keptIds.has(p.authorId)),
+        stories: prev.stories.filter((s) => keptIds.has(s.authorId)),
+        threads: prev.threads.filter((t) => t.participantIds.every((id) => keptIds.has(id))),
+        notifications: prev.notifications.filter(
+          (n) => keptIds.has(n.recipientId) && keptIds.has(n.actorId)
+        ),
+      };
+    });
+    showToast('Contas fictícias removidas. Rede apontada para usuários reais.');
+  };
+
   const updateProfile = (
-    updates: Partial<Pick<UserProfile, 'displayName' | 'username' | 'bio' | 'website' | 'avatarUrl'>>
+    updates: Partial<
+      Pick<UserProfile, 'displayName' | 'username' | 'bio' | 'website' | 'avatarUrl' | 'coverUrl' | 'email'>
+    >
   ) => {
     setState((prev) => ({
       ...prev,
@@ -515,6 +1020,12 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
   const publishPost = (payload: {
     mediaUrls: string[];
+    mediaAssets?: {
+      url: string;
+      mediaType?: 'image' | 'video';
+      durationSec?: number;
+      filterCss?: string;
+    }[];
     caption: string;
     location?: string;
     category: PostCategory;
@@ -526,13 +1037,26 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       showToast('Conta restrita pela administração — publicação bloqueada');
       return;
     }
+    const assets: {
+      url: string;
+      mediaType?: 'image' | 'video';
+      durationSec?: number;
+      filterCss?: string;
+    }[] =
+      payload.mediaAssets && payload.mediaAssets.length > 0
+        ? payload.mediaAssets
+        : payload.mediaUrls.map((url) => ({ url, mediaType: 'image' as const }));
+
     const newPost: Post = {
       id: `post_${Date.now()}`,
       authorId: currentUser.id,
-      media: payload.mediaUrls.map((url, idx) => ({
+      media: assets.map((asset, idx) => ({
         id: `m_${Date.now()}_${idx}`,
-        url,
-        alt: payload.caption.slice(0, 80) || 'Foto publicada na Lumina',
+        url: asset.url,
+        alt: payload.caption.slice(0, 80) || 'Publicação na Lumina',
+        mediaType: asset.mediaType || 'image',
+        durationSec: asset.durationSec,
+        filterCss: asset.filterCss,
       })),
       caption: payload.caption.trim(),
       location: payload.location?.trim() || undefined,
@@ -598,6 +1122,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     showToast(`Reação ${emoji} enviada`);
   };
 
+  // Direct messages for real users only (no automated/bot replies)
   const sendMessage = (
     recipientId: string,
     text: string,
@@ -644,6 +1169,16 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         createdAt: Date.now(),
       };
 
+      const newNotif: NotificationItem = {
+        id: `notif_${Date.now()}`,
+        recipientId,
+        actorId: prev.currentUserId,
+        type: 'mention',
+        text: trimmed || fallbackLabel,
+        createdAt: Date.now(),
+        read: false,
+      };
+
       if (existing) {
         return {
           ...prev,
@@ -659,6 +1194,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
                 : t
             )
             .sort((a, b) => b.updatedAt - a.updatedAt),
+          notifications:
+            recipientId !== prev.currentUserId
+              ? [newNotif, ...prev.notifications]
+              : prev.notifications,
         };
       }
 
@@ -672,43 +1211,12 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       return {
         ...prev,
         threads: [newThread, ...prev.threads],
+        notifications:
+          recipientId !== prev.currentUserId
+            ? [newNotif, ...prev.notifications]
+            : prev.notifications,
       };
     });
-
-    // Contextual simulated response from non-current creator
-    if (recipientId !== currentUser.id) {
-      const senderAtSend = currentUser.id;
-      window.setTimeout(() => {
-        const replyText = AUTO_REPLIES[Math.floor(Math.random() * AUTO_REPLIES.length)];
-        setState((prev) => ({
-          ...prev,
-          threads: prev.threads
-            .map((t) => {
-              if (
-                t.participantIds.includes(senderAtSend) &&
-                t.participantIds.includes(recipientId)
-              ) {
-                return {
-                  ...t,
-                  messages: [
-                    ...t.messages,
-                    {
-                      id: `dm_auto_${Date.now()}`,
-                      senderId: recipientId,
-                      text: replyText,
-                      createdAt: Date.now(),
-                    },
-                  ],
-                  unreadBy: prev.currentUserId === senderAtSend ? [senderAtSend] : [],
-                  updatedAt: Date.now(),
-                };
-              }
-              return t;
-            })
-            .sort((a, b) => b.updatedAt - a.updatedAt),
-        }));
-      }, 1100);
-    }
   };
 
   const markThreadRead = (threadId: string) => {
@@ -834,13 +1342,24 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     });
   };
 
+  const handleSetSiteMeta = (nextMeta: SiteMeta) => {
+    setSiteMeta(nextMeta);
+    channelRef.current?.postMessage({
+      senderTabId: tabIdRef.current,
+      type: 'sitemeta_sync',
+      siteMeta: nextMeta,
+    });
+  };
+
   return (
     <SocialContext.Provider
       value={{
         currentUser,
-        users: state.users,
-        posts: state.posts,
-        stories: state.stories,
+        users: visibleUsers,
+        allUsers: state.users,
+        posts: visiblePosts,
+        allPosts: state.posts,
+        stories: visibleStories,
         threads: state.threads,
         notifications: state.notifications,
         recentSearches: state.recentSearches,
@@ -854,8 +1373,19 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         sharePostId,
         toastMessage,
         siteMeta,
-        setSiteMeta,
+        setSiteMeta: handleSetSiteMeta,
         refreshSiteMeta,
+        invites,
+        setInvites,
+        pendingInviteCode,
+        setPendingInviteCode,
+        pendingInviteMeta,
+        isInviteModalOpen,
+        setIsInviteModalOpen,
+        createInvite,
+        revokeInvite,
+        registerWithInvite,
+        purgeDemoUsers,
         setActiveNav: (nav) => {
           if (nav === 'profile') setViewingProfileId(currentUser.id);
           setActiveNav(nav);

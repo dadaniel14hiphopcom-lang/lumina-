@@ -14,6 +14,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import React, { useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { Post } from '../types';
+import { isVideoAsset } from '../utils/media';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -218,12 +219,23 @@ export function PostCard({ post }: PostCardProps) {
         onDoubleClick={handleDoubleTap}
         className={`relative w-full select-none overflow-hidden bg-zinc-100 dark:bg-zinc-900 ${aspectClass}`}
       >
-        <MediaImage
-          src={post.media[slide]?.url}
-          alt={post.media[slide]?.alt || post.caption}
-          className="h-full w-full object-cover"
-          fallbackLabel={post.location || author.username}
-        />
+        {isVideoAsset(post.media[slide]) ? (
+          <video
+            src={post.media[slide]?.url}
+            controls
+            playsInline
+            loop
+            className="h-full w-full object-cover"
+            style={{ filter: post.media[slide]?.filterCss || 'none' }}
+          />
+        ) : (
+          <MediaImage
+            src={post.media[slide]?.url}
+            alt={post.media[slide]?.alt || post.caption}
+            className="h-full w-full object-cover"
+            fallbackLabel={post.location || author.username}
+          />
+        )}
 
         {/* Double-tap Heart Burst */}
         <AnimatePresence>
