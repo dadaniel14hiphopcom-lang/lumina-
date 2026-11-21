@@ -22,6 +22,7 @@ import {
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
+import { buildWordPressKitEntries, createBrowserZipBlob } from '../utils/zipClient';
 import { AvatarRing } from './AvatarRing';
 
 type AdminTab = 'users' | 'integrations' | 'updates' | 'wordpress';
@@ -120,6 +121,115 @@ function triggerBlobDownload(blob: Blob, filename: string) {
   URL.revokeObjectURL(url);
 }
 
+const LOCAL_AUTH_KEY = 'lumina_admin_local_auth_v1';
+const LOCAL_STATE_KEY = 'lumina_admin_local_state_v1';
+
+const DEFAULT_LOCAL_STATE: ServerOverview['state'] = {
+  aws: {
+    region: 'sa-east-1',
+    bucket: 'lumina-media-prod',
+    cloudFrontDomain: 'cdn.lumina.social',
+    sesSender: 'no-reply@lumina.social',
+    s3Enabled: true,
+    cloudFrontEnabled: true,
+    sesEnabled: false,
+    rekognitionEnabled: true,
+    lastVerifiedAt: null,
+  },
+  supabase: {
+    projectUrl: '',
+    schemaName: 'public',
+    autoSyncUsers: true,
+    autoSyncPosts: true,
+    rlsEnforced: true,
+    lastVerifiedAt: null,
+    lastStatus: null,
+  },
+  wordpress: {
+    siteUrl: '',
+    siteTitle: 'Lumina Editorial WP',
+    dbEngine: 'mariadb-11',
+    dbName: 'lumina_wp',
+    tablePrefix: 'wp_lum_',
+    phpVersion: '8.3',
+    permalinks: '/%postname%/',
+    sslEnabled: true,
+    redisCache: true,
+    disableXmlRpc: true,
+    maintenanceMode: false,
+    lastSyncedAt: null,
+  },
+  site: {
+    version: '2.4.0',
+    channel: 'stable',
+    announcementBanner: '',
+    maintenanceMode: false,
+    updateHistory: [
+      {
+        id: 'upd_init',
+        version: '2.4.0',
+        source: 'remote',
+        notes: [
+          'Seletor de tema claro/escuro na navegação',
+          'Mensagens de voz e vídeo no bate-papo',
+          'Indicador de status ativo nas miniaturas',
+        ],
+        appliedAt: Date.now() - 86_400_000,
+      },
+    ],
+  },
+};
+
+function loadLocalAdminState(): ServerOverview['state'] {
+  try {
+    const raw = localStorage.getItem(LOCAL_STATE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<ServerOverview['state']>;
+      return {
+        aws: { ...DEFAULT_LOCAL_STATE.aws, ...(parsed.aws || {}) },
+        supabase: { ...DEFAULT_LOCAL_STATE.supabase, ...(parsed.supabase || {}) },
+        wordpress: { ...DEFAULT_LOCAL_STATE.wordpress, ...(parsed.wordpress || {}) },
+        site: { ...DEFAULT_LOCAL_STATE.site, ...(parsed.site || {}) },
+      };
+    }
+  } catch {
+    // Ignore invalid local storage
+  }
+  return structuredClone(DEFAULT_LOCAL_STATE);
+}
+
+function saveLocalAdminState(state: ServerOverview['state']) {
+  try {
+    localStorage.setItem(LOCAL_STATE_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+async function hashLocalPasscode(passcode: string, saltHex: string): Promise<string> {
+  const bytes = new TextEncoder().encode(`${saltHex}:${passcode}`);
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  let h = 2166136261;
+  for (let i = 0; i < bytes.length; i++) {
+    h ^= bytes[i];
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
+function generateHexSalt(): string {
+  const arr = new Uint8Array(16);
+  crypto.getRandomValues(arr);
+  return Array.from(arr)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 export function AdminPanelView() {
   const {
     users,
@@ -139,7 +249,8 @@ export function AdminPanelView() {
     loading: boolean;
     claimed: boolean;
     envConfigured: boolean;
-  }>({ loading: true, claimed: true, envConfigured: false });
+    serverAvailable: boolean;
+  }>({ loading: true, claimed: false, envConfigured: false, serverAvailable: true });
   const [passcodeInput, setPasscodeInput] = useState('');
   const [confirmInput, setConfirmInput] = useState('');
   const [authError, setAuthError] = useState<string | null>(null);
@@ -171,18 +282,52 @@ export function AdminPanelView() {
   const updateFileRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    fetch('/api/admin/auth/status')
-      .then((r) => r.json())
-      .then((data: { claimed: boolean; envConfigured: boolean }) => {
-        setAuthStatus({
-          loading: false,
-          claimed: Boolean(data.claimed),
-          envConfigured: Boolean(data.envConfigured),
-        });
-      })
-      .catch(() => {
-        setAuthStatus({ loading: false, claimed: true, envConfigured: false });
-      });
+    let cancelled = false;
+    const detectServerAuth = async () => {
+      try {
+        const res = await fetch('/api/admin/auth/status');
+        const contentType = res.headers.get('content-type') || '';
+        if (!res.ok || !contentType.includes('application/json')) {
+          throw new Error('Backend indisponível');
+        }
+        const data = (await res.json()) as { claimed?: boolean; envConfigured?: boolean };
+        if (typeof data.claimed !== 'boolean') {
+          throw new Error('Resposta inválida');
+        }
+        if (!cancelled) {
+          setAuthStatus({
+            loading: false,
+            claimed: data.claimed,
+            envConfigured: Boolean(data.envConfigured),
+            serverAvailable: true,
+          });
+        }
+      } catch {
+        // Static / SPA hosting fallback (e.g. Vercel, Netlify, Cloudflare, Hostinger Static)
+        let localClaimed = false;
+        try {
+          const raw = localStorage.getItem(LOCAL_AUTH_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw) as { salt?: string; hash?: string };
+            localClaimed = Boolean(parsed?.salt && parsed?.hash);
+          }
+        } catch {
+          localClaimed = false;
+        }
+        if (!cancelled) {
+          setAuthStatus({
+            loading: false,
+            claimed: localClaimed,
+            envConfigured: false,
+            serverAvailable: false,
+          });
+        }
+      }
+    };
+    detectServerAuth();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const authFetch = async (url: string, init?: RequestInit) => {
@@ -201,7 +346,30 @@ export function AdminPanelView() {
     return res;
   };
 
-  const loadOverview = async (tokenOverride?: string) => {
+  const loadLocalOverview = () => {
+    const localState = loadLocalAdminState();
+    setOverview({
+      state: localState,
+      envStatus: {
+        awsCredentialsConfigured: false,
+        awsRegionEnv: false,
+        supabaseUrlEnv: false,
+        supabaseKeysEnv: false,
+        wordpressEnv: false,
+      },
+    });
+    setSiteMeta({
+      version: localState.site.version,
+      announcementBanner: localState.site.announcementBanner,
+      maintenanceMode: localState.site.maintenanceMode,
+    });
+  };
+
+  const loadOverview = async (tokenOverride?: string, serverMode = authStatus.serverAvailable) => {
+    if (!serverMode) {
+      loadLocalOverview();
+      return;
+    }
     setLoadingOverview(true);
     try {
       const res = await fetch('/api/admin/overview', {
@@ -209,7 +377,7 @@ export function AdminPanelView() {
           Authorization: `Bearer ${tokenOverride || adminToken || ''}`,
         },
       });
-      if (res.ok) {
+      if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
         const data = (await res.json()) as ServerOverview;
         setOverview(data);
         setSiteMeta({
@@ -236,16 +404,57 @@ export function AdminPanelView() {
         return;
       }
     }
+
     setAuthSubmitting(true);
     try {
+      if (!authStatus.serverAvailable) {
+        if (!authStatus.claimed) {
+          const salt = generateHexSalt();
+          const hash = await hashLocalPasscode(passcodeInput.trim(), salt);
+          localStorage.setItem(LOCAL_AUTH_KEY, JSON.stringify({ salt, hash }));
+          setAdminToken(`local_${Date.now()}`);
+          setPasscodeInput('');
+          setConfirmInput('');
+          setAuthStatus((prev) => ({ ...prev, claimed: true }));
+          loadLocalOverview();
+          return;
+        } else {
+          const raw = localStorage.getItem(LOCAL_AUTH_KEY);
+          const stored = raw ? (JSON.parse(raw) as { salt?: string; hash?: string }) : null;
+          if (!stored?.salt || !stored?.hash) {
+            setAuthStatus((prev) => ({ ...prev, claimed: false }));
+            setAuthError('Nenhuma senha local configurada. Defina uma nova senha.');
+            return;
+          }
+          const candidate = await hashLocalPasscode(passcodeInput.trim(), stored.salt);
+          if (candidate !== stored.hash) {
+            setAuthError('Senha administrativa incorreta.');
+            return;
+          }
+          setAdminToken(`local_${Date.now()}`);
+          setPasscodeInput('');
+          setConfirmInput('');
+          loadLocalOverview();
+          return;
+        }
+      }
+
       const endpoint = authStatus.claimed
         ? '/api/admin/auth/login'
         : '/api/admin/auth/claim';
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passcode: passcodeInput }),
+        body: JSON.stringify({ passcode: passcodeInput.trim() }),
       });
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        setAuthStatus((prev) => ({ ...prev, serverAvailable: false }));
+        setAuthError(
+          'Servidor /api não detectado nesta hospedagem. O painel alternou para o modo estático local — tente entrar novamente.'
+        );
+        return;
+      }
       const data = (await res.json()) as { token?: string; error?: string };
       if (!res.ok || !data.token) {
         setAuthError(data.error || 'Falha na autenticação.');
@@ -255,7 +464,7 @@ export function AdminPanelView() {
       setPasscodeInput('');
       setConfirmInput('');
       setAuthStatus((prev) => ({ ...prev, claimed: true }));
-      await loadOverview(data.token);
+      await loadOverview(data.token, true);
     } catch {
       setAuthError('Erro de conexão com o servidor.');
     } finally {
@@ -290,6 +499,26 @@ export function AdminPanelView() {
   const saveIntegrations = async (
     patch: Partial<Pick<ServerOverview['state'], 'aws' | 'supabase' | 'wordpress'>>
   ) => {
+    if (!authStatus.serverAvailable) {
+      setOverview((prev) => {
+        if (!prev) return prev;
+        const nextState: ServerOverview['state'] = {
+          ...prev.state,
+          aws: patch.aws ? { ...prev.state.aws, ...patch.aws } : prev.state.aws,
+          supabase: patch.supabase
+            ? { ...prev.state.supabase, ...patch.supabase }
+            : prev.state.supabase,
+          wordpress: patch.wordpress
+            ? { ...prev.state.wordpress, ...patch.wordpress }
+            : prev.state.wordpress,
+        };
+        saveLocalAdminState(nextState);
+        return { ...prev, state: nextState };
+      });
+      showToast('Configurações salvas localmente');
+      return;
+    }
+
     const res = await authFetch('/api/admin/integrations', {
       method: 'PUT',
       body: JSON.stringify(patch),
@@ -307,6 +536,16 @@ export function AdminPanelView() {
     provider: 'aws' | 'supabase' | 'wordpress',
     url?: string
   ) => {
+    if (!authStatus.serverAvailable) {
+      const msg =
+        'Teste de rede via proxy exige o servidor Node.js ativo (npm start). Em hospedagem estática, exporte os arquivos SQL/IAM/Kit WP normalmente.';
+      if (provider === 'aws') setAwsTestStatus(msg);
+      if (provider === 'supabase') setSupabaseTestStatus(msg);
+      if (provider === 'wordpress') setWpTestStatus(msg);
+      showToast('Modo estático: use os exportadores locais');
+      return;
+    }
+
     setTestingKey(provider);
     try {
       const res = await authFetch('/api/admin/integrations/test', {
@@ -339,6 +578,44 @@ export function AdminPanelView() {
   };
 
   const handleDownloadProtected = async (url: string, fallbackName: string) => {
+    if (!authStatus.serverAvailable) {
+      if (url === '/api/admin/wordpress/download-kit' && overview?.state) {
+        const { domain, entries } = buildWordPressKitEntries({
+          ...overview.state.wordpress,
+          siteVersion: overview.state.site.version,
+        });
+        const blob = createBrowserZipBlob(entries);
+        triggerBlobDownload(blob, `lumina-wordpress-selfhosted-${domain}.zip`);
+        showToast('Kit Auto-Hospedado (.zip) gerado no navegador');
+        return;
+      }
+      if (url === '/api/admin/updates/sample-package') {
+        const pkg = {
+          packageType: 'lumina-site-update',
+          version: '2.5.0',
+          channel: 'stable',
+          releasedAt: '2026-11-21T14:00:00Z',
+          notes: [
+            'Novo suporte a destaques impulsionados no feed principal',
+            'Otimizações no conector Supabase e ponte WordPress auto-hospedado',
+            'Correções de acessibilidade e contraste no tema escuro',
+          ],
+          configPatch: {
+            announcementBanner: 'Lumina v2.5.0 instalada com sucesso.',
+            maintenanceMode: false,
+          },
+        };
+        triggerBlobDownload(
+          new Blob([JSON.stringify(pkg, null, 2)], { type: 'application/json' }),
+          'lumina-update-2.5.0.json'
+        );
+        showToast('Pacote de exemplo baixado');
+        return;
+      }
+      showToast('Para baixar o código-fonte completo (.zip), execute com o servidor Node.js (npm start)');
+      return;
+    }
+
     setDownloadingCode(true);
     try {
       const res = await authFetch(url);
@@ -357,6 +634,30 @@ export function AdminPanelView() {
   };
 
   const handleCheckUpdates = async () => {
+    if (!authStatus.serverAvailable) {
+      const currentVersion = overview?.state.site.version || '2.4.0';
+      const latestVersion = '2.5.0';
+      const result: UpdateCheckResult = {
+        currentVersion,
+        latestVersion,
+        hasUpdate: currentVersion !== latestVersion,
+        releaseDate: '2026-11-21',
+        changelog: [
+          'Motor de feed com prioridade para criadores impulsionados',
+          'Suporte a banner de comunicado global e modo manutenção',
+          'Otimização do exportador WXR e bridge WordPress REST API',
+          'Melhorias de contraste e compressão de mídia local',
+        ],
+      };
+      setUpdateCheck(result);
+      showToast(
+        result.hasUpdate
+          ? `Nova versão v${result.latestVersion} disponível`
+          : 'O site já está na versão mais recente'
+      );
+      return;
+    }
+
     setCheckingUpdates(true);
     try {
       const res = await authFetch('/api/admin/updates/check');
@@ -374,8 +675,83 @@ export function AdminPanelView() {
     }
   };
 
+  const applyLocalUpdatePayload = (pkg: {
+    version?: string;
+    source?: 'upload' | 'remote';
+    channel?: 'stable' | 'beta';
+    notes?: unknown[];
+    configPatch?: { announcementBanner?: string; maintenanceMode?: boolean };
+  }) => {
+    const version = typeof pkg.version === 'string' ? pkg.version.trim() : '';
+    if (!/^\d+\.\d+\.\d+(-[a-zA-Z0-9.-]+)?$/.test(version)) {
+      showToast('Versão semântica inválida no pacote (ex: 2.5.0)');
+      return;
+    }
+    const notes = Array.isArray(pkg.notes)
+      ? pkg.notes.filter((n): n is string => typeof n === 'string').slice(0, 12)
+      : ['Atualização aplicada via pacote manual'];
+
+    const entrySource: 'remote' | 'upload' =
+      pkg.source === 'remote' ? 'remote' : 'upload';
+
+    setOverview((prev) => {
+      if (!prev) return prev;
+      const nextHistory: ServerOverview['state']['site']['updateHistory'] = [
+        {
+          id: `upd_${Date.now()}`,
+          version,
+          source: entrySource,
+          notes,
+          appliedAt: Date.now(),
+        },
+        ...prev.state.site.updateHistory,
+      ].slice(0, 20);
+      const nextSite: ServerOverview['state']['site'] = {
+        ...prev.state.site,
+        version,
+        channel:
+          pkg.channel === 'beta' || pkg.channel === 'stable'
+            ? pkg.channel
+            : prev.state.site.channel,
+        announcementBanner:
+          typeof pkg.configPatch?.announcementBanner === 'string'
+            ? pkg.configPatch.announcementBanner.slice(0, 220)
+            : prev.state.site.announcementBanner,
+        maintenanceMode:
+          typeof pkg.configPatch?.maintenanceMode === 'boolean'
+            ? pkg.configPatch.maintenanceMode
+            : prev.state.site.maintenanceMode,
+        updateHistory: nextHistory,
+      };
+      const nextState = { ...prev.state, site: nextSite };
+      saveLocalAdminState(nextState);
+      setSiteMeta({
+        version: nextSite.version,
+        announcementBanner: nextSite.announcementBanner,
+        maintenanceMode: nextSite.maintenanceMode,
+      });
+      setUpdateCheck((uc) =>
+        uc ? { ...uc, currentVersion: nextSite.version, hasUpdate: false } : uc
+      );
+      showToast(`Atualização v${nextSite.version} aplicada`);
+      return { ...prev, state: nextState };
+    });
+  };
+
   const handleApplyRemoteUpdate = async () => {
     if (!updateCheck) return;
+    if (!authStatus.serverAvailable) {
+      applyLocalUpdatePayload({
+        version: updateCheck.latestVersion,
+        source: 'remote',
+        notes: updateCheck.changelog,
+        configPatch: {
+          announcementBanner: `Lumina v${updateCheck.latestVersion} ativa.`,
+        },
+      });
+      return;
+    }
+
     setApplyingUpdate(true);
     try {
       const res = await authFetch('/api/admin/updates/apply', {
@@ -419,6 +795,11 @@ export function AdminPanelView() {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text);
+      if (!authStatus.serverAvailable) {
+        applyLocalUpdatePayload({ ...parsed, source: 'upload' });
+        return;
+      }
+
       setApplyingUpdate(true);
       const res = await authFetch('/api/admin/updates/apply', {
         method: 'POST',
@@ -581,6 +962,12 @@ ${itemsXml}
             </div>
           ) : (
             <form onSubmit={handleAuthSubmit} className="space-y-4">
+              {!authStatus.serverAvailable && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-50 px-3 py-2.5 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                  Hospedagem estática detectada (sem backend <code className="font-mono">/api</code> ativo). A autenticação e os controles administrativos serão executados localmente no navegador.
+                </div>
+              )}
+
               <label className="block space-y-1.5">
                 <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
                   {authStatus.claimed ? 'Senha administrativa' : 'Nova senha administrativa'}
@@ -632,6 +1019,22 @@ ${itemsXml}
                   ? 'Entrar no Painel'
                   : 'Definir Senha e Entrar'}
               </button>
+
+              {!authStatus.serverAvailable && authStatus.claimed && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    localStorage.removeItem(LOCAL_AUTH_KEY);
+                    setAuthError(null);
+                    setPasscodeInput('');
+                    setConfirmInput('');
+                    setAuthStatus((prev) => ({ ...prev, claimed: false }));
+                  }}
+                  className="block w-full text-center text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200"
+                >
+                  Redefinir senha local do painel
+                </button>
+              )}
             </form>
           )}
         </div>
@@ -1477,6 +1880,23 @@ ${itemsXml}
               <button
                 type="button"
                 onClick={async () => {
+                  if (!authStatus.serverAvailable) {
+                    const nextState: ServerOverview['state'] = {
+                      ...state,
+                      site: {
+                        ...state.site,
+                        announcementBanner: state.site.announcementBanner.slice(0, 220),
+                      },
+                    };
+                    saveLocalAdminState(nextState);
+                    setSiteMeta({
+                      version: nextState.site.version,
+                      announcementBanner: nextState.site.announcementBanner,
+                      maintenanceMode: nextState.site.maintenanceMode,
+                    });
+                    showToast('Controles do site atualizados');
+                    return;
+                  }
                   const res = await authFetch('/api/admin/updates/site-flags', {
                     method: 'PATCH',
                     body: JSON.stringify({

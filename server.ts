@@ -16,15 +16,16 @@ const ROOT_DIR = path.resolve(process.cwd());
 const ADMIN_AUTH_FILE = path.join(ROOT_DIR, '.lumina-admin-auth.json');
 const ADMIN_STATE_FILE = path.join(ROOT_DIR, '.lumina-admin-state.json');
 
-const SESSION_SIGNING_KEY = process.env.SESSION_SECRET
-  ? Buffer.from(process.env.SESSION_SECRET, 'utf8')
-  : crypto.randomBytes(32);
+const FALLBACK_RANDOM_KEY = crypto.randomBytes(32);
 
 interface AdminAuthRecord {
   salt: string;
   hash: string;
   createdAt: number;
 }
+
+let memoryAuthRecord: AdminAuthRecord | null = null;
+let memoryAdminState: IntegrationState | null = null;
 
 interface IntegrationState {
   aws: {
@@ -133,6 +134,9 @@ const DEFAULT_ADMIN_STATE: IntegrationState = {
 };
 
 function readAdminState(): IntegrationState {
+  if (memoryAdminState) {
+    return memoryAdminState;
+  }
   try {
     if (fs.existsSync(ADMIN_STATE_FILE)) {
       const raw = fs.readFileSync(ADMIN_STATE_FILE, 'utf8');
@@ -151,19 +155,48 @@ function readAdminState(): IntegrationState {
 }
 
 function writeAdminState(state: IntegrationState): void {
-  fs.writeFileSync(ADMIN_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+  memoryAdminState = structuredClone(state);
+  try {
+    fs.writeFileSync(ADMIN_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+  } catch {
+    // Hosting filesystem may be read-only; keep state in memory
+  }
 }
 
 function readAuthRecord(): AdminAuthRecord | null {
+  if (memoryAuthRecord) return memoryAuthRecord;
   try {
     if (fs.existsSync(ADMIN_AUTH_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(ADMIN_AUTH_FILE, 'utf8')) as AdminAuthRecord;
-      if (parsed.salt && parsed.hash) return parsed;
+      if (parsed.salt && parsed.hash) {
+        memoryAuthRecord = parsed;
+        return parsed;
+      }
     }
   } catch {
     // Ignore invalid file
   }
   return null;
+}
+
+function getSessionSigningKey(): Buffer {
+  if (process.env.SESSION_SECRET?.trim()) {
+    return crypto.createHash('sha256').update(process.env.SESSION_SECRET.trim()).digest();
+  }
+  if (process.env.ADMIN_PASSCODE?.trim()) {
+    return crypto
+      .createHash('sha256')
+      .update(`lumina-session:${process.env.ADMIN_PASSCODE.trim()}`)
+      .digest();
+  }
+  const record = readAuthRecord();
+  if (record) {
+    return crypto
+      .createHash('sha256')
+      .update(`lumina-session:${record.salt}:${record.hash}`)
+      .digest();
+  }
+  return FALLBACK_RANDOM_KEY;
 }
 
 function hashPasscode(passcode: string, salt: string): string {
@@ -198,7 +231,7 @@ function signSessionToken(): string {
   ).toString('base64url');
 
   const sig = crypto
-    .createHmac('sha256', SESSION_SIGNING_KEY)
+    .createHmac('sha256', getSessionSigningKey())
     .update(payload)
     .digest('base64url');
   return `${payload}.${sig}`;
@@ -209,7 +242,7 @@ function verifySessionToken(token: string): boolean {
   if (parts.length !== 2) return false;
   const [payload, sig] = parts;
   const expected = crypto
-    .createHmac('sha256', SESSION_SIGNING_KEY)
+    .createHmac('sha256', getSessionSigningKey())
     .update(payload)
     .digest('base64url');
 
@@ -395,11 +428,22 @@ async function startServer() {
     }
     const salt = crypto.randomBytes(16).toString('hex');
     const hash = hashPasscode(passcode, salt);
-    fs.writeFileSync(
-      ADMIN_AUTH_FILE,
-      JSON.stringify({ salt, hash, createdAt: Date.now() }, null, 2),
-      { encoding: 'utf8', flag: 'wx' }
-    );
+    const record: AdminAuthRecord = { salt, hash, createdAt: Date.now() };
+    memoryAuthRecord = record;
+    try {
+      fs.writeFileSync(
+        ADMIN_AUTH_FILE,
+        JSON.stringify(record, null, 2),
+        { encoding: 'utf8', flag: 'wx' }
+      );
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'EEXIST') {
+        res.status(409).json({ error: 'A conta administrativa já foi configurada.' });
+        return;
+      }
+      // Read-only filesystem fallback: memoryAuthRecord remains active
+    }
     const token = signSessionToken();
     res.json({ token });
   });

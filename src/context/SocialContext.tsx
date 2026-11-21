@@ -173,12 +173,37 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const refreshSiteMeta = async () => {
     try {
       const res = await fetch('/api/site/meta');
-      if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
         const data = (await res.json()) as SiteMeta;
-        setSiteMeta(data);
+        if (data && typeof data.version === 'string') {
+          setSiteMeta(data);
+          return;
+        }
       }
     } catch {
-      // Ignore network hiccup
+      // Fallback to local admin state on static hosting
+    }
+    try {
+      const raw = localStorage.getItem('lumina_admin_local_state_v1');
+      if (raw) {
+        const parsed = JSON.parse(raw) as { site?: Partial<SiteMeta> };
+        if (parsed?.site) {
+          setSiteMeta((prev) => ({
+            version: typeof parsed.site?.version === 'string' ? parsed.site.version : prev.version,
+            announcementBanner:
+              typeof parsed.site?.announcementBanner === 'string'
+                ? parsed.site.announcementBanner
+                : prev.announcementBanner,
+            maintenanceMode:
+              typeof parsed.site?.maintenanceMode === 'boolean'
+                ? parsed.site.maintenanceMode
+                : prev.maintenanceMode,
+          }));
+        }
+      }
+    } catch {
+      // Ignore storage error
     }
   };
 
