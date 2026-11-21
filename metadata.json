@@ -1,0 +1,6 @@
+{
+  "name": "Lumina",
+  "description": "Rede social visual com feed em tempo real, stories interativos, reels, estúdio de filtros e mensagens diretas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
