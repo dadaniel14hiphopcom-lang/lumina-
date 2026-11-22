@@ -17,6 +17,7 @@ export type PostCategory =
 
 export interface UserProfile {
   id: string;
+  uid?: string;
   username: string;
   displayName: string;
   avatarUrl: string;
@@ -88,6 +89,7 @@ export interface MediaAsset {
 export interface Post {
   id: string;
   authorId: string;
+  authorUid?: string;
   media: MediaAsset[];
   caption: string;
   location?: string;
@@ -104,6 +106,7 @@ export interface Post {
 export interface StoryItem {
   id: string;
   authorId: string;
+  authorUid?: string;
   mediaUrl: string;
   caption?: string;
   location?: string;

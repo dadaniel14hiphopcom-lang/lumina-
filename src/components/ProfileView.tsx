@@ -2,6 +2,7 @@ import {
   BadgeCheck,
   Bookmark,
   CheckCircle2,
+  Cloud,
   Eye,
   EyeOff,
   Film,
@@ -24,7 +25,7 @@ import {
 import React, { useMemo, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { ASSETS, STUDIO_SAMPLE_IMAGES } from '../data/seed';
-import { isVideoAsset } from '../utils/media';
+import { compressImageFile, isVideoAsset } from '../utils/media';
 import { formatCompactCount } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -50,6 +51,8 @@ export function ProfileView() {
     isAuthenticated,
     logout,
     openAuthModal,
+    cloudConnected,
+    loginWithGoogle,
     hasPasswordForCurrentUser,
     changePassword,
   } = useSocial();
@@ -189,32 +192,38 @@ export function ProfileView() {
     }
   };
 
-  const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (reader.result) setEditAvatar(String(reader.result));
-    };
-    reader.readAsDataURL(file);
+    const compressed = await compressImageFile(file, {
+      maxWidth: 480,
+      maxHeight: 480,
+      quality: 0.82,
+      maxChars: 180_000,
+    });
+    if (compressed) setEditAvatar(compressed);
   };
 
-  const handleCoverUpload = (e: React.ChangeEvent<HTMLInputElement>, applyImmediately = false) => {
+  const handleCoverUpload = async (
+    e: React.ChangeEvent<HTMLInputElement>,
+    applyImmediately = false
+  ) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (reader.result) {
-        const dataUrl = String(reader.result);
-        setEditCover(dataUrl);
-        if (applyImmediately) {
-          updateProfile({ coverUrl: dataUrl });
-        }
+    const compressed = await compressImageFile(file, {
+      maxWidth: 1200,
+      maxHeight: 800,
+      quality: 0.8,
+      maxChars: 280_000,
+    });
+    if (compressed) {
+      setEditCover(compressed);
+      if (applyImmediately) {
+        updateProfile({ coverUrl: compressed });
       }
-    };
-    reader.readAsDataURL(file);
+    }
   };
 
   const listIds =
@@ -339,6 +348,16 @@ export function ProfileView() {
                   <LogOut className="h-3.5 w-3.5" />
                   <span>Sair</span>
                 </button>
+                {!cloudConnected && (
+                  <button
+                    type="button"
+                    onClick={() => void loginWithGoogle()}
+                    className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg border border-sky-200 bg-sky-50 px-3 text-xs font-semibold text-sky-700 hover:bg-sky-100 dark:border-sky-900/50 dark:bg-sky-950/40 dark:text-sky-300 dark:hover:bg-sky-950/70"
+                  >
+                    <Cloud className="h-3.5 w-3.5" />
+                    <span>Sincronizar fotos na nuvem (Google)</span>
+                  </button>
+                )}
               </div>
             ) : !isAuthenticated ? (
               <button

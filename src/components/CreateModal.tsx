@@ -22,6 +22,7 @@ import {
   FILTER_PRESETS,
   renderFilteredImage,
 } from '../utils/filters';
+import { compressImageFile } from '../utils/media';
 import { MediaImage } from './MediaImage';
 
 interface CreateModalProps {
@@ -201,7 +202,14 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     }
 
     const urls = await Promise.all(
-      files.map((file) => readBlobAsDataUrl(file).catch(() => ''))
+      files.map((file) =>
+        compressImageFile(file, {
+          maxWidth: 1280,
+          maxHeight: 1600,
+          quality: 0.82,
+          maxChars: 340_000,
+        }).catch(() => '')
+      )
     );
     const valid = urls.filter(Boolean).map((url) => ({
       url,

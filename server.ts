@@ -16,6 +16,7 @@ const ROOT_DIR = path.resolve(process.cwd());
 const ADMIN_AUTH_FILE = path.join(ROOT_DIR, '.lumina-admin-auth.json');
 const ADMIN_STATE_FILE = path.join(ROOT_DIR, '.lumina-admin-state.json');
 const USER_AUTH_FILE = path.join(ROOT_DIR, '.lumina-user-auth.json');
+const SOCIAL_STATE_FILE = path.join(ROOT_DIR, '.lumina-social-state.json');
 
 const FALLBACK_RANDOM_KEY = crypto.randomBytes(32);
 
@@ -34,9 +35,20 @@ interface UserAuthRecord {
   createdAt: number;
 }
 
+interface SharedSocialState {
+  version: number;
+  updatedAt: number;
+  users: Record<string, unknown>[];
+  posts: Record<string, unknown>[];
+  stories: Record<string, unknown>[];
+  threads: Record<string, unknown>[];
+  notifications: Record<string, unknown>[];
+}
+
 let memoryAuthRecord: AdminAuthRecord | null = null;
 let memoryAdminState: IntegrationState | null = null;
 let memoryUserAuthRecords: UserAuthRecord[] | null = null;
+let memorySocialState: SharedSocialState | null = null;
 
 interface IntegrationState {
   aws: {
@@ -293,6 +305,31 @@ function verifyUserPassword(password: string, record: UserAuthRecord): boolean {
   const stored = Buffer.from(record.hash, 'hex');
   if (candidate.length !== stored.length) return false;
   return crypto.timingSafeEqual(candidate, stored);
+}
+
+function readSharedSocialState(): SharedSocialState | null {
+  if (memorySocialState) return memorySocialState;
+  try {
+    if (fs.existsSync(SOCIAL_STATE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(SOCIAL_STATE_FILE, 'utf8')) as SharedSocialState;
+      if (parsed && Array.isArray(parsed.users) && Array.isArray(parsed.posts)) {
+        memorySocialState = parsed;
+        return parsed;
+      }
+    }
+  } catch {
+    // Ignore malformed social state file
+  }
+  return null;
+}
+
+function writeSharedSocialState(next: SharedSocialState): void {
+  memorySocialState = next;
+  try {
+    fs.writeFileSync(SOCIAL_STATE_FILE, JSON.stringify(next), 'utf8');
+  } catch {
+    // Keep in memory if filesystem is read-only
+  }
 }
 
 function signSessionToken(): string {
@@ -1069,6 +1106,41 @@ async function startServer() {
     writeUserAuthRecords(filtered);
 
     res.json({ ok: true });
+  });
+
+  // Shared Social State Sync (multi-device fallback for Node-hosted instances)
+  app.get('/api/social/state', (_req, res) => {
+    const social = readSharedSocialState();
+    res.json({ ok: true, state: social });
+  });
+
+  app.put('/api/social/state', express.json({ limit: '10mb' }), (req, res) => {
+    const body = req.body || {};
+    if (!Array.isArray(body.users) || !Array.isArray(body.posts)) {
+      res.status(400).json({ error: 'Estrutura de sincronização inválida.' });
+      return;
+    }
+
+    const sanitizedUsers = (body.users as Record<string, unknown>[])
+      .slice(0, 200)
+      .map((u) => {
+        const { email: _stripEmail, ...publicFields } = u;
+        return publicFields;
+      });
+
+    const nextState: SharedSocialState = {
+      version: (memorySocialState?.version || 0) + 1,
+      updatedAt: Date.now(),
+      users: sanitizedUsers,
+      posts: (body.posts as Record<string, unknown>[]).slice(0, 200),
+      stories: Array.isArray(body.stories) ? (body.stories as Record<string, unknown>[]).slice(0, 100) : [],
+      threads: Array.isArray(body.threads) ? (body.threads as Record<string, unknown>[]).slice(0, 100) : [],
+      notifications: Array.isArray(body.notifications)
+        ? (body.notifications as Record<string, unknown>[]).slice(0, 200)
+        : [],
+    };
+    writeSharedSocialState(nextState);
+    res.json({ ok: true, version: nextState.version, updatedAt: nextState.updatedAt });
   });
 
   // Download Complete Self-Hosted WordPress Kit (.zip)

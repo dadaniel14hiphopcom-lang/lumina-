@@ -1,5 +1,6 @@
 import {
   BadgeCheck,
+  Cloud,
   Eye,
   EyeOff,
   ImagePlus,
@@ -14,6 +15,7 @@ import {
 import React, { useEffect, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { ASSETS, STUDIO_SAMPLE_IMAGES } from '../data/seed';
+import { compressImageFile } from '../utils/media';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
 
@@ -26,6 +28,7 @@ export function InviteRegisterModal() {
     pendingInviteMeta,
     registerWithInvite,
     loginWithCredentials,
+    loginWithGoogle,
   } = useSocial();
 
   const [mode, setMode] = useState<'register' | 'login'>('register');
@@ -69,18 +72,21 @@ export function InviteRegisterModal() {
 
   if (!isInviteModalOpen) return null;
 
-  const handleImagePick = (
+  const handleImagePick = async (
     e: React.ChangeEvent<HTMLInputElement>,
-    setter: (val: string) => void
+    setter: (val: string) => void,
+    kind: 'avatar' | 'cover'
   ) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (reader.result) setter(String(reader.result));
-    };
-    reader.readAsDataURL(file);
+    const compressed = await compressImageFile(
+      file,
+      kind === 'avatar'
+        ? { maxWidth: 480, maxHeight: 480, quality: 0.82, maxChars: 180_000 }
+        : { maxWidth: 1200, maxHeight: 800, quality: 0.8, maxChars: 280_000 }
+    );
+    if (compressed) setter(compressed);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -134,6 +140,19 @@ export function InviteRegisterModal() {
       const result = await loginWithCredentials(loginIdentifier, loginPassword);
       if (!result.ok) {
         setError(result.error || 'Não foi possível entrar na conta.');
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleGoogleLogin = async () => {
+    setError(null);
+    setSubmitting(true);
+    try {
+      const result = await loginWithGoogle();
+      if (!result.ok) {
+        setError(result.error || 'Não foi possível conectar com o Google.');
       }
     } finally {
       setSubmitting(false);
@@ -274,6 +293,25 @@ export function InviteRegisterModal() {
             >
               {submitting ? 'Verificando...' : 'Entrar na conta'}
             </button>
+
+            <div className="relative py-1">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-zinc-200 dark:border-zinc-800" />
+              </div>
+              <div className="relative flex justify-center text-[11px]">
+                <span className="bg-white px-2 text-zinc-400 dark:bg-zinc-950">ou</span>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={handleGoogleLogin}
+              className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 text-sm font-semibold text-zinc-900 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+            >
+              <Cloud className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+              <span>Entrar com Google (Nuvem)</span>
+            </button>
           </form>
         ) : (
           <form onSubmit={handleSubmit} className="space-y-4 p-5">
@@ -289,7 +327,7 @@ export function InviteRegisterModal() {
                   ref={coverRef}
                   type="file"
                   accept="image/*"
-                  onChange={(e) => handleImagePick(e, setCoverUrl)}
+                  onChange={(e) => void handleImagePick(e, setCoverUrl, 'cover')}
                   className="hidden"
                 />
                 <button
@@ -310,7 +348,7 @@ export function InviteRegisterModal() {
                   ref={avatarRef}
                   type="file"
                   accept="image/*"
-                  onChange={(e) => handleImagePick(e, setAvatarUrl)}
+                  onChange={(e) => void handleImagePick(e, setAvatarUrl, 'avatar')}
                   className="hidden"
                 />
                 <button

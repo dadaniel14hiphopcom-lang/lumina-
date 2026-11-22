@@ -1,0 +1,301 @@
+{
+  "entities": {
+    "PublicProfile": {
+      "title": "PublicProfile",
+      "description": "Public social profile synced across devices without private PII.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "username": { "type": "string", "minLength": 2, "maxLength": 40, "pattern": "^[a-z0-9._]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "avatarUrl": { "type": "string", "maxLength": 450000 },
+        "coverUrl": { "type": "string", "maxLength": 550000 },
+        "bio": { "type": "string", "maxLength": 220 },
+        "website": { "type": "string", "maxLength": 200 },
+        "verified": { "type": "boolean" },
+        "isOnline": { "type": "boolean" },
+        "isDemoSeed": { "type": "boolean" },
+        "restricted": { "type": "boolean" },
+        "boosted": { "type": "boolean" },
+        "followers": { "type": "array" },
+        "following": { "type": "array" },
+        "createdAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "uid",
+        "username",
+        "displayName",
+        "avatarUrl",
+        "bio",
+        "verified",
+        "isOnline",
+        "isDemoSeed",
+        "restricted",
+        "boosted",
+        "followers",
+        "following",
+        "createdAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PrivateUser": {
+      "title": "PrivateUser",
+      "description": "Private user account PII isolated per owner UID.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "profileId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 160 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "profileId", "email", "createdAt", "updatedAt"]
+    },
+    "Post": {
+      "title": "Post",
+      "description": "Feed photo, carousel, or short Reel publication synced across devices.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "authorId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "authorUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "visibility": { "type": "string", "enum": ["public"] },
+        "media": { "type": "array" },
+        "caption": { "type": "string", "maxLength": 2200 },
+        "location": { "type": "string", "maxLength": 120 },
+        "category": { "type": "string", "enum": ["Fotografia", "Arquitetura", "Gastronomia", "Viagem", "Design", "Arte"] },
+        "aspectRatio": { "type": "string", "enum": ["1:1", "4:5", "16:9", "9:16"] },
+        "isReel": { "type": "boolean" },
+        "audioTrack": { "type": "string", "maxLength": 120 },
+        "likes": { "type": "array" },
+        "savedBy": { "type": "array" },
+        "comments": { "type": "array" },
+        "createdAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "authorId",
+        "authorUid",
+        "visibility",
+        "media",
+        "caption",
+        "category",
+        "aspectRatio",
+        "likes",
+        "savedBy",
+        "comments",
+        "createdAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Story": {
+      "title": "Story",
+      "description": "24-hour story item synced across devices.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "authorId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "authorUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "active": { "type": "boolean" },
+        "mediaUrl": { "type": "string", "minLength": 1, "maxLength": 550000 },
+        "caption": { "type": "string", "maxLength": 300 },
+        "location": { "type": "string", "maxLength": 120 },
+        "viewedBy": { "type": "array" },
+        "reactions": { "type": "array" },
+        "createdAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "authorId",
+        "authorUid",
+        "active",
+        "mediaUrl",
+        "viewedBy",
+        "reactions",
+        "createdAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DirectThread": {
+      "title": "DirectThread",
+      "description": "Private direct message conversation between participants.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "participantIds": { "type": "array" },
+        "participantUids": { "type": "array" },
+        "messages": { "type": "array" },
+        "unreadBy": { "type": "array" },
+        "updatedAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "createdByUid",
+        "participantIds",
+        "participantUids",
+        "messages",
+        "unreadBy",
+        "updatedAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "User activity notification.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "recipientId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "recipientUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": { "type": "string", "enum": ["like", "comment", "follow", "mention"] },
+        "postId": { "type": "string", "maxLength": 128 },
+        "text": { "type": "string", "maxLength": 400 },
+        "read": { "type": "boolean" },
+        "createdAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "recipientId",
+        "recipientUid",
+        "actorId",
+        "actorUid",
+        "type",
+        "read",
+        "createdAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Invite": {
+      "title": "Invite",
+      "description": "Administrator-issued registration invite.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "code": { "type": "string", "minLength": 4, "maxLength": 32 },
+        "email": { "type": "string", "maxLength": 160 },
+        "invitedName": { "type": "string", "maxLength": 80 },
+        "grantVerified": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["pending", "accepted", "revoked"] },
+        "expiresAt": { "type": "number" },
+        "createdAtMs": { "type": "number" },
+        "acceptedByUserId": { "type": "string", "maxLength": 128 },
+        "acceptedByUid": { "type": "string", "maxLength": 128 },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "code",
+        "email",
+        "grantVerified",
+        "status",
+        "expiresAt",
+        "createdAtMs",
+        "createdByUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SiteConfig": {
+      "title": "SiteConfig",
+      "description": "Global Lumina site flags, announcement banner, and Reels video limits.",
+      "type": "object",
+      "properties": {
+        "scope": { "type": "string", "enum": ["public"] },
+        "version": { "type": "string", "maxLength": 32 },
+        "announcementBanner": { "type": "string", "maxLength": 240 },
+        "maintenanceMode": { "type": "boolean" },
+        "realUsersOnly": { "type": "boolean" },
+        "maxVideoSizeMB": { "type": "number" },
+        "maxReelDurationSec": { "type": "number" },
+        "allowVideoReels": { "type": "boolean" },
+        "updatedByUid": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "scope",
+        "version",
+        "announcementBanner",
+        "maintenanceMode",
+        "realUsersOnly",
+        "maxVideoSizeMB",
+        "maxReelDurationSec",
+        "allowVideoReels",
+        "updatedByUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminRole": {
+      "title": "AdminRole",
+      "description": "Verified administrator role marker document.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 160 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/profiles/{profileId}": {
+      "schema": { "$ref": "#/entities/PublicProfile" },
+      "description": "Public profile records (avatars, covers, bios, followers/following) synced across devices."
+    },
+    "/users_private/{userId}": {
+      "schema": { "$ref": "#/entities/PrivateUser" },
+      "description": "Private user PII (email) isolated to the account owner and admins."
+    },
+    "/posts/{postId}": {
+      "schema": { "$ref": "#/entities/Post" },
+      "description": "Feed posts and Reels synced across devices."
+    },
+    "/stories/{storyId}": {
+      "schema": { "$ref": "#/entities/Story" },
+      "description": "24h stories synced across devices."
+    },
+    "/threads/{threadId}": {
+      "schema": { "$ref": "#/entities/DirectThread" },
+      "description": "Direct messaging threads accessible strictly to thread participants."
+    },
+    "/notifications/{notifId}": {
+      "schema": { "$ref": "#/entities/Notification" },
+      "description": "Activity notifications accessible to the recipient or admin."
+    },
+    "/invites/{inviteId}": {
+      "schema": { "$ref": "#/entities/Invite" },
+      "description": "Admin invitation records."
+    },
+    "/site_meta/{docId}": {
+      "schema": { "$ref": "#/entities/SiteConfig" },
+      "description": "Site-wide configuration and Reel rules."
+    },
+    "/admins/{uid}": {
+      "schema": { "$ref": "#/entities/AdminRole" },
+      "description": "Administrator registry."
+    }
+  }
+}

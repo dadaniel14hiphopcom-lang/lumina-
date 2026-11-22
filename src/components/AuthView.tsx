@@ -1,7 +1,7 @@
 import {
-  ArrowRight,
   BadgeCheck,
   Camera,
+  Cloud,
   Eye,
   EyeOff,
   KeyRound,
@@ -11,7 +11,7 @@ import {
   Shield,
   Sun,
 } from 'lucide-react';
-import React, { useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { AvatarRing } from './AvatarRing';
 
@@ -21,7 +21,7 @@ export function AuthView() {
     theme,
     toggleTheme,
     loginWithCredentials,
-    switchUser,
+    loginWithGoogle,
     openAuthModal,
     hasPasswordForUser,
     setGuestBrowsing,
@@ -34,8 +34,15 @@ export function AuthView() {
   const [error, setError] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
 
   const passwordInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Only show genuinely registered non-demo accounts (never demo seed accounts)
+  const registeredUsers = useMemo(
+    () => users.filter((u) => !u.isDemoSeed && hasPasswordForUser(u.id)),
+    [users, hasPasswordForUser]
+  );
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -56,16 +63,26 @@ export function AuthView() {
     }
   };
 
-  const handleQuickAccountClick = (userId: string, username: string) => {
+  const handleGoogleSignIn = async () => {
     setError(null);
-    if (hasPasswordForUser(userId)) {
-      setIdentifier(`@${username}`);
-      setPassword('');
-      setHint(`Digite a senha de @${username} para entrar.`);
-      window.setTimeout(() => passwordInputRef.current?.focus(), 40);
-      return;
+    setHint(null);
+    setGoogleLoading(true);
+    try {
+      const res = await loginWithGoogle();
+      if (!res.ok) {
+        setError(res.error || 'Não foi possível entrar com o Google.');
+      }
+    } finally {
+      setGoogleLoading(false);
     }
-    switchUser(userId);
+  };
+
+  const handleRegisteredAccountSelect = (username: string) => {
+    setError(null);
+    setIdentifier(`@${username}`);
+    setPassword('');
+    setHint(`Digite a senha cadastrada para @${username} para entrar.`);
+    window.setTimeout(() => passwordInputRef.current?.focus(), 40);
   };
 
   return (
@@ -104,13 +121,33 @@ export function AuthView() {
       {/* Main Sign-in Card */}
       <main className="mx-auto my-8 w-full max-w-md space-y-5">
         <div className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-950 sm:p-7">
-          <div className="mb-6 space-y-1">
+          <div className="mb-5 space-y-1">
             <h1 className="text-xl font-bold tracking-tight text-zinc-950 dark:text-white">
               Entrar na sua conta
             </h1>
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Conecte-se com seu @usuário ou e-mail e senha de acesso.
+              Acesso exclusivo para usuários cadastrados. Entre com sua conta Google ou com usuário e senha.
             </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleGoogleSignIn}
+            disabled={googleLoading}
+            className="mb-4 inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-white text-sm font-semibold text-zinc-900 transition-colors hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white dark:hover:bg-zinc-800"
+          >
+            <Cloud className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+            <span>
+              {googleLoading ? 'Conectando...' : 'Entrar com Google (Nuvem)'}
+            </span>
+          </button>
+
+          <div className="mb-4 flex items-center gap-3">
+            <span className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />
+            <span className="text-[11px] font-medium text-zinc-400 dark:text-zinc-500">
+              ou usuário e senha
+            </span>
+            <span className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />
           </div>
 
           <form onSubmit={handleLogin} className="space-y-4">
@@ -185,7 +222,7 @@ export function AuthView() {
           <div className="my-5 flex items-center gap-3">
             <span className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />
             <span className="text-[11px] font-medium text-zinc-400 dark:text-zinc-500">
-              ou
+              novo por aqui?
             </span>
             <span className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />
           </div>
@@ -199,53 +236,41 @@ export function AuthView() {
             <span>Cadastrar com código de convite</span>
           </button>
 
-          {users.length > 0 && (
+          {registeredUsers.length > 0 && (
             <div className="mt-5 border-t border-zinc-100 pt-4 dark:border-zinc-800/80">
               <p className="mb-2.5 text-xs font-semibold text-zinc-500 dark:text-zinc-400">
-                Perfis neste dispositivo
+                Contas cadastradas neste dispositivo
               </p>
               <div className="max-h-44 space-y-1.5 overflow-y-auto pr-1">
-                {users.slice(0, 5).map((u) => {
-                  const hasPass = hasPasswordForUser(u.id);
-                  return (
-                    <button
-                      key={u.id}
-                      type="button"
-                      onClick={() => handleQuickAccountClick(u.id, u.username)}
-                      className="flex w-full items-center justify-between gap-2.5 rounded-xl border border-zinc-200/80 px-3 py-2 text-left transition-colors hover:bg-zinc-50 dark:border-zinc-800/80 dark:hover:bg-zinc-900"
-                    >
-                      <div className="flex min-w-0 items-center gap-2.5">
-                        <AvatarRing src={u.avatarUrl} alt={u.username} size="sm" />
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-1">
-                            <span className="truncate text-xs font-semibold text-zinc-950 dark:text-zinc-100">
-                              @{u.username}
-                            </span>
-                            {u.verified && (
-                              <BadgeCheck className="h-3.5 w-3.5 shrink-0 text-sky-500" />
-                            )}
-                          </div>
-                          <p className="truncate text-[11px] text-zinc-500 dark:text-zinc-400">
-                            {u.displayName}
-                          </p>
+                {registeredUsers.slice(0, 5).map((u) => (
+                  <button
+                    key={u.id}
+                    type="button"
+                    onClick={() => handleRegisteredAccountSelect(u.username)}
+                    className="flex w-full items-center justify-between gap-2.5 rounded-xl border border-zinc-200/80 px-3 py-2 text-left transition-colors hover:bg-zinc-50 dark:border-zinc-800/80 dark:hover:bg-zinc-900"
+                  >
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      <AvatarRing src={u.avatarUrl} alt={u.username} size="sm" />
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1">
+                          <span className="truncate text-xs font-semibold text-zinc-950 dark:text-zinc-100">
+                            @{u.username}
+                          </span>
+                          {u.verified && (
+                            <BadgeCheck className="h-3.5 w-3.5 shrink-0 text-sky-500" />
+                          )}
                         </div>
+                        <p className="truncate text-[11px] text-zinc-500 dark:text-zinc-400">
+                          {u.displayName}
+                        </p>
                       </div>
-                      <span className="inline-flex shrink-0 items-center gap-1 text-[11px] font-semibold text-sky-600 dark:text-sky-400">
-                        {hasPass ? (
-                          <>
-                            <Lock className="h-3 w-3" />
-                            <span>Senha</span>
-                          </>
-                        ) : (
-                          <>
-                            <span>Entrar</span>
-                            <ArrowRight className="h-3 w-3" />
-                          </>
-                        )}
-                      </span>
-                    </button>
-                  );
-                })}
+                    </div>
+                    <span className="inline-flex shrink-0 items-center gap-1 text-[11px] font-semibold text-sky-600 dark:text-sky-400">
+                      <Lock className="h-3 w-3" />
+                      <span>Senha</span>
+                    </span>
+                  </button>
+                ))}
               </div>
             </div>
           )}

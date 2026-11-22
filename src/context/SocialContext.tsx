@@ -1,4 +1,21 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { onAuthStateChanged, signInWithPopup, signOut, type User as FirebaseUser } from 'firebase/auth';
+import { auth, googleProvider } from '../lib/firebase';
+import {
+  adminUpdateProfileFlagsInCloud,
+  createInviteInCloud,
+  createPostInCloud,
+  createStoryInCloud,
+  deletePostInCloud,
+  ensureAdminDocIfMatched,
+  subscribeToCloudState,
+  syncSiteMetaToCloud,
+  updatePostInteractionInCloud,
+  updateProfileFollowersInCloud,
+  updateStoryInteractionInCloud,
+  upsertOwnProfileInCloud,
+  upsertThreadInCloud,
+} from '../lib/firestoreSync';
 import {
   DirectThread,
   InviteRecord,
@@ -276,6 +293,9 @@ interface SocialContextValue {
   isAuthenticated: boolean;
   guestBrowsing: boolean;
   setGuestBrowsing: (guest: boolean) => void;
+  firebaseUser: FirebaseUser | null;
+  cloudConnected: boolean;
+  loginWithGoogle: () => Promise<{ ok: boolean; error?: string }>;
   logout: () => void;
   hasPasswordForCurrentUser: boolean;
   hasPasswordForUser: (userId: string) => boolean;
@@ -440,6 +460,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const [inviteModalMode, setInviteModalMode] = useState<'register' | 'login'>('register');
   const [guestBrowsing, setGuestBrowsing] = useState(false);
   const [credentialsVersion, setCredentialsVersion] = useState(0);
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [serverSyncAvailable, setServerSyncAvailable] = useState(false);
 
   const openAuthModal = (mode: 'register' | 'login') => {
     setInviteModalMode(mode);
@@ -450,6 +472,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const tabIdRef = useRef<string>(`tab_${Math.random().toString(36).slice(2, 10)}`);
   const skipNextStateBroadcastRef = useRef(false);
   const skipNextInvitesBroadcastRef = useRef(false);
+  const skipNextServerPushRef = useRef(false);
+  const lastServerUpdatedAtRef = useRef(0);
 
   const refreshSiteMeta = async () => {
     try {
@@ -501,6 +525,140 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     refreshSiteMeta();
+  }, []);
+
+  // Helper to merge remote records cleanly by ID without losing local seed fallback
+  const mergeRecordsById = <T extends { id: string }>(localList: T[], remoteList: T[]): T[] => {
+    const map = new Map<string, T>();
+    for (const item of localList) map.set(item.id, item);
+    for (const item of remoteList) map.set(item.id, item);
+    return Array.from(map.values());
+  };
+
+  // Firebase Auth & Firestore real-time cross-device sync
+  useEffect(() => {
+    let unsubCloud: (() => void) | null = null;
+    const unsubAuth = onAuthStateChanged(auth, (fbUser) => {
+      setFirebaseUser(fbUser);
+      if (unsubCloud) {
+        unsubCloud();
+        unsubCloud = null;
+      }
+      if (!fbUser || !fbUser.emailVerified) return;
+
+      void ensureAdminDocIfMatched(fbUser).catch(() => {});
+
+      unsubCloud = subscribeToCloudState(fbUser, {
+        onProfiles: (cloudProfiles) => {
+          if (cloudProfiles.length === 0) return;
+          skipNextStateBroadcastRef.current = true;
+          skipNextServerPushRef.current = true;
+          setState((prev) => {
+            const merged = mergeRecordsById(prev.users, cloudProfiles);
+            return { ...prev, users: merged };
+          });
+        },
+        onPosts: (cloudPosts) => {
+          if (cloudPosts.length === 0) return;
+          skipNextStateBroadcastRef.current = true;
+          skipNextServerPushRef.current = true;
+          setState((prev) => ({
+            ...prev,
+            posts: mergeRecordsById(prev.posts, cloudPosts).sort((a, b) => b.createdAt - a.createdAt),
+          }));
+        },
+        onStories: (cloudStories) => {
+          if (cloudStories.length === 0) return;
+          skipNextStateBroadcastRef.current = true;
+          skipNextServerPushRef.current = true;
+          setState((prev) => ({
+            ...prev,
+            stories: mergeRecordsById(prev.stories, cloudStories).sort((a, b) => b.createdAt - a.createdAt),
+          }));
+        },
+        onThreads: (cloudThreads) => {
+          if (cloudThreads.length === 0) return;
+          skipNextStateBroadcastRef.current = true;
+          skipNextServerPushRef.current = true;
+          setState((prev) => ({
+            ...prev,
+            threads: mergeRecordsById(prev.threads, cloudThreads).sort((a, b) => b.updatedAt - a.updatedAt),
+          }));
+        },
+        onNotifications: (cloudNotifs) => {
+          if (cloudNotifs.length === 0) return;
+          skipNextStateBroadcastRef.current = true;
+          skipNextServerPushRef.current = true;
+          setState((prev) => ({
+            ...prev,
+            notifications: mergeRecordsById(prev.notifications, cloudNotifs).sort((a, b) => b.createdAt - a.createdAt),
+          }));
+        },
+        onSiteMeta: (cloudMeta) => {
+          setSiteMeta(cloudMeta);
+        },
+      });
+    });
+
+    return () => {
+      unsubAuth();
+      if (unsubCloud) unsubCloud();
+    };
+  }, []);
+
+  // Node server cross-device fallback sync (/api/social/state)
+  useEffect(() => {
+    let active = true;
+    const pullServerState = async () => {
+      try {
+        const res = await fetch('/api/social/state');
+        const ct = res.headers.get('content-type') || '';
+        if (!res.ok || !ct.includes('application/json')) return;
+        const data = (await res.json()) as {
+          ok?: boolean;
+          state?: {
+            updatedAt?: number;
+            users?: UserProfile[];
+            posts?: Post[];
+            stories?: StoryItem[];
+            threads?: DirectThread[];
+            notifications?: NotificationItem[];
+          } | null;
+        };
+        if (!active || !data.ok) return;
+        setServerSyncAvailable(true);
+        const remote = data.state;
+        if (!remote || !Array.isArray(remote.users) || !Array.isArray(remote.posts)) return;
+        if (remote.updatedAt && remote.updatedAt <= lastServerUpdatedAtRef.current) return;
+        lastServerUpdatedAtRef.current = remote.updatedAt || Date.now();
+        skipNextServerPushRef.current = true;
+        skipNextStateBroadcastRef.current = true;
+        setState((prev) => ({
+          ...prev,
+          users: mergeRecordsById(prev.users, remote.users!),
+          posts: mergeRecordsById(prev.posts, remote.posts!).sort((a, b) => b.createdAt - a.createdAt),
+          stories: Array.isArray(remote.stories)
+            ? mergeRecordsById(prev.stories, remote.stories).sort((a, b) => b.createdAt - a.createdAt)
+            : prev.stories,
+          threads: Array.isArray(remote.threads)
+            ? mergeRecordsById(prev.threads, remote.threads).sort((a, b) => b.updatedAt - a.updatedAt)
+            : prev.threads,
+          notifications: Array.isArray(remote.notifications)
+            ? mergeRecordsById(prev.notifications, remote.notifications).sort((a, b) => b.createdAt - a.createdAt)
+            : prev.notifications,
+        }));
+      } catch {
+        // Static hosting without Node /api/social/state
+      }
+    };
+    void pullServerState();
+    const timer = window.setInterval(() => {
+      void pullServerState();
+    }, 10000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
   }, []);
 
   // Cross-tab real-time synchronization for real user messages, posts, and profiles
@@ -637,7 +795,30 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       threads: state.threads,
       notifications: state.notifications,
     });
-  }, [state]);
+
+    if (skipNextServerPushRef.current) {
+      skipNextServerPushRef.current = false;
+    } else if (serverSyncAvailable) {
+      fetch('/api/social/state', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          users: state.users,
+          posts: state.posts,
+          stories: state.stories,
+          threads: state.threads,
+          notifications: state.notifications,
+        }),
+      })
+        .then(async (res) => {
+          if (res.ok) {
+            const data = (await res.json()) as { updatedAt?: number };
+            if (data.updatedAt) lastServerUpdatedAtRef.current = data.updatedAt;
+          }
+        })
+        .catch(() => {});
+    }
+  }, [state, serverSyncAvailable]);
 
   useEffect(() => {
     if (skipNextInvitesBroadcastRef.current) {
@@ -740,6 +921,106 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     );
   }, [currentUser.id, currentUser.username, credentialsVersion]);
 
+  const cloudConnected = Boolean(
+    (firebaseUser && firebaseUser.emailVerified) || serverSyncAvailable
+  );
+
+  const requireAuthForAction = (): boolean => {
+    if (isAuthenticated) return true;
+    showToast('Entre com uma conta cadastrada para interagir');
+    openAuthModal('login');
+    return false;
+  };
+
+  const loginWithGoogle = async (): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const cred = await signInWithPopup(auth, googleProvider);
+      const fbUser = cred.user;
+      if (!fbUser || !fbUser.emailVerified) {
+        return { ok: false, error: 'Use uma conta Google com e-mail verificado.' };
+      }
+
+      await ensureAdminDocIfMatched(fbUser).catch(() => {});
+
+      const cleanEmail = (fbUser.email || '').trim().toLowerCase();
+      const existingMatch = state.users.find(
+        (u) =>
+          !u.isDemoSeed &&
+          (u.uid === fbUser.uid ||
+            u.id === fbUser.uid ||
+            (cleanEmail && u.email?.toLowerCase() === cleanEmail))
+      );
+
+      let activeProfile: UserProfile;
+      if (existingMatch) {
+        activeProfile = {
+          ...existingMatch,
+          uid: fbUser.uid,
+          email: existingMatch.email || cleanEmail || undefined,
+          avatarUrl: existingMatch.avatarUrl || fbUser.photoURL || SEED_USERS[0].avatarUrl,
+          isOnline: true,
+          isDemoSeed: false,
+        };
+        setState((prev) => ({
+          ...prev,
+          users: prev.users.map((u) => (u.id === existingMatch.id ? activeProfile : u)),
+          currentUserId: activeProfile.id,
+          isAuthenticated: true,
+        }));
+      } else {
+        const baseHandle = (
+          fbUser.email?.split('@')[0] ||
+          fbUser.displayName ||
+          'usuario'
+        )
+          .toLowerCase()
+          .replace(/[^a-z0-9._]/g, '')
+          .slice(0, 24);
+        const safeHandle =
+          baseHandle.length >= 3
+            ? state.users.some((u) => u.username.toLowerCase() === baseHandle)
+              ? `${baseHandle}.${fbUser.uid.slice(0, 4).toLowerCase()}`
+              : baseHandle
+            : `user.${fbUser.uid.slice(0, 6).toLowerCase()}`;
+
+        activeProfile = {
+          id: fbUser.uid,
+          uid: fbUser.uid,
+          username: safeHandle,
+          displayName: fbUser.displayName?.trim() || safeHandle,
+          avatarUrl: fbUser.photoURL || SEED_USERS[0].avatarUrl,
+          coverUrl: SEED_USERS[0].coverUrl,
+          bio: 'Perfil conectado na nuvem Lumina.',
+          email: cleanEmail || undefined,
+          verified: false,
+          isOnline: true,
+          isDemoSeed: false,
+          followers: [],
+          following: [],
+        };
+        setState((prev) => ({
+          ...prev,
+          users: [activeProfile, ...prev.users.filter((u) => u.id !== activeProfile.id)],
+          currentUserId: activeProfile.id,
+          isAuthenticated: true,
+        }));
+      }
+
+      setGuestBrowsing(false);
+      setViewingProfileId(null);
+      setIsInviteModalOpen(false);
+      void upsertOwnProfileInCloud(activeProfile, fbUser).catch(() => {});
+      showToast(`Conectado na nuvem como @${activeProfile.username}`);
+      return { ok: true };
+    } catch (err) {
+      const msg =
+        err instanceof Error && err.message.includes('popup-closed-by-user')
+          ? 'Login com Google cancelado.'
+          : 'Não foi possível conectar com o Google. Tente novamente.';
+      return { ok: false, error: msg };
+    }
+  };
+
   const logout = () => {
     setSelectedPostId(null);
     setActiveStoryAuthorId(null);
@@ -749,15 +1030,22 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     setViewingProfileId(null);
     setActiveNav('feed');
     setState((prev) => ({ ...prev, isAuthenticated: false }));
+    if (auth.currentUser) {
+      void signOut(auth).catch(() => {});
+    }
     showToast('Você saiu da sua conta');
   };
 
   const switchUser = (userId: string) => {
+    const target = state.users.find((item) => item.id === userId);
+    if (!target || target.isDemoSeed) {
+      showToast('Apenas contas cadastradas podem entrar');
+      return;
+    }
     setState((prev) => ({ ...prev, currentUserId: userId, isAuthenticated: true }));
     setGuestBrowsing(false);
     setViewingProfileId(null);
-    const u = state.users.find((item) => item.id === userId);
-    if (u) showToast(`Conectado como @${u.username}`);
+    showToast(`Conectado como @${target.username}`);
   };
 
   const createAccount = (data: {
@@ -815,6 +1103,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       expiresAt: Date.now() + days * 24 * 60 * 60 * 1000,
     };
     setInvites((prev) => [record, ...prev]);
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void createInviteInCloud(record, auth.currentUser).catch(() => {});
+    }
     return record;
   };
 
@@ -949,6 +1240,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
     const newUser: UserProfile = {
       id: newId,
+      uid: auth.currentUser?.uid,
       username: cleanHandle,
       displayName: payload.displayName.trim() || cleanHandle,
       avatarUrl: payload.avatarUrl || SEED_USERS[0].avatarUrl,
@@ -969,6 +1261,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       isAuthenticated: true,
     }));
     setGuestBrowsing(false);
+
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void upsertOwnProfileInCloud(newUser, auth.currentUser).catch(() => {});
+    }
 
     if (localMatch) {
       setInvites((prev) =>
@@ -1179,38 +1475,44 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       Pick<UserProfile, 'displayName' | 'username' | 'bio' | 'website' | 'avatarUrl' | 'coverUrl' | 'email'>
     >
   ) => {
+    if (!requireAuthForAction()) return;
+    const updatedUser: UserProfile = { ...currentUser, ...updates };
     setState((prev) => ({
       ...prev,
       users: prev.users.map((u) =>
-        u.id === prev.currentUserId ? { ...u, ...updates } : u
+        u.id === prev.currentUserId ? updatedUser : u
       ),
     }));
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void upsertOwnProfileInCloud(updatedUser, auth.currentUser).catch(() => {});
+    }
     showToast('Perfil atualizado');
   };
 
   const toggleFollow = (targetUserId: string) => {
+    if (!requireAuthForAction()) return;
     if (targetUserId === currentUser.id) return;
+    const isFollowing = currentUser.following.includes(targetUserId);
+    const targetUser = state.users.find((u) => u.id === targetUserId);
+    const nextMeFollowing = isFollowing
+      ? currentUser.following.filter((id) => id !== targetUserId)
+      : [...currentUser.following, targetUserId];
+    const nextTargetFollowers = targetUser
+      ? isFollowing
+        ? targetUser.followers.filter((id) => id !== currentUser.id)
+        : [...targetUser.followers, currentUser.id]
+      : [];
+
     setState((prev) => {
       const me = prev.users.find((u) => u.id === prev.currentUserId);
       if (!me) return prev;
-      const isFollowing = me.following.includes(targetUserId);
 
       const updatedUsers = prev.users.map((u) => {
         if (u.id === prev.currentUserId) {
-          return {
-            ...u,
-            following: isFollowing
-              ? u.following.filter((id) => id !== targetUserId)
-              : [...u.following, targetUserId],
-          };
+          return { ...u, following: nextMeFollowing };
         }
         if (u.id === targetUserId) {
-          return {
-            ...u,
-            followers: isFollowing
-              ? u.followers.filter((id) => id !== prev.currentUserId)
-              : [...u.followers, prev.currentUserId],
-          };
+          return { ...u, followers: nextTargetFollowers };
         }
         return u;
       });
@@ -1231,22 +1533,29 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
       return { ...prev, users: updatedUsers, notifications: newNotifs };
     });
+
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void upsertOwnProfileInCloud({ ...currentUser, following: nextMeFollowing }, auth.currentUser).catch(() => {});
+      if (targetUser) {
+        void updateProfileFollowersInCloud(targetUser.id, nextTargetFollowers).catch(() => {});
+      }
+    }
   };
 
   const toggleLikePost = (postId: string) => {
-    setState((prev) => {
-      const targetPost = prev.posts.find((p) => p.id === postId);
-      const alreadyLiked = targetPost?.likes.includes(prev.currentUserId);
+    if (!requireAuthForAction()) return;
+    const targetPost = state.posts.find((p) => p.id === postId);
+    const alreadyLiked = targetPost?.likes.includes(currentUser.id);
+    const nextLikes = targetPost
+      ? alreadyLiked
+        ? targetPost.likes.filter((id) => id !== currentUser.id)
+        : [...targetPost.likes, currentUser.id]
+      : [];
 
-      const posts = prev.posts.map((p) => {
-        if (p.id !== postId) return p;
-        return {
-          ...p,
-          likes: alreadyLiked
-            ? p.likes.filter((id) => id !== prev.currentUserId)
-            : [...p.likes, prev.currentUserId],
-        };
-      });
+    setState((prev) => {
+      const posts = prev.posts.map((p) =>
+        p.id === postId ? { ...p, likes: nextLikes } : p
+      );
 
       const notifications =
         !alreadyLiked && targetPost && targetPost.authorId !== prev.currentUserId
@@ -1266,68 +1575,75 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
       return { ...prev, posts, notifications };
     });
+
+    if (targetPost && auth.currentUser && auth.currentUser.emailVerified) {
+      void updatePostInteractionInCloud({ ...targetPost, likes: nextLikes }).catch(() => {});
+    }
   };
 
   const toggleSavePost = (postId: string) => {
+    if (!requireAuthForAction()) return;
+    const targetPost = state.posts.find((p) => p.id === postId);
+    const saved = targetPost?.savedBy.includes(currentUser.id);
+    const nextSavedBy = targetPost
+      ? saved
+        ? targetPost.savedBy.filter((id) => id !== currentUser.id)
+        : [...targetPost.savedBy, currentUser.id]
+      : [];
+
     setState((prev) => ({
       ...prev,
-      posts: prev.posts.map((p) => {
-        if (p.id !== postId) return p;
-        const saved = p.savedBy.includes(prev.currentUserId);
-        return {
-          ...p,
-          savedBy: saved
-            ? p.savedBy.filter((id) => id !== prev.currentUserId)
-            : [...p.savedBy, prev.currentUserId],
-        };
-      }),
+      posts: prev.posts.map((p) =>
+        p.id === postId ? { ...p, savedBy: nextSavedBy } : p
+      ),
     }));
+
+    if (targetPost && auth.currentUser && auth.currentUser.emailVerified) {
+      void updatePostInteractionInCloud({ ...targetPost, savedBy: nextSavedBy }).catch(() => {});
+    }
   };
 
   const addComment = (postId: string, text: string, parentCommentId?: string) => {
+    if (!requireAuthForAction()) return;
     const trimmed = text.trim();
     if (!trimmed) return;
-    setState((prev) => {
-      const targetPost = prev.posts.find((p) => p.id === postId);
-      const posts = prev.posts.map((p) => {
-        if (p.id !== postId) return p;
-        if (parentCommentId) {
-          return {
-            ...p,
-            comments: p.comments.map((c) =>
-              c.id === parentCommentId
-                ? {
-                    ...c,
-                    replies: [
-                      ...c.replies,
-                      {
-                        id: `rep_${Date.now()}`,
-                        userId: prev.currentUserId,
-                        text: trimmed,
-                        createdAt: Date.now(),
-                        likes: [],
-                      },
-                    ],
-                  }
-                : c
-            ),
-          };
-        }
-        return {
-          ...p,
-          comments: [
-            ...p.comments,
+    const targetPost = state.posts.find((p) => p.id === postId);
+    const nextComments = targetPost
+      ? parentCommentId
+        ? targetPost.comments.map((c) =>
+            c.id === parentCommentId
+              ? {
+                  ...c,
+                  replies: [
+                    ...c.replies,
+                    {
+                      id: `rep_${Date.now()}`,
+                      userId: currentUser.id,
+                      text: trimmed,
+                      createdAt: Date.now(),
+                      likes: [],
+                    },
+                  ],
+                }
+              : c
+          )
+        : [
+            ...targetPost.comments,
             {
               id: `com_${Date.now()}`,
-              userId: prev.currentUserId,
+              userId: currentUser.id,
               text: trimmed,
               createdAt: Date.now(),
               likes: [],
               replies: [],
             },
-          ],
-        };
-      });
+          ]
+      : [];
+
+    setState((prev) => {
+      const posts = prev.posts.map((p) =>
+        p.id === postId ? { ...p, comments: nextComments } : p
+      );
 
       const notifications =
         targetPost && targetPost.authorId !== prev.currentUserId
@@ -1348,9 +1664,14 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
       return { ...prev, posts, notifications };
     });
+
+    if (targetPost && auth.currentUser && auth.currentUser.emailVerified) {
+      void updatePostInteractionInCloud({ ...targetPost, comments: nextComments }).catch(() => {});
+    }
   };
 
   const toggleLikeComment = (postId: string, commentId: string) => {
+    if (!requireAuthForAction()) return;
     setState((prev) => ({
       ...prev,
       posts: prev.posts.map((p) => {
@@ -1373,11 +1694,15 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   };
 
   const deletePost = (postId: string) => {
+    if (!requireAuthForAction()) return;
     setState((prev) => ({
       ...prev,
       posts: prev.posts.filter((p) => p.id !== postId),
     }));
     if (selectedPostId === postId) setSelectedPostId(null);
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void deletePostInCloud(postId).catch(() => {});
+    }
     showToast('Publicação removida');
   };
 
@@ -1396,6 +1721,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     isReel?: boolean;
     audioTrack?: string;
   }) => {
+    if (!requireAuthForAction()) return;
     if (currentUser.restricted) {
       showToast('Conta restrita pela administração — publicação bloqueada');
       return;
@@ -1413,6 +1739,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     const newPost: Post = {
       id: `post_${Date.now()}`,
       authorId: currentUser.id,
+      authorUid: auth.currentUser?.uid,
       media: assets.map((asset, idx) => ({
         id: `m_${Date.now()}_${idx}`,
         url: asset.url,
@@ -1436,14 +1763,19 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       ...prev,
       posts: [newPost, ...prev.posts],
     }));
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void createPostInCloud(newPost, currentUser, auth.currentUser).catch(() => {});
+    }
     setActiveNav(payload.isReel ? 'reels' : 'feed');
     showToast(payload.isReel ? 'Reel publicado no feed' : 'Publicação compartilhada');
   };
 
   const publishStory = (payload: { mediaUrl: string; caption?: string; location?: string }) => {
+    if (!requireAuthForAction()) return;
     const newStory: StoryItem = {
       id: `story_${Date.now()}`,
       authorId: currentUser.id,
+      authorUid: auth.currentUser?.uid,
       mediaUrl: payload.mediaUrl,
       caption: payload.caption?.trim() || undefined,
       location: payload.location?.trim() || undefined,
@@ -1455,33 +1787,43 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       ...prev,
       stories: [newStory, ...prev.stories],
     }));
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void createStoryInCloud(newStory, currentUser, auth.currentUser).catch(() => {});
+    }
     setActiveNav('feed');
     showToast('Story publicado por 24 horas');
   };
 
   const markStoryViewed = (storyId: string) => {
+    const story = state.stories.find((s) => s.id === storyId);
+    if (!story || story.viewedBy.includes(currentUser.id)) return;
+    const nextViewed = [...story.viewedBy, currentUser.id];
     setState((prev) => ({
       ...prev,
       stories: prev.stories.map((s) =>
-        s.id === storyId && !s.viewedBy.includes(prev.currentUserId)
-          ? { ...s, viewedBy: [...s.viewedBy, prev.currentUserId] }
-          : s
+        s.id === storyId ? { ...s, viewedBy: nextViewed } : s
       ),
     }));
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void updateStoryInteractionInCloud({ ...story, viewedBy: nextViewed }).catch(() => {});
+    }
   };
 
   const reactToStory = (storyId: string, emoji: string) => {
+    if (!requireAuthForAction()) return;
+    const story = state.stories.find((s) => s.id === storyId);
+    const nextReactions = story
+      ? [...story.reactions, { userId: currentUser.id, emoji }]
+      : [];
     setState((prev) => ({
       ...prev,
       stories: prev.stories.map((s) =>
-        s.id === storyId
-          ? {
-              ...s,
-              reactions: [...s.reactions, { userId: prev.currentUserId, emoji }],
-            }
-          : s
+        s.id === storyId ? { ...s, reactions: nextReactions } : s
       ),
     }));
+    if (story && auth.currentUser && auth.currentUser.emailVerified) {
+      void updateStoryInteractionInCloud({ ...story, reactions: nextReactions }).catch(() => {});
+    }
     showToast(`Reação ${emoji} enviada`);
   };
 
@@ -1498,40 +1840,56 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       videoName?: string;
     }
   ) => {
+    if (!requireAuthForAction()) return;
     const trimmed = text.trim();
     if (!trimmed && !options?.sharedPostId && !options?.audioUrl && !options?.videoUrl) {
       return;
     }
 
     const msgId = `dm_${Date.now()}`;
+    const fallbackLabel = options?.audioUrl
+      ? 'Mensagem de voz'
+      : options?.videoUrl
+      ? 'Vídeo'
+      : options?.sharedPostId
+      ? 'Compartilhou uma publicação'
+      : '';
+
+    const newMsg = {
+      id: msgId,
+      senderId: currentUser.id,
+      text: trimmed || fallbackLabel,
+      sharedPostId: options?.sharedPostId,
+      storyReplyUrl: options?.storyReplyUrl,
+      audioUrl: options?.audioUrl,
+      audioDurationSec: options?.audioDurationSec,
+      videoUrl: options?.videoUrl,
+      videoName: options?.videoName,
+      createdAt: Date.now(),
+    };
+
+    const existingThread = state.threads.find(
+      (t) =>
+        t.participantIds.includes(currentUser.id) &&
+        t.participantIds.includes(recipientId)
+    );
+
+    const updatedThread: DirectThread = existingThread
+      ? {
+          ...existingThread,
+          messages: [...existingThread.messages, newMsg],
+          unreadBy: [recipientId],
+          updatedAt: Date.now(),
+        }
+      : {
+          id: `thread_${Date.now()}`,
+          participantIds: [currentUser.id, recipientId],
+          messages: [newMsg],
+          unreadBy: [recipientId],
+          updatedAt: Date.now(),
+        };
+
     setState((prev) => {
-      const existing = prev.threads.find(
-        (t) =>
-          t.participantIds.includes(prev.currentUserId) &&
-          t.participantIds.includes(recipientId)
-      );
-
-      const fallbackLabel = options?.audioUrl
-        ? 'Mensagem de voz'
-        : options?.videoUrl
-        ? 'Vídeo'
-        : options?.sharedPostId
-        ? 'Compartilhou uma publicação'
-        : '';
-
-      const newMsg = {
-        id: msgId,
-        senderId: prev.currentUserId,
-        text: trimmed || fallbackLabel,
-        sharedPostId: options?.sharedPostId,
-        storyReplyUrl: options?.storyReplyUrl,
-        audioUrl: options?.audioUrl,
-        audioDurationSec: options?.audioDurationSec,
-        videoUrl: options?.videoUrl,
-        videoName: options?.videoName,
-        createdAt: Date.now(),
-      };
-
       const newNotif: NotificationItem = {
         id: `notif_${Date.now()}`,
         recipientId,
@@ -1542,44 +1900,27 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         read: false,
       };
 
-      if (existing) {
-        return {
-          ...prev,
-          threads: prev.threads
-            .map((t) =>
-              t.id === existing.id
-                ? {
-                    ...t,
-                    messages: [...t.messages, newMsg],
-                    unreadBy: [recipientId],
-                    updatedAt: Date.now(),
-                  }
-                : t
-            )
-            .sort((a, b) => b.updatedAt - a.updatedAt),
-          notifications:
-            recipientId !== prev.currentUserId
-              ? [newNotif, ...prev.notifications]
-              : prev.notifications,
-        };
-      }
+      const threadsList = existingThread
+        ? prev.threads
+            .map((t) => (t.id === existingThread.id ? updatedThread : t))
+            .sort((a, b) => b.updatedAt - a.updatedAt)
+        : [updatedThread, ...prev.threads];
 
-      const newThread: DirectThread = {
-        id: `thread_${Date.now()}`,
-        participantIds: [prev.currentUserId, recipientId],
-        messages: [newMsg],
-        unreadBy: [recipientId],
-        updatedAt: Date.now(),
-      };
       return {
         ...prev,
-        threads: [newThread, ...prev.threads],
+        threads: threadsList,
         notifications:
           recipientId !== prev.currentUserId
             ? [newNotif, ...prev.notifications]
             : prev.notifications,
       };
     });
+
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      const recipientUser = state.users.find((u) => u.id === recipientId);
+      const participantUids = [auth.currentUser.uid, recipientUser?.uid || ''].filter(Boolean);
+      void upsertThreadInCloud(updatedThread, participantUids, auth.currentUser).catch(() => {});
+    }
   };
 
   const markThreadRead = (threadId: string) => {
@@ -1653,61 +1994,73 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   };
 
   const toggleRestrictUser = (userId: string) => {
-    setState((prev) => {
-      const target = prev.users.find((u) => u.id === userId);
-      const nextVal = !target?.restricted;
+    const target = state.users.find((u) => u.id === userId);
+    const nextVal = !target?.restricted;
+    if (target) {
       showToast(
         nextVal
-          ? `@${target?.username || 'usuário'} foi restringido`
-          : `Restrição removida de @${target?.username || 'usuário'}`
+          ? `@${target.username} foi restringido`
+          : `Restrição removida de @${target.username}`
       );
-      return {
-        ...prev,
-        users: prev.users.map((u) =>
-          u.id === userId ? { ...u, restricted: nextVal } : u
-        ),
-      };
-    });
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        void adminUpdateProfileFlagsInCloud({ ...target, restricted: nextVal }, auth.currentUser).catch(() => {});
+      }
+    }
+    setState((prev) => ({
+      ...prev,
+      users: prev.users.map((u) =>
+        u.id === userId ? { ...u, restricted: nextVal } : u
+      ),
+    }));
   };
 
   const toggleBoostUser = (userId: string) => {
-    setState((prev) => {
-      const target = prev.users.find((u) => u.id === userId);
-      const nextVal = !target?.boosted;
+    const target = state.users.find((u) => u.id === userId);
+    const nextVal = !target?.boosted;
+    if (target) {
       showToast(
         nextVal
-          ? `Perfil @${target?.username || 'usuário'} impulsionado no feed`
-          : `Impulsionamento desativado para @${target?.username || 'usuário'}`
+          ? `Perfil @${target.username} impulsionado no feed`
+          : `Impulsionamento desativado para @${target.username}`
       );
-      return {
-        ...prev,
-        users: prev.users.map((u) =>
-          u.id === userId ? { ...u, boosted: nextVal } : u
-        ),
-      };
-    });
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        void adminUpdateProfileFlagsInCloud({ ...target, boosted: nextVal }, auth.currentUser).catch(() => {});
+      }
+    }
+    setState((prev) => ({
+      ...prev,
+      users: prev.users.map((u) =>
+        u.id === userId ? { ...u, boosted: nextVal } : u
+      ),
+    }));
   };
 
   const toggleVerifyUser = (userId: string) => {
-    setState((prev) => {
-      const target = prev.users.find((u) => u.id === userId);
-      const nextVal = !target?.verified;
+    const target = state.users.find((u) => u.id === userId);
+    const nextVal = !target?.verified;
+    if (target) {
       showToast(
         nextVal
-          ? `Selo de verificação concedido a @${target?.username || 'usuário'}`
-          : `Selo de verificação removido de @${target?.username || 'usuário'}`
+          ? `Selo de verificação concedido a @${target.username}`
+          : `Selo de verificação removido de @${target.username}`
       );
-      return {
-        ...prev,
-        users: prev.users.map((u) =>
-          u.id === userId ? { ...u, verified: nextVal } : u
-        ),
-      };
-    });
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        void adminUpdateProfileFlagsInCloud({ ...target, verified: nextVal }, auth.currentUser).catch(() => {});
+      }
+    }
+    setState((prev) => ({
+      ...prev,
+      users: prev.users.map((u) =>
+        u.id === userId ? { ...u, verified: nextVal } : u
+      ),
+    }));
   };
 
   const handleSetSiteMeta = (nextMeta: SiteMeta) => {
     setSiteMeta(nextMeta);
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void syncSiteMetaToCloud(nextMeta, auth.currentUser).catch(() => {});
+    }
     channelRef.current?.postMessage({
       senderTabId: tabIdRef.current,
       type: 'sitemeta_sync',
@@ -1751,6 +2104,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         isAuthenticated,
         guestBrowsing,
         setGuestBrowsing,
+        firebaseUser,
+        cloudConnected,
+        loginWithGoogle,
         logout,
         hasPasswordForCurrentUser,
         hasPasswordForUser,
