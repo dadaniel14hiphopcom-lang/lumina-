@@ -17,6 +17,7 @@ import { ShareSheetModal } from './components/ShareSheetModal';
 import { StoryBar } from './components/StoryBar';
 import { StoryViewer } from './components/StoryViewer';
 import { SocialProvider, useSocial } from './context/SocialContext';
+import { isExclusiveAdminUser } from './lib/firebase';
 
 function FeedStage({ onAddStory }: { onAddStory: () => void }) {
   const { posts, currentUser, users } = useSocial();
@@ -111,7 +112,9 @@ function LuminaShell() {
     siteMeta,
     isAuthenticated,
     guestBrowsing,
+    firebaseUser,
   } = useSocial();
+  const canSeeAdminEntry = !isAuthenticated || isExclusiveAdminUser(firebaseUser);
   const [createMode, setCreateMode] = useState<'post' | 'story' | 'reel'>('post');
 
   const openCreateWithMode = (mode: 'post' | 'story' | 'reel') => {
@@ -157,14 +160,16 @@ function LuminaShell() {
                 Modo de manutenção ativo no painel administrativo. A visualização pública está sinalizada.
               </span>
             </div>
-            <button
-              type="button"
-              onClick={() => setActiveNav('admin')}
-              className="inline-flex items-center gap-1.5 font-semibold underline hover:opacity-80"
-            >
-              <Shield className="h-3.5 w-3.5" />
-              <span>Gerenciar no Painel Admin</span>
-            </button>
+            {canSeeAdminEntry && (
+              <button
+                type="button"
+                onClick={() => setActiveNav('admin')}
+                className="inline-flex items-center gap-1.5 font-semibold underline hover:opacity-80"
+              >
+                <Shield className="h-3.5 w-3.5" />
+                <span>Gerenciar no Painel Admin</span>
+              </button>
+            )}
           </div>
         </div>
       )}

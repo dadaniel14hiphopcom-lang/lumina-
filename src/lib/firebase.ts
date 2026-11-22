@@ -5,6 +5,16 @@ import firebaseConfig from '../../firebase-applet-config.json';
 
 export const ADMIN_EMAIL = 'dadaniel14hiphop.com@gmail.com';
 
+export function isExclusiveAdminUser(
+  user?: { email?: string | null; emailVerified?: boolean } | null
+): boolean {
+  return Boolean(
+    user?.emailVerified &&
+      user.email &&
+      user.email.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase()
+  );
+}
+
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);

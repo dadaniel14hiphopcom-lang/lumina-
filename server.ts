@@ -19,6 +19,114 @@ const USER_AUTH_FILE = path.join(ROOT_DIR, '.lumina-user-auth.json');
 const SOCIAL_STATE_FILE = path.join(ROOT_DIR, '.lumina-social-state.json');
 
 const FALLBACK_RANDOM_KEY = crypto.randomBytes(32);
+const ADMIN_EMAIL = 'dadaniel14hiphop.com@gmail.com';
+
+function loadFirebaseProjectId(): string | null {
+  try {
+    const cfgPath = path.join(ROOT_DIR, 'firebase-applet-config.json');
+    if (fs.existsSync(cfgPath)) {
+      const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as { projectId?: string };
+      if (typeof parsed.projectId === 'string' && parsed.projectId.trim()) {
+        return parsed.projectId.trim();
+      }
+    }
+  } catch {
+    // Ignore invalid firebase config
+  }
+  return null;
+}
+
+const FIREBASE_PROJECT_ID = loadFirebaseProjectId();
+let cachedFirebaseCerts: { certs: Record<string, string>; expiresAt: number } | null = null;
+
+async function getFirebasePublicCerts(): Promise<Record<string, string>> {
+  if (cachedFirebaseCerts && cachedFirebaseCerts.expiresAt > Date.now()) {
+    return cachedFirebaseCerts.certs;
+  }
+  const resp = await fetch(
+    'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com'
+  );
+  if (!resp.ok) {
+    throw new Error('Falha ao obter certificados públicos do Firebase Auth.');
+  }
+  const certs = (await resp.json()) as Record<string, string>;
+  const cacheControl = resp.headers.get('cache-control') || '';
+  const maxAgeMatch = cacheControl.match(/max-age=(\d+)/i);
+  const maxAgeSec = maxAgeMatch ? Math.min(86400, Math.max(60, Number(maxAgeMatch[1]))) : 3600;
+  cachedFirebaseCerts = { certs, expiresAt: Date.now() + maxAgeSec * 1000 };
+  return certs;
+}
+
+async function verifyFirebaseIdToken(
+  idToken: string
+): Promise<{ uid: string; email: string; emailVerified: boolean }> {
+  if (!FIREBASE_PROJECT_ID) {
+    throw new Error('Firebase não configurado no servidor.');
+  }
+  const parts = idToken.split('.');
+  if (parts.length !== 3 || parts.some((p) => !p)) {
+    throw new Error('Token Firebase inválido.');
+  }
+  const [headerB64, payloadB64, sigB64] = parts;
+  const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8')) as {
+    alg?: string;
+    kid?: string;
+  };
+  if (header.alg !== 'RS256' || typeof header.kid !== 'string') {
+    throw new Error('Cabeçalho JWT inválido.');
+  }
+
+  const certs = await getFirebasePublicCerts();
+  const certPem = certs[header.kid];
+  if (!certPem) {
+    throw new Error('Chave pública do token não encontrada.');
+  }
+
+  const verifier = crypto.createVerify('RSA-SHA256');
+  verifier.update(`${headerB64}.${payloadB64}`);
+  verifier.end();
+  const validSig = verifier.verify(certPem, Buffer.from(sigB64, 'base64url'));
+  if (!validSig) {
+    throw new Error('Assinatura do token Firebase inválida.');
+  }
+
+  const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as {
+    aud?: string;
+    iss?: string;
+    sub?: string;
+    exp?: number;
+    iat?: number;
+    auth_time?: number;
+    email?: string;
+    email_verified?: boolean;
+  };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (payload.aud !== FIREBASE_PROJECT_ID) {
+    throw new Error('Audience do token incompatível.');
+  }
+  if (payload.iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) {
+    throw new Error('Issuer do token incompatível.');
+  }
+  if (typeof payload.sub !== 'string' || !payload.sub || payload.sub.length > 128) {
+    throw new Error('UID do token inválido.');
+  }
+  if (typeof payload.exp !== 'number' || payload.exp <= nowSec) {
+    throw new Error('Token Firebase expirado.');
+  }
+  if (typeof payload.iat !== 'number' || payload.iat > nowSec + 300) {
+    throw new Error('Data de emissão do token inválida.');
+  }
+  if (typeof payload.auth_time !== 'number' || payload.auth_time > nowSec + 300) {
+    throw new Error('auth_time inválido.');
+  }
+
+  return {
+    uid: payload.sub,
+    email: typeof payload.email === 'string' ? payload.email.trim().toLowerCase() : '',
+    emailVerified: payload.email_verified === true,
+  };
+}
 
 interface AdminAuthRecord {
   salt: string;
@@ -520,11 +628,46 @@ async function startServer() {
   app.get('/api/admin/auth/status', (_req, res) => {
     const envConfigured = Boolean(process.env.ADMIN_PASSCODE?.trim());
     const claimed = envConfigured || Boolean(readAuthRecord());
-    res.json({ claimed, envConfigured });
+    res.json({
+      claimed,
+      envConfigured,
+      firebaseAdminConfigured: Boolean(FIREBASE_PROJECT_ID),
+      adminEmail: ADMIN_EMAIL,
+    });
   });
 
-  // First-run atomic admin password claim (only when env ADMIN_PASSCODE is unset and no hash exists)
-  app.post('/api/admin/auth/claim', (req, res) => {
+  // Exclusive Firebase Admin sign-in (only verified ADMIN_EMAIL)
+  app.post('/api/admin/auth/firebase', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    const rawToken =
+      authHeader && authHeader.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : typeof req.body?.idToken === 'string'
+        ? req.body.idToken.trim()
+        : '';
+
+    if (!rawToken) {
+      res.status(401).json({ error: 'Token Firebase não enviado.' });
+      return;
+    }
+
+    try {
+      const verified = await verifyFirebaseIdToken(rawToken);
+      if (!verified.emailVerified || verified.email !== ADMIN_EMAIL.toLowerCase()) {
+        res.status(403).json({
+          error: `Acesso exclusivo: somente a conta ${ADMIN_EMAIL} pode entrar como administrador.`,
+        });
+        return;
+      }
+      const token = signSessionToken();
+      res.json({ token, email: verified.email, uid: verified.uid });
+    } catch {
+      res.status(401).json({ error: 'Sessão Google/Firebase inválida ou expirada.' });
+    }
+  });
+
+  // First-run atomic admin password claim (requires verified Firebase Admin when Firebase is active)
+  app.post('/api/admin/auth/claim', async (req, res) => {
     if (process.env.ADMIN_PASSCODE?.trim()) {
       res.status(409).json({ error: 'Senha administrativa gerenciada via variável de ambiente.' });
       return;
@@ -533,6 +676,30 @@ async function startServer() {
       res.status(409).json({ error: 'A conta administrativa já foi configurada.' });
       return;
     }
+    if (FIREBASE_PROJECT_ID) {
+      const authHeader = req.headers.authorization;
+      const rawToken =
+        authHeader && authHeader.startsWith('Bearer ')
+          ? authHeader.slice('Bearer '.length).trim()
+          : '';
+      if (!rawToken) {
+        res.status(403).json({
+          error: `Entre com a conta administradora (${ADMIN_EMAIL}) para configurar uma senha adicional.`,
+        });
+        return;
+      }
+      try {
+        const verified = await verifyFirebaseIdToken(rawToken);
+        if (!verified.emailVerified || verified.email !== ADMIN_EMAIL.toLowerCase()) {
+          res.status(403).json({ error: 'Somente o administrador autorizado pode configurar a senha.' });
+          return;
+        }
+      } catch {
+        res.status(401).json({ error: 'Sessão Google/Firebase inválida.' });
+        return;
+      }
+    }
+
     const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
     if (passcode.length < 6) {
       res.status(400).json({ error: 'A senha administrativa deve ter pelo menos 6 caracteres.' });

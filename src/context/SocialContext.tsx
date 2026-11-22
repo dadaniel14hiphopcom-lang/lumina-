@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, type User as FirebaseUser } from 'firebase/auth';
-import { auth, googleProvider } from '../lib/firebase';
+import { auth, googleProvider, isExclusiveAdminUser } from '../lib/firebase';
 import {
   adminUpdateProfileFlagsInCloud,
   createInviteInCloud,
@@ -945,6 +945,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
       await ensureAdminDocIfMatched(fbUser).catch(() => {});
 
+      const isExclusiveAdmin = isExclusiveAdminUser(fbUser);
       const cleanEmail = (fbUser.email || '').trim().toLowerCase();
       const existingMatch = state.users.find(
         (u) =>
@@ -961,6 +962,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           uid: fbUser.uid,
           email: existingMatch.email || cleanEmail || undefined,
           avatarUrl: existingMatch.avatarUrl || fbUser.photoURL || SEED_USERS[0].avatarUrl,
+          verified: isExclusiveAdmin ? true : existingMatch.verified,
           isOnline: true,
           isDemoSeed: false,
         };
@@ -993,9 +995,11 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           displayName: fbUser.displayName?.trim() || safeHandle,
           avatarUrl: fbUser.photoURL || SEED_USERS[0].avatarUrl,
           coverUrl: SEED_USERS[0].coverUrl,
-          bio: 'Perfil conectado na nuvem Lumina.',
+          bio: isExclusiveAdmin
+            ? 'Administrador exclusivo da rede Lumina.'
+            : 'Perfil conectado na nuvem Lumina.',
           email: cleanEmail || undefined,
-          verified: false,
+          verified: isExclusiveAdmin,
           isOnline: true,
           isDemoSeed: false,
           followers: [],
@@ -1012,8 +1016,17 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       setGuestBrowsing(false);
       setViewingProfileId(null);
       setIsInviteModalOpen(false);
-      void upsertOwnProfileInCloud(activeProfile, fbUser).catch(() => {});
-      showToast(`Conectado na nuvem como @${activeProfile.username}`);
+      void (async () => {
+        await upsertOwnProfileInCloud(activeProfile, fbUser).catch(() => {});
+        if (isExclusiveAdmin) {
+          await adminUpdateProfileFlagsInCloud(activeProfile, fbUser).catch(() => {});
+        }
+      })();
+      showToast(
+        isExclusiveAdmin
+          ? `Administrador conectado: @${activeProfile.username}`
+          : `Conectado na nuvem como @${activeProfile.username}`
+      );
       return { ok: true };
     } catch (err) {
       const msg =

@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_VIDEO_RULES, encodeInviteMeta, useSocial } from '../context/SocialContext';
+import { ADMIN_EMAIL, isExclusiveAdminUser } from '../lib/firebase';
 import { InviteRecord, VideoRulesConfig } from '../types';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { buildWordPressKitEntries, createBrowserZipBlob } from '../utils/zipClient';
@@ -132,7 +133,6 @@ function triggerBlobDownload(blob: Blob, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-const LOCAL_AUTH_KEY = 'lumina_admin_local_auth_v1';
 const LOCAL_STATE_KEY = 'lumina_admin_local_state_v1';
 
 const DEFAULT_LOCAL_STATE: ServerOverview['state'] = {
@@ -227,30 +227,6 @@ function saveLocalAdminState(state: ServerOverview['state']) {
   }
 }
 
-async function hashLocalPasscode(passcode: string, saltHex: string): Promise<string> {
-  const bytes = new TextEncoder().encode(`${saltHex}:${passcode}`);
-  if (typeof crypto !== 'undefined' && crypto.subtle) {
-    const digest = await crypto.subtle.digest('SHA-256', bytes);
-    return Array.from(new Uint8Array(digest))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-  }
-  let h = 2166136261;
-  for (let i = 0; i < bytes.length; i++) {
-    h ^= bytes[i];
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0).toString(16);
-}
-
-function generateHexSalt(): string {
-  const arr = new Uint8Array(16);
-  crypto.getRandomValues(arr);
-  return Array.from(arr)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
 export function AdminPanelView() {
   const {
     allUsers,
@@ -267,10 +243,15 @@ export function AdminPanelView() {
     createInvite,
     revokeInvite,
     purgeDemoUsers,
+    firebaseUser,
+    loginWithGoogle,
   } = useSocial();
 
   // Auth held strictly in React memory (never localStorage)
   const [adminToken, setAdminToken] = useState<string | null>(null);
+  const [manualLock, setManualLock] = useState(false);
+  const [showServerPasscodeForm, setShowServerPasscodeForm] = useState(false);
+  const [firebaseAdminLoading, setFirebaseAdminLoading] = useState(false);
   const [authStatus, setAuthStatus] = useState<{
     loading: boolean;
     claimed: boolean;
@@ -336,21 +317,11 @@ export function AdminPanelView() {
           });
         }
       } catch {
-        // Static / SPA hosting fallback (e.g. Vercel, Netlify, Cloudflare, Hostinger Static)
-        let localClaimed = false;
-        try {
-          const raw = localStorage.getItem(LOCAL_AUTH_KEY);
-          if (raw) {
-            const parsed = JSON.parse(raw) as { salt?: string; hash?: string };
-            localClaimed = Boolean(parsed?.salt && parsed?.hash);
-          }
-        } catch {
-          localClaimed = false;
-        }
+        // Static / SPA hosting fallback: exclusive Google/Firebase Admin authentication only
         if (!cancelled) {
           setAuthStatus({
             loading: false,
-            claimed: localClaimed,
+            claimed: false,
             envConfigured: false,
             serverAvailable: false,
           });
@@ -429,9 +400,87 @@ export function AdminPanelView() {
     }
   };
 
+  const authenticateExclusiveAdminWithFirebase = async (
+    userOverride = firebaseUser
+  ): Promise<boolean> => {
+    if (!userOverride || !isExclusiveAdminUser(userOverride)) {
+      return false;
+    }
+    setAuthError(null);
+    setFirebaseAdminLoading(true);
+    try {
+      if (!authStatus.serverAvailable) {
+        setAdminToken(`firebase_admin_${userOverride.uid}`);
+        loadLocalOverview();
+        return true;
+      }
+
+      const idToken = await userOverride.getIdToken();
+      const res = await fetch('/api/admin/auth/firebase', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+      });
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('application/json')) {
+        setAuthStatus((prev) => ({ ...prev, serverAvailable: false }));
+        setAdminToken(`firebase_admin_${userOverride.uid}`);
+        loadLocalOverview();
+        return true;
+      }
+      const data = (await res.json()) as { token?: string; error?: string };
+      if (!res.ok || !data.token) {
+        setAuthError(data.error || 'Acesso administrativo negado.');
+        return false;
+      }
+      setAdminToken(data.token);
+      await loadOverview(data.token, true);
+      return true;
+    } catch {
+      setAuthError('Não foi possível validar a sessão administrativa.');
+      return false;
+    } finally {
+      setFirebaseAdminLoading(false);
+    }
+  };
+
+  // Automatic direct access when the exclusive administrator Google account is active
+  useEffect(() => {
+    if (authStatus.loading || adminToken || manualLock) return;
+    if (isExclusiveAdminUser(firebaseUser)) {
+      void authenticateExclusiveAdminWithFirebase(firebaseUser);
+    }
+  }, [authStatus.loading, authStatus.serverAvailable, firebaseUser, adminToken, manualLock]);
+
+  const handleExclusiveGoogleAdminLogin = async () => {
+    setAuthError(null);
+    setManualLock(false);
+    if (isExclusiveAdminUser(firebaseUser)) {
+      await authenticateExclusiveAdminWithFirebase(firebaseUser);
+      return;
+    }
+    setFirebaseAdminLoading(true);
+    try {
+      const res = await loginWithGoogle();
+      if (!res.ok) {
+        setAuthError(res.error || 'Login cancelado ou não autorizado.');
+      }
+    } finally {
+      setFirebaseAdminLoading(false);
+    }
+  };
+
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
+    if (!authStatus.serverAvailable) {
+      setAuthError(
+        `Use o botão de entrada exclusiva (${ADMIN_EMAIL}) para acessar o painel na hospedagem estática.`
+      );
+      return;
+    }
     if (!authStatus.claimed) {
       if (passcodeInput.trim().length < 6) {
         setAuthError('Escolha uma senha de acesso com pelo menos 6 caracteres.');
@@ -445,51 +494,23 @@ export function AdminPanelView() {
 
     setAuthSubmitting(true);
     try {
-      if (!authStatus.serverAvailable) {
-        if (!authStatus.claimed) {
-          const salt = generateHexSalt();
-          const hash = await hashLocalPasscode(passcodeInput.trim(), salt);
-          localStorage.setItem(LOCAL_AUTH_KEY, JSON.stringify({ salt, hash }));
-          setAdminToken(`local_${Date.now()}`);
-          setPasscodeInput('');
-          setConfirmInput('');
-          setAuthStatus((prev) => ({ ...prev, claimed: true }));
-          loadLocalOverview();
-          return;
-        } else {
-          const raw = localStorage.getItem(LOCAL_AUTH_KEY);
-          const stored = raw ? (JSON.parse(raw) as { salt?: string; hash?: string }) : null;
-          if (!stored?.salt || !stored?.hash) {
-            setAuthStatus((prev) => ({ ...prev, claimed: false }));
-            setAuthError('Nenhuma senha local configurada. Defina uma nova senha.');
-            return;
-          }
-          const candidate = await hashLocalPasscode(passcodeInput.trim(), stored.salt);
-          if (candidate !== stored.hash) {
-            setAuthError('Senha administrativa incorreta.');
-            return;
-          }
-          setAdminToken(`local_${Date.now()}`);
-          setPasscodeInput('');
-          setConfirmInput('');
-          loadLocalOverview();
-          return;
-        }
-      }
-
       const endpoint = authStatus.claimed
         ? '/api/admin/auth/login'
         : '/api/admin/auth/claim';
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (!authStatus.claimed && firebaseUser && isExclusiveAdminUser(firebaseUser)) {
+        headers.Authorization = `Bearer ${await firebaseUser.getIdToken()}`;
+      }
       const res = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ passcode: passcodeInput.trim() }),
       });
       const contentType = res.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
         setAuthStatus((prev) => ({ ...prev, serverAvailable: false }));
         setAuthError(
-          'Servidor /api não detectado nesta hospedagem. O painel alternou para o modo estático local — tente entrar novamente.'
+          `Servidor /api não detectado. Entre diretamente com sua conta Google Admin (${ADMIN_EMAIL}).`
         );
         return;
       }
@@ -498,6 +519,7 @@ export function AdminPanelView() {
         setAuthError(data.error || 'Falha na autenticação.');
         return;
       }
+      setManualLock(false);
       setAdminToken(data.token);
       setPasscodeInput('');
       setConfirmInput('');
@@ -1082,21 +1104,23 @@ ${itemsXml}
 
   // Render Admin Auth Gate if not authenticated
   if (!adminToken) {
+    const signedWrongGoogleAccount =
+      Boolean(firebaseUser) && !isExclusiveAdminUser(firebaseUser);
+    const isAdminGoogleReady = isExclusiveAdminUser(firebaseUser);
+
     return (
       <div className="mx-auto flex min-h-[calc(100vh-6rem)] w-full max-w-md items-center justify-center px-4 py-10">
-        <div className="w-full rounded-2xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-950">
-          <div className="mb-5 flex items-center gap-3">
+        <div className="w-full space-y-5 rounded-2xl border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-950">
+          <div className="flex items-center gap-3">
             <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-zinc-950 text-white dark:bg-white dark:text-zinc-950">
               <Shield className="h-5 w-5" />
             </span>
             <div>
               <h1 className="text-lg font-bold text-zinc-950 dark:text-white">
-                Painel Administrativo
+                Painel Administrativo Exclusivo
               </h1>
               <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                {authStatus.claimed
-                  ? 'Acesso protegido para moderação e infraestrutura'
-                  : 'Primeiro acesso: defina a senha administrativa'}
+                Acesso restrito ao administrador autorizado
               </p>
             </div>
           </div>
@@ -1106,45 +1130,23 @@ ${itemsXml}
               Verificando credenciais do servidor...
             </div>
           ) : (
-            <form onSubmit={handleAuthSubmit} className="space-y-4">
-              {!authStatus.serverAvailable && (
-                <div className="rounded-xl border border-amber-500/30 bg-amber-50 px-3 py-2.5 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-                  Hospedagem estática detectada (sem backend <code className="font-mono">/api</code> ativo). A autenticação e os controles administrativos serão executados localmente no navegador.
-                </div>
-              )}
+            <div className="space-y-4">
+              <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3.5 text-xs dark:border-zinc-800 dark:bg-zinc-900/70">
+                <p className="font-semibold text-zinc-900 dark:text-zinc-100">
+                  Conta Administradora Vinculada
+                </p>
+                <p className="mt-1 font-mono text-zinc-600 dark:text-zinc-300">
+                  {ADMIN_EMAIL}
+                </p>
+                <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                  Somente esta conta Google verificada tem permissão administrativa no banco de dados e no painel.
+                </p>
+              </div>
 
-              <label className="block space-y-1.5">
-                <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
-                  {authStatus.claimed ? 'Senha administrativa' : 'Nova senha administrativa'}
-                </span>
-                <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
-                  <KeyRound className="h-4 w-4 text-zinc-400" />
-                  <input
-                    type="password"
-                    value={passcodeInput}
-                    onChange={(e) => setPasscodeInput(e.target.value)}
-                    placeholder="Mínimo 6 caracteres"
-                    className="h-11 flex-1 bg-transparent text-sm text-zinc-950 focus:outline-none dark:text-white"
-                  />
+              {signedWrongGoogleAccount && (
+                <div className="rounded-xl border border-rose-500/30 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-800 dark:bg-rose-950/30 dark:text-rose-200">
+                  A conta atual (<strong>{firebaseUser?.email}</strong>) não possui permissão de administrador. Entre com <strong>{ADMIN_EMAIL}</strong>.
                 </div>
-              </label>
-
-              {!authStatus.claimed && (
-                <label className="block space-y-1.5">
-                  <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
-                    Confirmar senha
-                  </span>
-                  <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
-                    <Lock className="h-4 w-4 text-zinc-400" />
-                    <input
-                      type="password"
-                      value={confirmInput}
-                      onChange={(e) => setConfirmInput(e.target.value)}
-                      placeholder="Repita a senha"
-                      className="h-11 flex-1 bg-transparent text-sm text-zinc-950 focus:outline-none dark:text-white"
-                    />
-                  </div>
-                </label>
               )}
 
               {authError && (
@@ -1154,33 +1156,85 @@ ${itemsXml}
               )}
 
               <button
-                type="submit"
-                disabled={authSubmitting}
-                className="h-11 w-full rounded-xl bg-zinc-950 text-sm font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-white dark:text-zinc-950"
+                type="button"
+                disabled={firebaseAdminLoading}
+                onClick={() => void handleExclusiveGoogleAdminLogin()}
+                className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-sky-600 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
               >
-                {authSubmitting
-                  ? 'Validando...'
-                  : authStatus.claimed
-                  ? 'Entrar no Painel'
-                  : 'Definir Senha e Entrar'}
+                <Cloud className="h-4 w-4" />
+                <span>
+                  {firebaseAdminLoading
+                    ? 'Autenticando administrador...'
+                    : isAdminGoogleReady
+                    ? 'Entrar diretamente como Administrador'
+                    : 'Entrar como Administrador (Google)'}
+                </span>
               </button>
 
-              {!authStatus.serverAvailable && authStatus.claimed && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    localStorage.removeItem(LOCAL_AUTH_KEY);
-                    setAuthError(null);
-                    setPasscodeInput('');
-                    setConfirmInput('');
-                    setAuthStatus((prev) => ({ ...prev, claimed: false }));
-                  }}
-                  className="block w-full text-center text-xs font-medium text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200"
-                >
-                  Redefinir senha local do painel
-                </button>
+              {authStatus.serverAvailable && (authStatus.envConfigured || authStatus.claimed || isAdminGoogleReady) && (
+                <div className="border-t border-zinc-200 pt-3 dark:border-zinc-800">
+                  <button
+                    type="button"
+                    onClick={() => setShowServerPasscodeForm((v) => !v)}
+                    className="w-full text-center text-xs font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200"
+                  >
+                    {showServerPasscodeForm
+                      ? 'Ocultar acesso por chave do servidor'
+                      : 'Usar chave administrativa do servidor (.env)'}
+                  </button>
+
+                  {showServerPasscodeForm && (
+                    <form onSubmit={handleAuthSubmit} className="mt-3 space-y-3">
+                      <label className="block space-y-1.5">
+                        <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                          {authStatus.claimed ? 'Senha administrativa' : 'Definir senha extra do servidor'}
+                        </span>
+                        <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                          <KeyRound className="h-4 w-4 text-zinc-400" />
+                          <input
+                            type="password"
+                            value={passcodeInput}
+                            onChange={(e) => setPasscodeInput(e.target.value)}
+                            placeholder="Mínimo 6 caracteres"
+                            className="h-10 flex-1 bg-transparent text-sm text-zinc-950 focus:outline-none dark:text-white"
+                          />
+                        </div>
+                      </label>
+
+                      {!authStatus.claimed && (
+                        <label className="block space-y-1.5">
+                          <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                            Confirmar senha
+                          </span>
+                          <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                            <Lock className="h-4 w-4 text-zinc-400" />
+                            <input
+                              type="password"
+                              value={confirmInput}
+                              onChange={(e) => setConfirmInput(e.target.value)}
+                              placeholder="Repita a senha"
+                              className="h-10 flex-1 bg-transparent text-sm text-zinc-950 focus:outline-none dark:text-white"
+                            />
+                          </div>
+                        </label>
+                      )}
+
+                      <button
+                        type="submit"
+                        disabled={authSubmitting}
+                        className="h-10 w-full rounded-xl bg-zinc-950 text-xs font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-white dark:text-zinc-950"
+                      >
+                        {authSubmitting
+                          ? 'Validando...'
+                          : authStatus.claimed
+                          ? 'Entrar com chave'
+                          : 'Salvar chave e entrar'}
+                      </button>
+                    </form>
+                  )}
+                </div>
               )}
-            </form>
+            </div>
           )}
         </div>
       </div>
@@ -1196,6 +1250,7 @@ ${itemsXml}
         <div>
           <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
             Lumina Admin · v{state?.site.version || '2.4.0'}
+            {isExclusiveAdminUser(firebaseUser) && ` · Exclusivo (${ADMIN_EMAIL})`}
           </p>
           <h1 className="text-2xl font-bold tracking-tight text-zinc-950 dark:text-white">
             Painel Administrativo e Infraestrutura
@@ -1214,7 +1269,10 @@ ${itemsXml}
           </button>
           <button
             type="button"
-            onClick={() => setAdminToken(null)}
+            onClick={() => {
+              setManualLock(true);
+              setAdminToken(null);
+            }}
             className="inline-flex h-10 items-center gap-2 rounded-xl bg-zinc-100 px-3.5 text-xs font-semibold text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
           >
             <LogOut className="h-3.5 w-3.5" />

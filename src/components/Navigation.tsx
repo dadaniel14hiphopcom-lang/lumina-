@@ -13,6 +13,7 @@ import {
   Sun,
 } from 'lucide-react';
 import { useSocial } from '../context/SocialContext';
+import { isExclusiveAdminUser } from '../lib/firebase';
 import { NavSection } from '../types';
 import { AvatarRing } from './AvatarRing';
 
@@ -30,9 +31,12 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
     theme,
     toggleTheme,
     isAuthenticated,
+    firebaseUser,
     logout,
     openAuthModal,
   } = useSocial();
+
+  const canSeeAdminNav = !isAuthenticated || isExclusiveAdminUser(firebaseUser);
 
   const unreadNotifs = notifications.filter(
     (n) => n.recipientId === currentUser.id && !n.read
@@ -60,7 +64,9 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
       icon: Heart,
       badge: unreadNotifs,
     },
-    { id: 'admin', label: 'Painel Admin', icon: Shield },
+    ...(canSeeAdminNav
+      ? [{ id: 'admin' as const, label: 'Painel Admin', icon: Shield }]
+      : []),
   ];
 
   return (
@@ -245,18 +251,20 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
         </button>
 
         <div className="flex items-center gap-0.5">
-          <button
-            type="button"
-            onClick={() => setActiveNav('admin')}
-            aria-label="Painel Admin"
-            className={`flex h-11 w-11 items-center justify-center rounded-full transition-colors ${
-              activeNav === 'admin'
-                ? 'bg-zinc-100 text-zinc-950 dark:bg-zinc-900 dark:text-white'
-                : 'text-zinc-800 dark:text-zinc-200'
-            }`}
-          >
-            <Shield className="h-5 w-5" />
-          </button>
+          {canSeeAdminNav && (
+            <button
+              type="button"
+              onClick={() => setActiveNav('admin')}
+              aria-label="Painel Admin"
+              className={`flex h-11 w-11 items-center justify-center rounded-full transition-colors ${
+                activeNav === 'admin'
+                  ? 'bg-zinc-100 text-zinc-950 dark:bg-zinc-900 dark:text-white'
+                  : 'text-zinc-800 dark:text-zinc-200'
+              }`}
+            >
+              <Shield className="h-5 w-5" />
+            </button>
+          )}
 
           <button
             type="button"
