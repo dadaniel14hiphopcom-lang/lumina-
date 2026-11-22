@@ -21,6 +21,7 @@ import {
 
 interface PersistedState {
   currentUserId: string;
+  isAuthenticated?: boolean;
   users: UserProfile[];
   posts: Post[];
   stories: StoryItem[];
@@ -206,6 +207,7 @@ function loadInitialState(): PersistedState {
       if (parsed && Array.isArray(parsed.users) && Array.isArray(parsed.posts)) {
         return {
           ...parsed,
+          isAuthenticated: parsed.isAuthenticated !== false,
           users: parsed.users.map((u) => {
             const seedMatch = SEED_USERS.find((s) => s.id === u.id);
             return {
@@ -228,6 +230,7 @@ function loadInitialState(): PersistedState {
   }
   return {
     currentUserId: 'user_daniel',
+    isAuthenticated: true,
     users: SEED_USERS,
     posts: SEED_POSTS,
     stories: SEED_STORIES,
@@ -268,6 +271,18 @@ interface SocialContextValue {
   pendingInviteMeta: PendingInviteMeta | null;
   isInviteModalOpen: boolean;
   setIsInviteModalOpen: (open: boolean) => void;
+  inviteModalMode: 'register' | 'login';
+  openAuthModal: (mode: 'register' | 'login') => void;
+  isAuthenticated: boolean;
+  guestBrowsing: boolean;
+  setGuestBrowsing: (guest: boolean) => void;
+  logout: () => void;
+  hasPasswordForCurrentUser: boolean;
+  hasPasswordForUser: (userId: string) => boolean;
+  changePassword: (payload: {
+    currentPassword?: string;
+    newPassword: string;
+  }) => Promise<{ ok: boolean; error?: string }>;
   createInvite: (payload: {
     email: string;
     invitedName?: string;
@@ -422,6 +437,14 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     if (typeof window === 'undefined') return false;
     return Boolean(new URLSearchParams(window.location.search).get('invite')?.trim());
   });
+  const [inviteModalMode, setInviteModalMode] = useState<'register' | 'login'>('register');
+  const [guestBrowsing, setGuestBrowsing] = useState(false);
+  const [credentialsVersion, setCredentialsVersion] = useState(0);
+
+  const openAuthModal = (mode: 'register' | 'login') => {
+    setInviteModalMode(mode);
+    setIsInviteModalOpen(true);
+  };
 
   const channelRef = useRef<BroadcastChannel | null>(null);
   const tabIdRef = useRef<string>(`tab_${Math.random().toString(36).slice(2, 10)}`);
@@ -694,8 +717,44 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     });
   };
 
+  const isAuthenticated = state.isAuthenticated !== false;
+
+  const hasPasswordForUser = (userId: string) => {
+    void credentialsVersion;
+    const u = state.users.find((item) => item.id === userId);
+    const creds = loadLocalCredentials();
+    return creds.some(
+      (c) =>
+        c.userId === userId ||
+        (u && c.username.toLowerCase() === u.username.toLowerCase())
+    );
+  };
+
+  const hasPasswordForCurrentUser = useMemo(() => {
+    void credentialsVersion;
+    const creds = loadLocalCredentials();
+    return creds.some(
+      (c) =>
+        c.userId === currentUser.id ||
+        c.username.toLowerCase() === currentUser.username.toLowerCase()
+    );
+  }, [currentUser.id, currentUser.username, credentialsVersion]);
+
+  const logout = () => {
+    setSelectedPostId(null);
+    setActiveStoryAuthorId(null);
+    setIsCreateOpen(false);
+    setSharePostId(null);
+    setGuestBrowsing(false);
+    setViewingProfileId(null);
+    setActiveNav('feed');
+    setState((prev) => ({ ...prev, isAuthenticated: false }));
+    showToast('Você saiu da sua conta');
+  };
+
   const switchUser = (userId: string) => {
-    setState((prev) => ({ ...prev, currentUserId: userId }));
+    setState((prev) => ({ ...prev, currentUserId: userId, isAuthenticated: true }));
+    setGuestBrowsing(false);
     setViewingProfileId(null);
     const u = state.users.find((item) => item.id === userId);
     if (u) showToast(`Conectado como @${u.username}`);
@@ -730,7 +789,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       ...prev,
       users: [newUser, ...prev.users],
       currentUserId: newId,
+      isAuthenticated: true,
     }));
+    setGuestBrowsing(false);
     setViewingProfileId(null);
     showToast(`Conta @${cleanHandle} criada com sucesso`);
   };
@@ -884,6 +945,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       createdAt: Date.now(),
     });
     saveLocalCredentials(existingCreds);
+    setCredentialsVersion((v) => v + 1);
 
     const newUser: UserProfile = {
       id: newId,
@@ -904,7 +966,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       ...prev,
       users: [newUser, ...prev.users],
       currentUserId: newId,
+      isAuthenticated: true,
     }));
+    setGuestBrowsing(false);
 
     if (localMatch) {
       setInvites((prev) =>
@@ -957,7 +1021,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           state.users.find((u) => u.id === localCred.userId) ||
           state.users.find((u) => u.username.toLowerCase() === localCred.username.toLowerCase());
         if (targetUser) {
-          setState((prev) => ({ ...prev, currentUserId: targetUser.id }));
+          setState((prev) => ({ ...prev, currentUserId: targetUser.id, isAuthenticated: true }));
+          setGuestBrowsing(false);
           setViewingProfileId(null);
           setIsInviteModalOpen(false);
           showToast(`Conectado como @${targetUser.username}`);
@@ -989,7 +1054,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
               (u) => data.username && u.username.toLowerCase() === data.username.toLowerCase()
             );
           if (targetUser) {
-            setState((prev) => ({ ...prev, currentUserId: targetUser.id }));
+            setState((prev) => ({ ...prev, currentUserId: targetUser.id, isAuthenticated: true }));
+            setGuestBrowsing(false);
             setViewingProfileId(null);
             setIsInviteModalOpen(false);
             showToast(`Conectado como @${targetUser.username}`);
@@ -1003,6 +1069,78 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     }
 
     return { ok: false, error: 'Usuário/e-mail ou senha incorretos.' };
+  };
+
+  const changePassword = async (payload: {
+    currentPassword?: string;
+    newPassword: string;
+  }): Promise<{ ok: boolean; error?: string }> => {
+    const nextPass = payload.newPassword || '';
+    if (nextPass.length < 6) {
+      return { ok: false, error: 'A nova senha deve ter pelo menos 6 caracteres.' };
+    }
+
+    const creds = loadLocalCredentials();
+    const existingCred = creds.find(
+      (c) =>
+        c.userId === currentUser.id ||
+        c.username.toLowerCase() === currentUser.username.toLowerCase()
+    );
+
+    if (existingCred) {
+      const currentAttempt = payload.currentPassword || '';
+      if (!currentAttempt) {
+        return { ok: false, error: 'Informe sua senha atual para alterá-la.' };
+      }
+      const candidateHash = await derivePasswordHash(currentAttempt, existingCred.salt);
+      if (!constantTimeEqual(candidateHash, existingCred.hash)) {
+        return { ok: false, error: 'A senha atual está incorreta.' };
+      }
+    }
+
+    // Sync with Node backend if available
+    try {
+      const res = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.id,
+          username: currentUser.username,
+          email: currentUser.email,
+          currentPassword: payload.currentPassword || '',
+          newPassword: nextPass,
+        }),
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const data = (await res.json()) as { ok?: boolean; error?: string };
+        if (!res.ok || !data.ok) {
+          return { ok: false, error: data.error || 'Não foi possível alterar a senha.' };
+        }
+      }
+    } catch {
+      // Static hosting without backend — local salted PBKDF2 store still updates
+    }
+
+    const newSalt = generateSaltHex();
+    const newHash = await derivePasswordHash(nextPass, newSalt);
+    const updatedCreds = creds.filter(
+      (c) =>
+        c.userId !== currentUser.id &&
+        c.username.toLowerCase() !== currentUser.username.toLowerCase()
+    );
+    updatedCreds.unshift({
+      userId: currentUser.id,
+      username: currentUser.username.toLowerCase(),
+      email: currentUser.email?.toLowerCase(),
+      salt: newSalt,
+      hash: newHash,
+      createdAt: existingCred?.createdAt || Date.now(),
+    });
+    saveLocalCredentials(updatedCreds);
+    setCredentialsVersion((v) => v + 1);
+    showToast('Senha de acesso atualizada com sucesso');
+    return { ok: true };
   };
 
   const purgeDemoUsers = () => {
@@ -1502,6 +1640,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     localStorage.removeItem(STORAGE_KEY);
     setState({
       currentUserId: 'user_daniel',
+      isAuthenticated: true,
       users: SEED_USERS,
       posts: SEED_POSTS,
       stories: SEED_STORIES,
@@ -1607,6 +1746,15 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         pendingInviteMeta,
         isInviteModalOpen,
         setIsInviteModalOpen,
+        inviteModalMode,
+        openAuthModal,
+        isAuthenticated,
+        guestBrowsing,
+        setGuestBrowsing,
+        logout,
+        hasPasswordForCurrentUser,
+        hasPasswordForUser,
+        changePassword,
         createInvite,
         revokeInvite,
         registerWithInvite,

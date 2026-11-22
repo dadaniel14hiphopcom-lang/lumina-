@@ -1,6 +1,7 @@
 import { AlertTriangle, Shield } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { AdminPanelView } from './components/AdminPanelView';
+import { AuthView } from './components/AuthView';
 import { CreateModal } from './components/CreateModal';
 import { ExploreView } from './components/ExploreView';
 import { InviteRegisterModal } from './components/InviteRegisterModal';
@@ -108,6 +109,8 @@ function LuminaShell() {
     setIsCreateOpen,
     toastMessage,
     siteMeta,
+    isAuthenticated,
+    guestBrowsing,
   } = useSocial();
   const [createMode, setCreateMode] = useState<'post' | 'story' | 'reel'>('post');
 
@@ -115,6 +118,23 @@ function LuminaShell() {
     setCreateMode(mode);
     setIsCreateOpen(true);
   };
+
+  if (!isAuthenticated && !guestBrowsing && activeNav !== 'admin') {
+    return (
+      <>
+        <AuthView />
+        <InviteRegisterModal />
+        {toastMessage && (
+          <div
+            role="status"
+            className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-xl bg-zinc-900 px-4 py-2.5 text-xs font-medium text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-950"
+          >
+            {toastMessage}
+          </div>
+        )}
+      </>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-zinc-50/40 pb-16 text-zinc-950 dark:bg-[#050505] dark:text-zinc-100 lg:pb-0 lg:pl-20 xl:pl-64">

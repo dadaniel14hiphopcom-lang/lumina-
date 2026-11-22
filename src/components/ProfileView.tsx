@@ -1,12 +1,19 @@
 import {
   BadgeCheck,
   Bookmark,
+  CheckCircle2,
+  Eye,
+  EyeOff,
   Film,
   Grid3X3,
   Heart,
   ImagePlus,
+  KeyRound,
   Layers,
   Link as LinkIcon,
+  Lock,
+  LogIn,
+  LogOut,
   MessageCircle,
   Moon,
   Settings,
@@ -40,14 +47,20 @@ export function ProfileView() {
     showToast,
     theme,
     toggleTheme,
+    isAuthenticated,
+    logout,
+    openAuthModal,
+    hasPasswordForCurrentUser,
+    changePassword,
   } = useSocial();
 
   const targetUser = getUserById(viewingProfileId || currentUser.id) || currentUser;
-  const isOwnProfile = targetUser.id === currentUser.id;
+  const isOwnProfile = targetUser.id === currentUser.id && isAuthenticated;
   const isFollowing = currentUser.following.includes(targetUser.id);
 
   const [activeTab, setActiveTab] = useState<'posts' | 'reels' | 'saved'>('posts');
   const [editOpen, setEditOpen] = useState(false);
+  const [editTab, setEditTab] = useState<'profile' | 'password'>('profile');
   const [listModal, setListModal] = useState<'followers' | 'following' | null>(null);
 
   const [editName, setEditName] = useState(targetUser.displayName);
@@ -56,6 +69,16 @@ export function ProfileView() {
   const [editWebsite, setEditWebsite] = useState(targetUser.website || '');
   const [editAvatar, setEditAvatar] = useState(targetUser.avatarUrl);
   const [editCover, setEditCover] = useState(targetUser.coverUrl || ASSETS.postArchitecture);
+
+  const [serverHasPassword, setServerHasPassword] = useState(false);
+  const [currentPass, setCurrentPass] = useState('');
+  const [newPass, setNewPass] = useState('');
+  const [confirmNewPass, setConfirmNewPass] = useState('');
+  const [showPassFields, setShowPassFields] = useState(false);
+  const [passError, setPassError] = useState<string | null>(null);
+  const [passSuccess, setPassSuccess] = useState<string | null>(null);
+  const [passSaving, setPassSaving] = useState(false);
+
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const coverInputRef = useRef<HTMLInputElement | null>(null);
   const quickCoverInputRef = useRef<HTMLInputElement | null>(null);
@@ -86,14 +109,32 @@ export function ProfileView() {
   const hasStory = userStories.length > 0;
   const hasUnseenStory = userStories.some((s) => !s.viewedBy.includes(currentUser.id));
 
-  const openEditModal = () => {
+  const openEditModal = (initialTab: 'profile' | 'password' = 'profile') => {
     setEditName(targetUser.displayName);
     setEditHandle(targetUser.username);
     setEditBio(targetUser.bio);
     setEditWebsite(targetUser.website || '');
     setEditAvatar(targetUser.avatarUrl);
     setEditCover(targetUser.coverUrl || ASSETS.postArchitecture);
+    setEditTab(initialTab);
+    setCurrentPass('');
+    setNewPass('');
+    setConfirmNewPass('');
+    setPassError(null);
+    setPassSuccess(null);
     setEditOpen(true);
+
+    fetch(
+      `/api/auth/has-password?userId=${encodeURIComponent(currentUser.id)}&username=${encodeURIComponent(currentUser.username)}`
+    )
+      .then(async (res) => {
+        const ct = res.headers.get('content-type') || '';
+        if (res.ok && ct.includes('application/json')) {
+          const data = (await res.json()) as { hasPassword?: boolean };
+          setServerHasPassword(Boolean(data.hasPassword));
+        }
+      })
+      .catch(() => setServerHasPassword(false));
   };
 
   const handleSaveProfile = (e: React.FormEvent) => {
@@ -107,6 +148,45 @@ export function ProfileView() {
       coverUrl: editCover,
     });
     setEditOpen(false);
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPassError(null);
+    setPassSuccess(null);
+
+    const requiresCurrent = hasPasswordForCurrentUser || serverHasPassword;
+    if (requiresCurrent && !currentPass) {
+      setPassError('Informe sua senha atual.');
+      return;
+    }
+    if (newPass.length < 6) {
+      setPassError('A nova senha deve ter pelo menos 6 caracteres.');
+      return;
+    }
+    if (newPass !== confirmNewPass) {
+      setPassError('A confirmação da nova senha não coincide.');
+      return;
+    }
+
+    setPassSaving(true);
+    try {
+      const res = await changePassword({
+        currentPassword: currentPass,
+        newPassword: newPass,
+      });
+      if (!res.ok) {
+        setPassError(res.error || 'Não foi possível alterar a senha.');
+        return;
+      }
+      setCurrentPass('');
+      setNewPass('');
+      setConfirmNewPass('');
+      setPassSuccess('Senha de acesso atualizada com sucesso.');
+      setServerHasPassword(true);
+    } finally {
+      setPassSaving(false);
+    }
   };
 
   const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -231,11 +311,11 @@ export function ProfileView() {
             </div>
 
             {isOwnProfile ? (
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={openEditModal}
-                  className="h-9 rounded-lg bg-zinc-100 px-4 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                  onClick={() => openEditModal('profile')}
+                  className="h-9 whitespace-nowrap rounded-lg bg-zinc-100 px-4 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
                 >
                   Editar perfil
                 </button>
@@ -251,7 +331,24 @@ export function ProfileView() {
                     <Moon className="h-4 w-4" />
                   )}
                 </button>
+                <button
+                  type="button"
+                  onClick={logout}
+                  className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg border border-zinc-200 bg-white px-3 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  <span>Sair</span>
+                </button>
               </div>
+            ) : !isAuthenticated ? (
+              <button
+                type="button"
+                onClick={() => openAuthModal('login')}
+                className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg bg-sky-600 px-4 text-xs font-semibold text-white hover:bg-sky-700"
+              >
+                <LogIn className="h-3.5 w-3.5" />
+                <span>Entrar</span>
+              </button>
             ) : (
               <div className="flex items-center gap-2">
                 <button
@@ -462,13 +559,13 @@ export function ProfileView() {
         </div>
       )}
 
-      {/* Edit Profile Modal */}
+      {/* Edit Profile & Password Modal */}
       {editOpen && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs"
           role="dialog"
           aria-modal="true"
-          aria-label="Editar perfil"
+          aria-label="Editar perfil e senha"
           onClick={() => setEditOpen(false)}
         >
           <div
@@ -477,9 +574,13 @@ export function ProfileView() {
           >
             <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3.5 dark:border-zinc-800">
               <div className="flex items-center gap-2">
-                <Settings className="h-4 w-4 text-zinc-500" />
+                {editTab === 'password' ? (
+                  <KeyRound className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                ) : (
+                  <Settings className="h-4 w-4 text-zinc-500" />
+                )}
                 <h3 className="text-base font-semibold text-zinc-950 dark:text-zinc-100">
-                  Editar perfil
+                  {editTab === 'password' ? 'Alterar senha' : 'Editar perfil'}
                 </h3>
               </div>
               <button
@@ -492,128 +593,279 @@ export function ProfileView() {
               </button>
             </div>
 
-            <form onSubmit={handleSaveProfile} className="max-h-[78vh] space-y-4 overflow-y-auto p-5">
-              {/* Cover editor */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
+            <div className="border-b border-zinc-200 px-4 py-2.5 dark:border-zinc-800">
+              <div className="grid grid-cols-2 gap-1 rounded-xl bg-zinc-100 p-1 dark:bg-zinc-900">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditTab('profile');
+                    setPassError(null);
+                    setPassSuccess(null);
+                  }}
+                  className={`rounded-lg py-1.5 text-xs font-semibold transition-colors ${
+                    editTab === 'profile'
+                      ? 'bg-white text-zinc-950 shadow-xs dark:bg-zinc-800 dark:text-white'
+                      : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400'
+                  }`}
+                >
+                  Dados do perfil
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditTab('password');
+                    setPassError(null);
+                    setPassSuccess(null);
+                  }}
+                  className={`rounded-lg py-1.5 text-xs font-semibold transition-colors ${
+                    editTab === 'password'
+                      ? 'bg-white text-zinc-950 shadow-xs dark:bg-zinc-800 dark:text-white'
+                      : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400'
+                  }`}
+                >
+                  Alterar senha
+                </button>
+              </div>
+            </div>
+
+            {editTab === 'password' ? (
+              <form onSubmit={handleChangePassword} className="space-y-4 p-5">
+                <p className="text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
+                  {hasPasswordForCurrentUser || serverHasPassword
+                    ? `Atualize a senha de acesso de @${currentUser.username}.`
+                    : `Esta conta ainda não possui senha definida. Crie uma senha para entrar em @${currentUser.username} com segurança.`}
+                </p>
+
+                {(hasPasswordForCurrentUser || serverHasPassword) && (
+                  <label className="block space-y-1">
+                    <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                      Senha atual
+                    </span>
+                    <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                      <Lock className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+                      <input
+                        type={showPassFields ? 'text' : 'password'}
+                        value={currentPass}
+                        onChange={(e) => setCurrentPass(e.target.value)}
+                        placeholder="Digite sua senha atual"
+                        autoComplete="current-password"
+                        className="h-10 w-full bg-transparent text-sm text-zinc-900 focus:outline-none dark:text-zinc-100"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassFields((s) => !s)}
+                        aria-label={showPassFields ? 'Ocultar senhas' : 'Mostrar senhas'}
+                        className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                      >
+                        {showPassFields ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
+                  </label>
+                )}
+
+                <label className="block space-y-1">
                   <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                    Imagem de capa
+                    Nova senha (mín. 6 caracteres)
+                  </span>
+                  <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                    <Lock className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+                    <input
+                      type={showPassFields ? 'text' : 'password'}
+                      value={newPass}
+                      onChange={(e) => setNewPass(e.target.value)}
+                      placeholder="Crie a nova senha"
+                      minLength={6}
+                      autoComplete="new-password"
+                      className="h-10 w-full bg-transparent text-sm text-zinc-900 focus:outline-none dark:text-zinc-100"
+                    />
+                    {!(hasPasswordForCurrentUser || serverHasPassword) && (
+                      <button
+                        type="button"
+                        onClick={() => setShowPassFields((s) => !s)}
+                        aria-label={showPassFields ? 'Ocultar senhas' : 'Mostrar senhas'}
+                        className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                      >
+                        {showPassFields ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
+                    )}
+                  </div>
+                </label>
+
+                <label className="block space-y-1">
+                  <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                    Confirmar nova senha
+                  </span>
+                  <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                    <Lock className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+                    <input
+                      type={showPassFields ? 'text' : 'password'}
+                      value={confirmNewPass}
+                      onChange={(e) => setConfirmNewPass(e.target.value)}
+                      placeholder="Repita a nova senha"
+                      minLength={6}
+                      autoComplete="new-password"
+                      className="h-10 w-full bg-transparent text-sm text-zinc-900 focus:outline-none dark:text-zinc-100"
+                    />
+                  </div>
+                </label>
+
+                {passError && (
+                  <p className="rounded-xl bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700 dark:bg-rose-950/40 dark:text-rose-300">
+                    {passError}
+                  </p>
+                )}
+
+                {passSuccess && (
+                  <p className="flex items-center gap-2 rounded-xl bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                    <CheckCircle2 className="h-4 w-4 shrink-0" />
+                    <span>{passSuccess}</span>
+                  </p>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={passSaving}
+                  className="h-11 w-full rounded-xl bg-sky-600 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
+                >
+                  {passSaving
+                    ? 'Salvando senha...'
+                    : hasPasswordForCurrentUser || serverHasPassword
+                    ? 'Salvar nova senha'
+                    : 'Definir senha de acesso'}
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={handleSaveProfile} className="max-h-[72vh] space-y-4 overflow-y-auto p-5">
+                {/* Cover editor */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                      Imagem de capa
+                    </span>
+                    <input
+                      ref={coverInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => handleCoverUpload(e, false)}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => coverInputRef.current?.click()}
+                      className="inline-flex items-center gap-1 text-xs font-semibold text-sky-600 hover:underline dark:text-sky-400"
+                    >
+                      <ImagePlus className="h-3.5 w-3.5" />
+                      <span>Enviar capa</span>
+                    </button>
+                  </div>
+                  <div className="relative h-24 w-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
+                    <MediaImage src={editCover} alt="Prévia da capa" className="h-full w-full object-cover" />
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {STUDIO_SAMPLE_IMAGES.slice(0, 4).map((sample) => (
+                      <button
+                        key={sample.url}
+                        type="button"
+                        onClick={() => setEditCover(sample.url)}
+                        className={`h-8 flex-1 overflow-hidden rounded-lg border ${
+                          editCover === sample.url
+                            ? 'border-sky-500 ring-2 ring-sky-500/30'
+                            : 'border-zinc-200 opacity-75 hover:opacity-100 dark:border-zinc-800'
+                        }`}
+                      >
+                        <MediaImage src={sample.url} alt={sample.label} className="h-full w-full object-cover" />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-4">
+                  <AvatarRing src={editAvatar} alt={editHandle} size="lg" />
+                  <div>
+                    <input
+                      ref={avatarInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={handleAvatarUpload}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => avatarInputRef.current?.click()}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-100 px-3 py-2 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100"
+                    >
+                      <Upload className="h-3.5 w-3.5" />
+                      <span>Alterar foto</span>
+                    </button>
+                  </div>
+                </div>
+
+                <label className="block space-y-1">
+                  <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                    Nome
                   </span>
                   <input
-                    ref={coverInputRef}
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) => handleCoverUpload(e, false)}
-                    className="hidden"
+                    type="text"
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
                   />
-                  <button
-                    type="button"
-                    onClick={() => coverInputRef.current?.click()}
-                    className="inline-flex items-center gap-1 text-xs font-semibold text-sky-600 hover:underline dark:text-sky-400"
-                  >
-                    <ImagePlus className="h-3.5 w-3.5" />
-                    <span>Enviar capa</span>
-                  </button>
-                </div>
-                <div className="relative h-24 w-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
-                  <MediaImage src={editCover} alt="Prévia da capa" className="h-full w-full object-cover" />
-                </div>
-                <div className="flex items-center gap-1.5">
-                  {STUDIO_SAMPLE_IMAGES.slice(0, 4).map((sample) => (
-                    <button
-                      key={sample.url}
-                      type="button"
-                      onClick={() => setEditCover(sample.url)}
-                      className={`h-8 flex-1 overflow-hidden rounded-lg border ${
-                        editCover === sample.url
-                          ? 'border-sky-500 ring-2 ring-sky-500/30'
-                          : 'border-zinc-200 opacity-75 hover:opacity-100 dark:border-zinc-800'
-                      }`}
-                    >
-                      <MediaImage src={sample.url} alt={sample.label} className="h-full w-full object-cover" />
-                    </button>
-                  ))}
-                </div>
-              </div>
+                </label>
 
-              <div className="flex items-center gap-4">
-                <AvatarRing src={editAvatar} alt={editHandle} size="lg" />
-                <div>
+                <label className="block space-y-1">
+                  <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                    Nome de usuário
+                  </span>
                   <input
-                    ref={avatarInputRef}
-                    type="file"
-                    accept="image/*"
-                    onChange={handleAvatarUpload}
-                    className="hidden"
+                    type="text"
+                    value={editHandle}
+                    onChange={(e) => setEditHandle(e.target.value)}
+                    className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
                   />
-                  <button
-                    type="button"
-                    onClick={() => avatarInputRef.current?.click()}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-100 px-3 py-2 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100"
-                  >
-                    <Upload className="h-3.5 w-3.5" />
-                    <span>Alterar foto</span>
-                  </button>
-                </div>
-              </div>
+                </label>
 
-              <label className="block space-y-1">
-                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                  Nome
-                </span>
-                <input
-                  type="text"
-                  value={editName}
-                  onChange={(e) => setEditName(e.target.value)}
-                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
-                />
-              </label>
+                <label className="block space-y-1">
+                  <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                    Biografia
+                  </span>
+                  <textarea
+                    rows={3}
+                    maxLength={160}
+                    value={editBio}
+                    onChange={(e) => setEditBio(e.target.value)}
+                    className="w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-900 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
+                  />
+                </label>
 
-              <label className="block space-y-1">
-                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                  Nome de usuário
-                </span>
-                <input
-                  type="text"
-                  value={editHandle}
-                  onChange={(e) => setEditHandle(e.target.value)}
-                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
-                />
-              </label>
+                <label className="block space-y-1">
+                  <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                    Site
+                  </span>
+                  <input
+                    type="text"
+                    value={editWebsite}
+                    onChange={(e) => setEditWebsite(e.target.value)}
+                    placeholder="seusite.com.br"
+                    className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
+                  />
+                </label>
 
-              <label className="block space-y-1">
-                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                  Biografia
-                </span>
-                <textarea
-                  rows={3}
-                  maxLength={160}
-                  value={editBio}
-                  onChange={(e) => setEditBio(e.target.value)}
-                  className="w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-900 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
-                />
-              </label>
-
-              <label className="block space-y-1">
-                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                  Site
-                </span>
-                <input
-                  type="text"
-                  value={editWebsite}
-                  onChange={(e) => setEditWebsite(e.target.value)}
-                  placeholder="seusite.com.br"
-                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
-                />
-              </label>
-
-              <button
-                type="submit"
-                className="h-11 w-full rounded-xl bg-sky-600 text-sm font-semibold text-white hover:bg-sky-700"
-              >
-                Salvar alterações
-              </button>
-            </form>
+                <button
+                  type="submit"
+                  className="h-11 w-full rounded-xl bg-sky-600 text-sm font-semibold text-white hover:bg-sky-700"
+                >
+                  Salvar alterações
+                </button>
+              </form>
+            )}
           </div>
         </div>
       )}

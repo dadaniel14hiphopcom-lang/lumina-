@@ -1000,6 +1000,77 @@ async function startServer() {
     res.json({ ok: true, userId: match.userId, username: match.username });
   });
 
+  app.get('/api/auth/has-password', (req, res) => {
+    const userId = typeof req.query.userId === 'string' ? req.query.userId.trim() : '';
+    const username =
+      typeof req.query.username === 'string'
+        ? req.query.username.trim().toLowerCase().replace(/^@/, '')
+        : '';
+    const records = readUserAuthRecords();
+    const exists = records.some(
+      (r) =>
+        (userId && r.userId === userId) ||
+        (username && r.username.toLowerCase() === username)
+    );
+    res.json({ hasPassword: exists });
+  });
+
+  app.post('/api/auth/change-password', (req, res) => {
+    const userId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+    const username =
+      typeof req.body?.username === 'string'
+        ? req.body.username.trim().toLowerCase().replace(/^@/, '')
+        : '';
+    const email =
+      typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const currentPassword =
+      typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
+    const newPassword =
+      typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+
+    if (!userId && !username) {
+      res.status(400).json({ error: 'Usuário não identificado.' });
+      return;
+    }
+    if (newPassword.length < 6) {
+      res.status(400).json({ error: 'A nova senha deve ter pelo menos 6 caracteres.' });
+      return;
+    }
+
+    const records = readUserAuthRecords();
+    const match = records.find(
+      (r) =>
+        (userId && r.userId === userId) ||
+        (username && r.username.toLowerCase() === username)
+    );
+
+    if (match) {
+      if (!currentPassword || !verifyUserPassword(currentPassword, match)) {
+        res.status(401).json({ error: 'A senha atual está incorreta.' });
+        return;
+      }
+    }
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = hashPasscode(newPassword, salt);
+    const filtered = records.filter(
+      (r) =>
+        !(userId && r.userId === userId) &&
+        !(username && r.username.toLowerCase() === username)
+    );
+    filtered.unshift({
+      userId: userId || match?.userId || `user_${Date.now()}`,
+      username: username || match?.username || '',
+      email: email || match?.email,
+      salt,
+      hash,
+      createdAt: match?.createdAt || Date.now(),
+    });
+    writeUserAuthRecords(filtered);
+
+    res.json({ ok: true });
+  });
+
   // Download Complete Self-Hosted WordPress Kit (.zip)
   app.get('/api/admin/wordpress/download-kit', requireAdminAuth, (_req, res) => {
     const state = readAdminState();

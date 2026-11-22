@@ -6,6 +6,7 @@ import {
   Flame,
   Lock,
   LogIn,
+  LogOut,
   UserPlus,
   X,
 } from 'lucide-react';
@@ -27,6 +28,9 @@ export function RightSidebar() {
     loginWithCredentials,
     resetDemoData,
     setIsInviteModalOpen,
+    openAuthModal,
+    isAuthenticated,
+    logout,
   } = useSocial();
 
   const [switchModalOpen, setSwitchModalOpen] = useState(false);
@@ -123,44 +127,81 @@ export function RightSidebar() {
   return (
     <aside className="hidden w-[320px] shrink-0 xl:block">
       <div className="sticky top-8 space-y-6">
-        {/* Current User Summary */}
-        <div className="flex items-center justify-between gap-3">
-          <ProfileHoverCard userId={currentUser.id} className="min-w-0 flex-1">
-            <button
-              type="button"
-              onClick={() => openProfile(currentUser.id)}
-              className="flex w-full min-w-0 items-center gap-3 text-left"
-            >
-              <AvatarRing
-                src={currentUser.avatarUrl}
-                alt={currentUser.username}
-                size="md"
-                showOnlineIndicator={Boolean(currentUser.isOnline)}
-              />
-              <div className="min-w-0">
-                <div className="flex items-center gap-1">
-                  <span className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
-                    {currentUser.username}
-                  </span>
-                  {currentUser.verified && (
-                    <BadgeCheck className="h-3.5 w-3.5 shrink-0 text-sky-500" />
-                  )}
+        {/* Current User Summary or Sign-in Prompt */}
+        {isAuthenticated ? (
+          <div className="flex items-center justify-between gap-3">
+            <ProfileHoverCard userId={currentUser.id} className="min-w-0 flex-1">
+              <button
+                type="button"
+                onClick={() => openProfile(currentUser.id)}
+                className="flex w-full min-w-0 items-center gap-3 text-left"
+              >
+                <AvatarRing
+                  src={currentUser.avatarUrl}
+                  alt={currentUser.username}
+                  size="md"
+                  showOnlineIndicator={Boolean(currentUser.isOnline)}
+                />
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1">
+                    <span className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
+                      {currentUser.username}
+                    </span>
+                    {currentUser.verified && (
+                      <BadgeCheck className="h-3.5 w-3.5 shrink-0 text-sky-500" />
+                    )}
+                  </div>
+                  <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
+                    {currentUser.displayName}
+                  </p>
                 </div>
-                <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
-                  {currentUser.displayName}
-                </p>
-              </div>
-            </button>
-          </ProfileHoverCard>
+              </button>
+            </ProfileHoverCard>
 
-          <button
-            type="button"
-            onClick={() => setSwitchModalOpen(true)}
-            className="shrink-0 text-xs font-semibold text-sky-600 hover:text-sky-700 dark:text-sky-400"
-          >
-            Trocar
-          </button>
-        </div>
+            <div className="flex shrink-0 items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => setSwitchModalOpen(true)}
+                className="text-xs font-semibold text-sky-600 hover:text-sky-700 dark:text-sky-400"
+              >
+                Trocar
+              </button>
+              <button
+                type="button"
+                onClick={logout}
+                className="text-xs font-semibold text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+              >
+                Sair
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
+            <p className="text-sm font-bold text-zinc-950 dark:text-white">
+              Entre na Lumina
+            </p>
+            <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
+              Faça login com sua conta ou cadastre-se com um convite.
+            </p>
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => openAuthModal('login')}
+                className="inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-xl bg-sky-600 text-xs font-semibold text-white hover:bg-sky-700"
+              >
+                <LogIn className="h-3.5 w-3.5" />
+                <span>Entrar</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => openAuthModal('register')}
+                className="inline-flex h-9 flex-1 items-center justify-center rounded-xl border border-zinc-200 bg-zinc-50 text-xs font-semibold text-zinc-900 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
+              >
+                Convite
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Em alta (Trending Users above Suggestions) */}
         {trendingUsers.length > 0 && (
@@ -309,6 +350,24 @@ export function RightSidebar() {
             >
               Entrar com convite
             </button>
+            <span aria-hidden="true">·</span>
+            {isAuthenticated ? (
+              <button
+                type="button"
+                onClick={logout}
+                className="hover:underline"
+              >
+                Sair
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => openAuthModal('login')}
+                className="hover:underline"
+              >
+                Entrar
+              </button>
+            )}
             <span aria-hidden="true">·</span>
             <button
               type="button"
@@ -516,6 +575,19 @@ export function RightSidebar() {
                   >
                     Criar e entrar
                   </button>
+                  {isAuthenticated && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSwitchModalOpen(false);
+                        logout();
+                      }}
+                      className="inline-flex h-9 w-full items-center justify-center gap-1.5 rounded-xl border border-zinc-200 bg-white text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                    >
+                      <LogOut className="h-3.5 w-3.5" />
+                      <span>Sair da conta atual</span>
+                    </button>
+                  )}
                 </form>
               </>
             )}

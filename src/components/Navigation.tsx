@@ -4,6 +4,8 @@ import {
   Film,
   Heart,
   Home,
+  LogIn,
+  LogOut,
   MessageCircle,
   Moon,
   PlusSquare,
@@ -27,6 +29,9 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
     threads,
     theme,
     toggleTheme,
+    isAuthenticated,
+    logout,
+    openAuthModal,
   } = useSocial();
 
   const unreadNotifs = notifications.filter(
@@ -118,27 +123,60 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
               <span className="hidden truncate xl:inline">Criar</span>
             </button>
 
-            <button
-              type="button"
-              onClick={() => setActiveNav('profile')}
-              className={`flex h-12 w-full items-center gap-3.5 rounded-xl px-3 text-sm transition-colors ${
-                activeNav === 'profile'
-                  ? 'bg-zinc-100 font-bold text-zinc-950 dark:bg-zinc-900 dark:text-white'
-                  : 'font-medium text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-900/60'
-              }`}
-            >
-              <AvatarRing
-                src={currentUser.avatarUrl}
-                alt={currentUser.username}
-                size="xs"
-              />
-              <span className="hidden truncate xl:inline">Perfil</span>
-            </button>
+            {isAuthenticated ? (
+              <button
+                type="button"
+                onClick={() => setActiveNav('profile')}
+                className={`flex h-12 w-full items-center gap-3.5 rounded-xl px-3 text-sm transition-colors ${
+                  activeNav === 'profile'
+                    ? 'bg-zinc-100 font-bold text-zinc-950 dark:bg-zinc-900 dark:text-white'
+                    : 'font-medium text-zinc-700 hover:bg-zinc-50 dark:text-zinc-300 dark:hover:bg-zinc-900/60'
+                }`}
+              >
+                <AvatarRing
+                  src={currentUser.avatarUrl}
+                  alt={currentUser.username}
+                  size="xs"
+                />
+                <span className="hidden truncate xl:inline">Perfil</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => openAuthModal('login')}
+                className="flex h-12 w-full items-center gap-3.5 rounded-xl bg-sky-600 px-3 text-sm font-semibold text-white transition-colors hover:bg-sky-700"
+              >
+                <LogIn className="h-5 w-5 shrink-0" strokeWidth={2} />
+                <span className="hidden truncate xl:inline">Entrar</span>
+              </button>
+            )}
           </nav>
         </div>
 
-        {/* Bottom Theme Switcher */}
+        {/* Bottom Session + Theme Switcher */}
         <div className="space-y-2">
+          {isAuthenticated ? (
+            <button
+              type="button"
+              onClick={logout}
+              aria-label="Sair da conta"
+              className="flex h-11 w-full items-center justify-center gap-2.5 rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-xs font-semibold text-zinc-700 transition-colors hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-300 dark:hover:bg-zinc-900 xl:justify-start"
+            >
+              <LogOut className="h-4 w-4 shrink-0" />
+              <span className="hidden xl:inline">Sair da conta</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => openAuthModal('login')}
+              aria-label="Entrar na conta"
+              className="flex h-11 w-full items-center justify-center gap-2.5 rounded-xl border border-sky-200 bg-sky-50 px-3 text-xs font-semibold text-sky-700 transition-colors hover:bg-sky-100 dark:border-sky-900/50 dark:bg-sky-950/30 dark:text-sky-300 xl:justify-start"
+            >
+              <LogIn className="h-4 w-4 shrink-0" />
+              <span className="hidden xl:inline">Entrar</span>
+            </button>
+          )}
+
           <div
             role="group"
             aria-label="Seletor de tema"
@@ -258,6 +296,27 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
               </span>
             )}
           </button>
+
+          {isAuthenticated ? (
+            <button
+              type="button"
+              onClick={logout}
+              aria-label="Sair da conta"
+              title="Sair"
+              className="flex h-11 w-11 items-center justify-center rounded-full text-zinc-800 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900"
+            >
+              <LogOut className="h-5 w-5" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => openAuthModal('login')}
+              className="inline-flex h-9 items-center gap-1 rounded-lg bg-sky-600 px-3 text-xs font-semibold text-white hover:bg-sky-700"
+            >
+              <LogIn className="h-3.5 w-3.5" />
+              <span>Entrar</span>
+            </button>
+          )}
         </div>
       </header>
 

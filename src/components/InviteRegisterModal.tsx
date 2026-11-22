@@ -21,6 +21,7 @@ export function InviteRegisterModal() {
   const {
     isInviteModalOpen,
     setIsInviteModalOpen,
+    inviteModalMode,
     pendingInviteCode,
     pendingInviteMeta,
     registerWithInvite,
@@ -53,6 +54,8 @@ export function InviteRegisterModal() {
     if (isInviteModalOpen) {
       if (pendingInviteCode) {
         setMode('register');
+      } else {
+        setMode(inviteModalMode);
       }
       setCode(pendingInviteCode || '');
       if (pendingInviteMeta?.email) setEmail(pendingInviteMeta.email);
@@ -62,7 +65,7 @@ export function InviteRegisterModal() {
       setLoginPassword('');
       setError(null);
     }
-  }, [isInviteModalOpen, pendingInviteCode, pendingInviteMeta]);
+  }, [isInviteModalOpen, inviteModalMode, pendingInviteCode, pendingInviteMeta]);
 
   if (!isInviteModalOpen) return null;
 
