@@ -4,8 +4,95 @@ export function isVideoAsset(media?: Partial<MediaAsset> | null): boolean {
   if (!media?.url) return false;
   if (media.mediaType === 'video') return true;
   if (media.url.startsWith('data:video/')) return true;
-  if (/\.(mp4|webm|mov|m4v|ogg)(\?|#|$)/i.test(media.url)) return true;
+  if (/\.(mp4|webm|mov|m4v|ogg|ogv)(\?|#|$)/i.test(media.url)) return true;
   return false;
+}
+
+export interface MediaStatusInfo {
+  uploadAvailable: boolean;
+  storageProvider: 'aws-s3' | 'server-disk';
+  awsCredentialsConfigured: boolean;
+  s3Enabled: boolean;
+  cloudFrontActive: boolean;
+  region: string;
+  bucket: string;
+  maxVideoSizeMB?: number;
+}
+
+export interface MediaUploadResult {
+  url: string;
+  storageProvider: 'aws-cloudfront' | 'aws-s3' | 'server-disk';
+  fallbackNeeded: false;
+}
+
+export interface MediaUploadFallback {
+  fallbackNeeded: true;
+}
+
+function inferMediaMimeType(blob: Blob, fileName?: string): string {
+  const raw = (blob.type || '').split(';')[0].trim().toLowerCase();
+  if (raw && raw !== 'application/octet-stream') return raw;
+  const ext = (fileName || '').split('.').pop()?.toLowerCase() || '';
+  if (ext === 'webm') return 'video/webm';
+  if (ext === 'mov') return 'video/quicktime';
+  if (ext === 'm4v') return 'video/x-m4v';
+  if (ext === 'ogg' || ext === 'ogv') return 'video/ogg';
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'png') return 'image/png';
+  if (ext === 'webp') return 'image/webp';
+  if (ext === 'gif') return 'image/gif';
+  return 'video/mp4';
+}
+
+export async function fetchMediaDeliveryStatus(): Promise<MediaStatusInfo | null> {
+  try {
+    const res = await fetch('/api/media/status');
+    if (!res.ok) return null;
+    const data = (await res.json()) as MediaStatusInfo;
+    return data && typeof data.uploadAvailable === 'boolean' ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function uploadMediaToCloud(
+  blob: Blob,
+  fileName?: string
+): Promise<MediaUploadResult | MediaUploadFallback> {
+  const contentType = inferMediaMimeType(blob, fileName);
+  let res: Response;
+  try {
+    res = await fetch('/api/media/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': contentType,
+      },
+      body: blob,
+    });
+  } catch {
+    return { fallbackNeeded: true };
+  }
+
+  if (res.status === 404 || res.status === 405 || res.status === 502 || res.status === 503) {
+    return { fallbackNeeded: true };
+  }
+
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    url?: string;
+    storageProvider?: 'aws-cloudfront' | 'aws-s3' | 'server-disk';
+    error?: string;
+  };
+
+  if (!res.ok || !data.ok || !data.url) {
+    throw new Error(data.error || 'O servidor rejeitou o envio deste arquivo de mídia.');
+  }
+
+  return {
+    url: data.url,
+    storageProvider: data.storageProvider || 'server-disk',
+    fallbackNeeded: false,
+  };
 }
 
 function readAsDataUrl(file: Blob): Promise<string> {

@@ -200,7 +200,7 @@ export async function createPostInCloud(
     .slice(0, 5)
     .map((m) => ({
       id: m.id,
-      url: m.url.length <= 450_000 ? m.url : '',
+      url: m.url.length <= 450_000 && !m.url.startsWith('blob:') ? m.url : '',
       alt: (m.alt || 'Publicação na Lumina').slice(0, 120),
       mediaType: m.mediaType || 'image',
       ...(m.filterCss ? { filterCss: m.filterCss.slice(0, 160) } : {}),

@@ -4,6 +4,7 @@ import {
   Film,
   ImagePlus,
   Layers,
+  Loader2,
   MapPin,
   SlidersHorizontal,
   Sparkles,
@@ -22,7 +23,12 @@ import {
   FILTER_PRESETS,
   renderFilteredImage,
 } from '../utils/filters';
-import { compressImageFile } from '../utils/media';
+import {
+  compressImageFile,
+  fetchMediaDeliveryStatus,
+  MediaStatusInfo,
+  uploadMediaToCloud,
+} from '../utils/media';
 import { MediaImage } from './MediaImage';
 
 interface CreateModalProps {
@@ -84,7 +90,10 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
   const [category, setCategory] = useState<PostCategory>('Fotografia');
   const [audioTrack, setAudioTrack] = useState('Luz Natural · Instrumental');
   const [isPublishing, setIsPublishing] = useState(false);
+  const [uploadingMedia, setUploadingMedia] = useState(false);
+  const [mediaDeliveryStatus, setMediaDeliveryStatus] = useState<MediaStatusInfo | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
+  const [previewVideoError, setPreviewVideoError] = useState(false);
 
   // Short-video camera recorder for Reels
   const [camOpen, setCamOpen] = useState(false);
@@ -118,6 +127,17 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     return () => stopCamera();
   }, []);
 
+  useEffect(() => {
+    if (!isCreateOpen) return;
+    let active = true;
+    fetchMediaDeliveryStatus().then((status) => {
+      if (active) setMediaDeliveryStatus(status);
+    });
+    return () => {
+      active = false;
+    };
+  }, [isCreateOpen]);
+
   if (!isCreateOpen) return null;
 
   const { maxVideoSizeMB, maxReelDurationSec, allowVideoReels } = siteMeta.videoRules;
@@ -131,11 +151,52 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     setCaption('');
     setLocation('');
     setMediaError(null);
+    setPreviewVideoError(false);
+    setUploadingMedia(false);
     setIsCreateOpen(false);
+  };
+
+  const uploadVideoBlobToCloud = async (
+    blob: Blob,
+    fileName?: string
+  ): Promise<string | null> => {
+    setUploadingMedia(true);
+    try {
+      const result = await uploadMediaToCloud(blob, fileName);
+      if (!result.fallbackNeeded) {
+        if (result.storageProvider === 'aws-cloudfront' || result.storageProvider === 'aws-s3') {
+          showToast('Vídeo hospedado na Amazon AWS S3');
+        } else {
+          showToast('Vídeo enviado para streaming de mídia');
+        }
+        return result.url;
+      }
+
+      if (blob.size <= 3_500_000) {
+        return await readBlobAsDataUrl(blob);
+      }
+
+      const msg =
+        'Este servidor estático não suporta arquivos acima de 3,5 MB. Ative o servidor Lumina + Amazon AWS S3 para hospedar vídeos maiores.';
+      setMediaError(msg);
+      showToast(msg);
+      return null;
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Não foi possível enviar o vídeo para a nuvem.';
+      setMediaError(msg);
+      showToast(msg);
+      return null;
+    } finally {
+      setUploadingMedia(false);
+    }
   };
 
   const validateAndLoadVideoFile = async (file: File) => {
     setMediaError(null);
+    setPreviewVideoError(false);
     if (!allowVideoReels) {
       const msg = 'Envio de vídeos nos Reels está desativado nas regras do painel admin.';
       setMediaError(msg);
@@ -153,27 +214,20 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
 
     const tempUrl = URL.createObjectURL(file);
     const duration = await readVideoDuration(tempUrl);
+    URL.revokeObjectURL(tempUrl);
     if (duration > maxReelDurationSec + 0.5) {
-      URL.revokeObjectURL(tempUrl);
       const msg = `O vídeo dura ${Math.ceil(duration)}s e excede o máximo permitido de ${maxReelDurationSec}s para Reels.`;
       setMediaError(msg);
       showToast(msg);
       return;
     }
 
-    let finalUrl = tempUrl;
-    if (file.size <= 3_500_000) {
-      try {
-        finalUrl = await readBlobAsDataUrl(file);
-        URL.revokeObjectURL(tempUrl);
-      } catch {
-        // Keep object URL fallback
-      }
-    }
+    const uploadedUrl = await uploadVideoBlobToCloud(file, file.name);
+    if (!uploadedUrl) return;
 
     setMediaItems([
       {
-        url: finalUrl,
+        url: uploadedUrl,
         mediaType: 'video',
         durationSec: duration > 0 ? Math.round(duration) : undefined,
       },
@@ -272,7 +326,8 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
       if (ev.data.size > 0) camChunksRef.current.push(ev.data);
     };
     rec.onstop = async () => {
-      const blob = new Blob(camChunksRef.current, { type: rec.mimeType || 'video/webm' });
+      const mimeType = (rec.mimeType || 'video/webm').split(';')[0] || 'video/webm';
+      const blob = new Blob(camChunksRef.current, { type: mimeType });
       const recordedSec = Math.max(1, Math.round((Date.now() - startMs) / 1000));
       stopCamera();
 
@@ -281,14 +336,16 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
         return;
       }
 
-      const url =
-        blob.size <= 3_500_000
-          ? await readBlobAsDataUrl(blob)
-          : URL.createObjectURL(blob);
+      const uploadedUrl = await uploadVideoBlobToCloud(
+        blob,
+        mimeType === 'video/mp4' ? 'camera-reel.mp4' : 'camera-reel.webm'
+      );
+      if (!uploadedUrl) return;
 
+      setPreviewVideoError(false);
       setMediaItems([
         {
-          url,
+          url: uploadedUrl,
           mediaType: 'video',
           durationSec: recordedSec,
         },
@@ -529,6 +586,17 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
               </div>
             )}
 
+            {uploadingMedia && (
+              <div className="mb-4 flex items-center gap-3 rounded-xl border border-sky-500/30 bg-sky-50 px-4 py-3 text-xs font-medium text-sky-800 dark:bg-sky-950/30 dark:text-sky-200">
+                <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                <span>
+                  {mediaDeliveryStatus?.storageProvider === 'aws-s3'
+                    ? `Enviando vídeo para Amazon S3 (${mediaDeliveryStatus.bucket})...`
+                    : 'Enviando vídeo para o servidor de streaming...'}
+                </span>
+              </div>
+            )}
+
             {/* Live Short Video Camera Stage for Reels */}
             {camOpen && mode === 'reel' ? (
               <div className="mb-6 overflow-hidden rounded-2xl border border-zinc-200 bg-black dark:border-zinc-800">
@@ -599,6 +667,15 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                     ? 'Selecione até 5 imagens para criar um carrossel'
                     : 'Selecione uma imagem vertical ou horizontal para editar'}
                 </p>
+                {mode === 'reel' && allowVideoReels && mediaDeliveryStatus && (
+                  <p className="mt-1.5 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
+                    {mediaDeliveryStatus.storageProvider === 'aws-s3'
+                      ? `Entrega na nuvem: Amazon S3 (${mediaDeliveryStatus.bucket})${
+                          mediaDeliveryStatus.cloudFrontActive ? ' + CloudFront CDN' : ''
+                        }`
+                      : 'Entrega por streaming HTTP 206 no servidor (pronto para Amazon S3 nas integrações ADM)'}
+                  </p>
+                )}
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -610,7 +687,7 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                 <input
                   ref={videoInputRef}
                   type="file"
-                  accept="video/*"
+                  accept="video/mp4,video/webm,video/quicktime,video/x-m4v,video/ogg,.mp4,.webm,.mov,.m4v,.ogv"
                   onChange={handleVideoFileOnly}
                   className="hidden"
                 />
@@ -620,16 +697,18 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                     <>
                       <button
                         type="button"
+                        disabled={uploadingMedia}
                         onClick={() => videoInputRef.current?.click()}
-                        className="inline-flex h-10 items-center gap-2 rounded-xl bg-sky-600 px-5 text-sm font-semibold text-white hover:bg-sky-700"
+                        className="inline-flex h-10 items-center gap-2 rounded-xl bg-sky-600 px-5 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
                       >
                         <Film className="h-4 w-4" />
-                        <span>Selecionar vídeo curto</span>
+                        <span>{uploadingMedia ? 'Enviando...' : 'Selecionar vídeo curto'}</span>
                       </button>
                       <button
                         type="button"
+                        disabled={uploadingMedia}
                         onClick={openReelCamera}
-                        className="inline-flex h-10 items-center gap-2 rounded-xl border border-zinc-300 bg-white px-4 text-sm font-semibold text-zinc-900 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                        className="inline-flex h-10 items-center gap-2 rounded-xl border border-zinc-300 bg-white px-4 text-sm font-semibold text-zinc-900 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
                       >
                         <Video className="h-4 w-4" />
                         <span>Gravar agora</span>
@@ -638,8 +717,9 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                   )}
                   <button
                     type="button"
+                    disabled={uploadingMedia}
                     onClick={() => fileInputRef.current?.click()}
-                    className={`inline-flex h-10 items-center gap-2 rounded-xl px-5 text-sm font-semibold ${
+                    className={`inline-flex h-10 items-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:opacity-50 ${
                       mode === 'reel' && allowVideoReels
                         ? 'border border-zinc-300 bg-white text-zinc-900 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100'
                         : 'bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950'
@@ -711,14 +791,27 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                 className={`relative w-full max-w-[380px] overflow-hidden rounded-xl bg-black shadow-sm ${previewRatioClass}`}
               >
                 {isActiveVideo ? (
-                  <video
-                    src={activeItem.url}
-                    controls
-                    playsInline
-                    loop
-                    className="h-full w-full object-cover transition-all duration-150"
-                    style={{ filter: filterCss || 'none' }}
-                  />
+                  previewVideoError ? (
+                    <div className="flex h-full w-full flex-col items-center justify-center bg-zinc-950 px-5 text-center text-white">
+                      <AlertCircle className="mb-2 h-7 w-7 text-amber-400" />
+                      <p className="text-xs font-semibold">
+                        O navegador não conseguiu decodificar este formato de vídeo
+                      </p>
+                      <p className="mt-1 text-[11px] text-zinc-400">
+                        Recomendamos exportar o vídeo em MP4 (H.264 + AAC) ou WebM para máxima compatibilidade.
+                      </p>
+                    </div>
+                  ) : (
+                    <video
+                      src={activeItem.url}
+                      controls
+                      playsInline
+                      loop
+                      onError={() => setPreviewVideoError(true)}
+                      className="h-full w-full object-cover transition-all duration-150"
+                      style={{ filter: filterCss || 'none' }}
+                    />
+                  )
                 ) : (
                   <MediaImage
                     src={activeItem?.url}

@@ -1112,10 +1112,16 @@ create policy "Publicações de contas ativas"
       Version: '2012-10-17',
       Statement: [
         {
+          Sid: 'LuminaS3BucketCheck',
+          Effect: 'Allow',
+          Action: ['s3:ListBucket'],
+          Resource: [`arn:aws:s3:::${bucket}`],
+        },
+        {
           Sid: 'LuminaS3MediaAccess',
           Effect: 'Allow',
           Action: ['s3:PutObject', 's3:GetObject', 's3:DeleteObject'],
-          Resource: [`arn:aws:s3:::${bucket}/uploads/*`],
+          Resource: [`arn:aws:s3:::${bucket}/*`],
         },
       ],
     };
@@ -2178,9 +2184,13 @@ ${itemsXml}
             </div>
 
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Chaves privadas (<code className="font-mono">AWS_ACCESS_KEY_ID</code> e{' '}
-              <code className="font-mono">AWS_SECRET_ACCESS_KEY</code>) permanecem isoladas
-              nas variáveis de ambiente do servidor.
+              Vídeos dos Reels são enviados automaticamente para{' '}
+              <code className="font-mono">s3://{state.aws.bucket}/reels/</code> e entregues via
+              CloudFront CDN ou URLs assinadas S3 com suporte a HTTP Range (ou streaming direto do
+              servidor enquanto as chaves{' '}
+              <code className="font-mono">AWS_ACCESS_KEY_ID</code> e{' '}
+              <code className="font-mono">AWS_SECRET_ACCESS_KEY</code> não estiverem definidas nos
+              Segredos do servidor).
             </p>
 
             {awsTestStatus && (

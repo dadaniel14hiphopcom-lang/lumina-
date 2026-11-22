@@ -17,6 +17,7 @@ const ADMIN_AUTH_FILE = path.join(ROOT_DIR, '.lumina-admin-auth.json');
 const ADMIN_STATE_FILE = path.join(ROOT_DIR, '.lumina-admin-state.json');
 const USER_AUTH_FILE = path.join(ROOT_DIR, '.lumina-user-auth.json');
 const SOCIAL_STATE_FILE = path.join(ROOT_DIR, '.lumina-social-state.json');
+const UPLOADS_DIR = path.join(ROOT_DIR, '.lumina-uploads');
 
 const FALLBACK_RANDOM_KEY = crypto.randomBytes(32);
 const ADMIN_EMAIL = 'dadaniel14hiphop.com@gmail.com';
@@ -760,9 +761,517 @@ function injectLinkPreviewMeta(html: string, req: Request): string {
     );
 }
 
+const ALLOWED_MEDIA_MIME_EXT: Record<string, { ext: string; kind: 'video' | 'image' }> = {
+  'video/mp4': { ext: 'mp4', kind: 'video' },
+  'video/webm': { ext: 'webm', kind: 'video' },
+  'video/quicktime': { ext: 'mov', kind: 'video' },
+  'video/x-m4v': { ext: 'm4v', kind: 'video' },
+  'video/ogg': { ext: 'ogv', kind: 'video' },
+  'image/jpeg': { ext: 'jpg', kind: 'image' },
+  'image/jpg': { ext: 'jpg', kind: 'image' },
+  'image/png': { ext: 'png', kind: 'image' },
+  'image/webp': { ext: 'webp', kind: 'image' },
+  'image/gif': { ext: 'gif', kind: 'image' },
+};
+
+const EXT_TO_CONTENT_TYPE: Record<string, string> = {
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime',
+  m4v: 'video/x-m4v',
+  ogv: 'video/ogg',
+  jpg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  gif: 'image/gif',
+};
+
+function awsEncodeRfc3986(input: string): string {
+  return encodeURIComponent(input).replace(
+    /[!'()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+}
+
+function encodeS3ObjectKey(key: string): string {
+  const cleanSegments = key
+    .split('/')
+    .map((s) => s.trim())
+    .filter((s) => s && s !== '.' && s !== '..');
+  return cleanSegments.map(awsEncodeRfc3986).join('/');
+}
+
+function sha256Hex(data: Buffer | string): string {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+function hmacSha256(key: Buffer | string, data: string): Buffer {
+  return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
+}
+
+function getAwsSigningKey(
+  secretAccessKey: string,
+  dateStamp: string,
+  region: string,
+  service = 's3'
+): Buffer {
+  const kDate = hmacSha256(`AWS4${secretAccessKey}`, dateStamp);
+  const kRegion = hmacSha256(kDate, region);
+  const kService = hmacSha256(kRegion, service);
+  return hmacSha256(kService, 'aws4_request');
+}
+
+function getAwsEnvCredentials(): {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+} | null {
+  const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
+  const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
+  const sessionToken = process.env.AWS_SESSION_TOKEN?.trim() || undefined;
+  if (!accessKeyId || !secretAccessKey) return null;
+  return { accessKeyId, secretAccessKey, sessionToken };
+}
+
+function resolveAwsMediaTarget(state: IntegrationState) {
+  const region = sanitizeIdentifier(
+    process.env.AWS_REGION?.trim() || state.aws.region,
+    'sa-east-1'
+  );
+  const bucket = sanitizeHost(
+    process.env.AWS_S3_BUCKET?.trim() || state.aws.bucket,
+    'lumina-media-prod'
+  );
+  const cloudFrontDomain = sanitizeHost(
+    process.env.AWS_CLOUDFRONT_DOMAIN?.trim() || state.aws.cloudFrontDomain,
+    ''
+  );
+  const hasRealCloudFront =
+    state.aws.cloudFrontEnabled &&
+    Boolean(cloudFrontDomain) &&
+    (Boolean(process.env.AWS_CLOUDFRONT_DOMAIN?.trim()) ||
+      cloudFrontDomain !== 'cdn.lumina.social');
+  return { region, bucket, cloudFrontDomain, hasRealCloudFront };
+}
+
+async function uploadBufferToAwsS3(params: {
+  region: string;
+  bucket: string;
+  key: string;
+  body: Buffer;
+  contentType: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+}): Promise<{ ok: boolean; status: number; message?: string }> {
+  const host = `${params.bucket}.s3.${params.region}.amazonaws.com`;
+  const encodedKey = encodeS3ObjectKey(params.key);
+  const canonicalUri = `/${encodedKey}`;
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = sha256Hex(params.body);
+
+  const canonicalHeadersList: [string, string][] = [
+    ['host', host],
+    ['x-amz-content-sha256', payloadHash],
+    ['x-amz-date', amzDate],
+  ];
+  if (params.sessionToken) {
+    canonicalHeadersList.push(['x-amz-security-token', params.sessionToken]);
+  }
+  canonicalHeadersList.sort((a, b) => a[0].localeCompare(b[0]));
+
+  const canonicalHeaders = canonicalHeadersList.map(([k, v]) => `${k}:${v}\n`).join('');
+  const signedHeaders = canonicalHeadersList.map(([k]) => k).join(';');
+  const canonicalRequest = [
+    'PUT',
+    canonicalUri,
+    '',
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join('\n');
+
+  const credentialScope = `${dateStamp}/${params.region}/s3/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join('\n');
+
+  const signingKey = getAwsSigningKey(params.secretAccessKey, dateStamp, params.region, 's3');
+  const signature = crypto
+    .createHmac('sha256', signingKey)
+    .update(stringToSign, 'utf8')
+    .digest('hex');
+
+  const authorization = `AWS4-HMAC-SHA256 Credential=${params.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const headers: Record<string, string> = {
+    'Content-Type': params.contentType,
+    'Content-Length': String(params.body.length),
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'x-amz-content-sha256': payloadHash,
+    'x-amz-date': amzDate,
+    Authorization: authorization,
+  };
+  if (params.sessionToken) {
+    headers['x-amz-security-token'] = params.sessionToken;
+  }
+
+  const resp = await fetch(`https://${host}${canonicalUri}`, {
+    method: 'PUT',
+    headers,
+    body: new Uint8Array(params.body),
+    signal: AbortSignal.timeout(45_000),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '');
+    return {
+      ok: false,
+      status: resp.status,
+      message: errText.slice(0, 240) || `HTTP ${resp.status}`,
+    };
+  }
+  return { ok: true, status: resp.status };
+}
+
+async function headAwsS3Bucket(params: {
+  region: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+}): Promise<{ ok: boolean; status: number }> {
+  const host = `${params.bucket}.s3.${params.region}.amazonaws.com`;
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = sha256Hex('');
+
+  const canonicalHeadersList: [string, string][] = [
+    ['host', host],
+    ['x-amz-content-sha256', payloadHash],
+    ['x-amz-date', amzDate],
+  ];
+  if (params.sessionToken) {
+    canonicalHeadersList.push(['x-amz-security-token', params.sessionToken]);
+  }
+  canonicalHeadersList.sort((a, b) => a[0].localeCompare(b[0]));
+
+  const canonicalHeaders = canonicalHeadersList.map(([k, v]) => `${k}:${v}\n`).join('');
+  const signedHeaders = canonicalHeadersList.map(([k]) => k).join(';');
+  const canonicalRequest = ['HEAD', '/', '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const credentialScope = `${dateStamp}/${params.region}/s3/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join('\n');
+  const signingKey = getAwsSigningKey(params.secretAccessKey, dateStamp, params.region, 's3');
+  const signature = crypto
+    .createHmac('sha256', signingKey)
+    .update(stringToSign, 'utf8')
+    .digest('hex');
+
+  const headers: Record<string, string> = {
+    'x-amz-content-sha256': payloadHash,
+    'x-amz-date': amzDate,
+    Authorization: `AWS4-HMAC-SHA256 Credential=${params.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+  };
+  if (params.sessionToken) {
+    headers['x-amz-security-token'] = params.sessionToken;
+  }
+
+  const resp = await fetch(`https://${host}/`, {
+    method: 'HEAD',
+    headers,
+    signal: AbortSignal.timeout(8000),
+  });
+  return { ok: resp.ok, status: resp.status };
+}
+
+function createAwsS3PresignedGetUrl(params: {
+  region: string;
+  bucket: string;
+  key: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  expiresSec?: number;
+}): string {
+  const expiresSec = params.expiresSec ?? 3600;
+  const host = `${params.bucket}.s3.${params.region}.amazonaws.com`;
+  const canonicalUri = `/${encodeS3ObjectKey(params.key)}`;
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const credentialScope = `${dateStamp}/${params.region}/s3/aws4_request`;
+
+  const queryEntries: [string, string][] = [
+    ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
+    ['X-Amz-Credential', `${params.accessKeyId}/${credentialScope}`],
+    ['X-Amz-Date', amzDate],
+    ['X-Amz-Expires', String(expiresSec)],
+    ['X-Amz-SignedHeaders', 'host'],
+  ];
+  if (params.sessionToken) {
+    queryEntries.push(['X-Amz-Security-Token', params.sessionToken]);
+  }
+  queryEntries.sort((a, b) => a[0].localeCompare(b[0]));
+
+  const canonicalQuery = queryEntries
+    .map(([k, v]) => `${awsEncodeRfc3986(k)}=${awsEncodeRfc3986(v)}`)
+    .join('&');
+  const canonicalRequest = [
+    'GET',
+    canonicalUri,
+    canonicalQuery,
+    `host:${host}\n`,
+    'host',
+    'UNSIGNED-PAYLOAD',
+  ].join('\n');
+
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest),
+  ].join('\n');
+  const signingKey = getAwsSigningKey(params.secretAccessKey, dateStamp, params.region, 's3');
+  const signature = crypto
+    .createHmac('sha256', signingKey)
+    .update(stringToSign, 'utf8')
+    .digest('hex');
+
+  return `https://${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '4mb' }));
+
+  // Media delivery capability check
+  app.get('/api/media/status', (_req, res) => {
+    const state = readAdminState();
+    const creds = getAwsEnvCredentials();
+    const target = resolveAwsMediaTarget(state);
+    const awsReady = Boolean(creds && state.aws.s3Enabled);
+    res.json({
+      uploadAvailable: true,
+      storageProvider: awsReady ? 'aws-s3' : 'server-disk',
+      awsCredentialsConfigured: Boolean(creds),
+      s3Enabled: state.aws.s3Enabled,
+      cloudFrontActive: awsReady && target.hasRealCloudFront,
+      region: target.region,
+      bucket: target.bucket,
+      maxVideoSizeMB: state.site.videoRules.maxVideoSizeMB,
+    });
+  });
+
+  // Upload Reel video or photo directly to Amazon S3 (with CloudFront/Presigned delivery) or local HTTP-206 disk store
+  app.post(
+    '/api/media/upload',
+    express.raw({
+      type: ['video/*', 'image/*', 'application/octet-stream'],
+      limit: '260mb',
+    }),
+    async (req, res) => {
+      const state = readAdminState();
+      const rawType = String(req.headers['content-type'] || '')
+        .split(';')[0]
+        .trim()
+        .toLowerCase();
+      const spec = ALLOWED_MEDIA_MIME_EXT[rawType];
+      if (!spec) {
+        res.status(415).json({
+          error:
+            'Formato de mídia não suportado. Envie MP4, WebM, MOV, M4V, JPG, PNG ou WebP.',
+        });
+        return;
+      }
+
+      const bodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (bodyBuffer.length === 0) {
+        res.status(400).json({ error: 'Arquivo vazio ou corrompido.' });
+        return;
+      }
+
+      const maxVideoBytes = state.site.videoRules.maxVideoSizeMB * 1024 * 1024;
+      const maxImageBytes = 15 * 1024 * 1024;
+      const maxAllowedBytes = spec.kind === 'video' ? maxVideoBytes : maxImageBytes;
+      if (bodyBuffer.length > maxAllowedBytes) {
+        res.status(413).json({
+          error: `Arquivo excede o limite de ${
+            spec.kind === 'video' ? `${state.site.videoRules.maxVideoSizeMB} MB` : '15 MB'
+          }.`,
+        });
+        return;
+      }
+
+      const now = new Date();
+      const ym = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+      const uniqueId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+      const fileName = `${uniqueId}.${spec.ext}`;
+      const folder = spec.kind === 'video' ? 'reels' : 'media';
+      const objectKey = `${folder}/${ym}/${fileName}`;
+
+      const awsCreds = getAwsEnvCredentials();
+      const awsTarget = resolveAwsMediaTarget(state);
+
+      if (awsCreds && state.aws.s3Enabled) {
+        try {
+          const uploadResult = await uploadBufferToAwsS3({
+            region: awsTarget.region,
+            bucket: awsTarget.bucket,
+            key: objectKey,
+            body: bodyBuffer,
+            contentType: rawType,
+            accessKeyId: awsCreds.accessKeyId,
+            secretAccessKey: awsCreds.secretAccessKey,
+            sessionToken: awsCreds.sessionToken,
+          });
+          if (uploadResult.ok) {
+            const deliveryUrl = awsTarget.hasRealCloudFront
+              ? `https://${awsTarget.cloudFrontDomain}/${encodeS3ObjectKey(objectKey)}`
+              : `/api/media/s3/${objectKey}`;
+            res.json({
+              ok: true,
+              url: deliveryUrl,
+              storageProvider: awsTarget.hasRealCloudFront ? 'aws-cloudfront' : 'aws-s3',
+              key: objectKey,
+              sizeBytes: bodyBuffer.length,
+              contentType: rawType,
+            });
+            return;
+          }
+          console.error(`AWS S3 upload HTTP ${uploadResult.status}: ${uploadResult.message}`);
+        } catch (err) {
+          console.error('AWS S3 upload failed, falling back to server media stream:', err);
+        }
+      }
+
+      // Server local disk stream fallback with full HTTP 206 byte-range seeking
+      try {
+        if (!fs.existsSync(UPLOADS_DIR)) {
+          fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+        }
+        const safePath = path.resolve(UPLOADS_DIR, fileName);
+        if (!safePath.startsWith(UPLOADS_DIR + path.sep)) {
+          res.status(400).json({ error: 'Caminho de arquivo inválido.' });
+          return;
+        }
+        fs.writeFileSync(safePath, bodyBuffer);
+        res.json({
+          ok: true,
+          url: `/api/media/file/${fileName}`,
+          storageProvider: 'server-disk',
+          key: fileName,
+          sizeBytes: bodyBuffer.length,
+          contentType: rawType,
+        });
+      } catch {
+        res.status(500).json({ error: 'Não foi possível salvar a mídia no servidor.' });
+      }
+    }
+  );
+
+  // Redirect to a short-lived AWS S3 SigV4 presigned GET URL (supports private buckets & Range seeking)
+  app.get('/api/media/s3/*', (req, res) => {
+    const rawKey = String((req.params as Record<string, string>)[0] || '').trim();
+    if (!rawKey || rawKey.includes('..') || !/^[a-zA-Z0-9/_.-]{4,240}$/.test(rawKey)) {
+      res.status(400).json({ error: 'Chave S3 inválida.' });
+      return;
+    }
+    const awsCreds = getAwsEnvCredentials();
+    if (!awsCreds) {
+      res.status(503).json({ error: 'Credenciais AWS não configuradas no servidor.' });
+      return;
+    }
+    const state = readAdminState();
+    const target = resolveAwsMediaTarget(state);
+    const signedUrl = createAwsS3PresignedGetUrl({
+      region: target.region,
+      bucket: target.bucket,
+      key: rawKey,
+      accessKeyId: awsCreds.accessKeyId,
+      secretAccessKey: awsCreds.secretAccessKey,
+      sessionToken: awsCreds.sessionToken,
+      expiresSec: 3600,
+    });
+    res.setHeader('Cache-Control', 'private, max-age=3000');
+    res.redirect(302, signedUrl);
+  });
+
+  // Stream uploaded server media with full HTTP 206 Partial Content Range support for mobile/desktop video playback
+  app.get('/api/media/file/:filename', (req, res) => {
+    const filename = String(req.params.filename || '').trim();
+    const match = filename.match(/^([a-zA-Z0-9_-]{4,80})\.(mp4|webm|mov|m4v|ogv|jpg|png|webp|gif)$/i);
+    if (!match) {
+      res.status(400).json({ error: 'Nome de arquivo inválido.' });
+      return;
+    }
+    const safePath = path.resolve(UPLOADS_DIR, filename);
+    if (!safePath.startsWith(UPLOADS_DIR + path.sep) || !fs.existsSync(safePath)) {
+      res.status(404).json({ error: 'Mídia não encontrada.' });
+      return;
+    }
+
+    const ext = match[2].toLowerCase();
+    const contentType = EXT_TO_CONTENT_TYPE[ext] || 'application/octet-stream';
+    const stat = fs.statSync(safePath);
+    const total = stat.size;
+    const range = req.headers.range;
+
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Content-Type', contentType);
+
+    if (range && /^bytes=\d*-\d*$/i.test(range)) {
+      const [startRaw, endRaw] = range.replace(/bytes=/i, '').split('-');
+      const start = startRaw ? Number.parseInt(startRaw, 10) : 0;
+      const end = endRaw ? Math.min(total - 1, Number.parseInt(endRaw, 10)) : total - 1;
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+        return;
+      }
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', String(end - start + 1));
+      fs.createReadStream(safePath, { start, end }).pipe(res);
+      return;
+    }
+
+    res.status(200);
+    res.setHeader('Content-Length', String(total));
+    fs.createReadStream(safePath).pipe(res);
+  });
+
+  app.use(
+    '/api/media',
+    (
+      err: { status?: number; type?: string },
+      _req: Request,
+      res: Response,
+      next: NextFunction
+    ) => {
+      if (!err) {
+        next();
+        return;
+      }
+      if (err.type === 'entity.too.large' || err.status === 413) {
+        res.status(413).json({
+          error:
+            'O arquivo de vídeo excede o limite máximo suportado pelo servidor (260 MB).',
+        });
+        return;
+      }
+      res.status(err.status && err.status >= 400 ? err.status : 400).json({
+        error: 'Falha ao processar o arquivo de mídia enviado.',
+      });
+    }
+  );
 
   // Auth status (public check for admin gate)
   app.get('/api/admin/auth/status', (_req, res) => {
@@ -1008,16 +1517,49 @@ async function startServer() {
     const state = readAdminState();
 
     if (provider === 'aws') {
-      const hasKeys = Boolean(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+      const awsCreds = getAwsEnvCredentials();
+      const target = resolveAwsMediaTarget(state);
       state.aws.lastVerifiedAt = Date.now();
       writeAdminState(state);
-      res.json({
-        ok: true,
-        reachable: hasKeys,
-        statusLabel: hasKeys
-          ? `Credenciais AWS detectadas (${state.aws.region} · s3://${state.aws.bucket})`
-          : `Configuração salva (${state.aws.region} · s3://${state.aws.bucket}). Defina AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY nos Segredos do servidor para uploads S3 reais.`,
-      });
+
+      if (!awsCreds) {
+        res.json({
+          ok: true,
+          reachable: false,
+          statusLabel: `Modo local ativo (${target.region} · s3://${target.bucket}). Defina AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY nos Segredos do servidor para hospedar vídeos diretamente na Amazon S3.`,
+        });
+        return;
+      }
+
+      try {
+        const probe = await headAwsS3Bucket({
+          region: target.region,
+          bucket: target.bucket,
+          accessKeyId: awsCreds.accessKeyId,
+          secretAccessKey: awsCreds.secretAccessKey,
+          sessionToken: awsCreds.sessionToken,
+        });
+        res.json({
+          ok: true,
+          reachable: probe.ok,
+          httpStatus: probe.status,
+          statusLabel: probe.ok
+            ? `Amazon S3 conectado em s3://${target.bucket} (${target.region})${
+                target.hasRealCloudFront ? ` · CloudFront: ${target.cloudFrontDomain}` : ' · Entrega com URL assinada S3'
+              }`
+            : probe.status === 403
+            ? `Credenciais AWS detectadas, mas o bucket s3://${target.bucket} retornou HTTP 403 (verifique permissões IAM s3:PutObject/GetObject/ListBucket).`
+            : probe.status === 301
+            ? `Bucket s3://${target.bucket} existe em outra região AWS (ajuste a Região AWS e salve).`
+            : `Bucket s3://${target.bucket} retornou HTTP ${probe.status}.`,
+        });
+      } catch {
+        res.json({
+          ok: true,
+          reachable: false,
+          statusLabel: `Credenciais AWS configuradas, mas não foi possível alcançar s3://${target.bucket} (${target.region}).`,
+        });
+      }
       return;
     }
 

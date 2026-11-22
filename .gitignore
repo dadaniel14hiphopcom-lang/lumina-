@@ -7,3 +7,6 @@ coverage/
 .env*
 !.env.example
 .lumina-admin-*.json
+.lumina-user-*.json
+.lumina-social-*.json
+.lumina-uploads/

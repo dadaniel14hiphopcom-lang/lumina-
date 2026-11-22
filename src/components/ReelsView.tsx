@@ -38,16 +38,23 @@ function ReelVideoFrame({
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [progress, setProgress] = useState(0);
+  const [hasError, setHasError] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
+
+  useEffect(() => {
+    setHasError(false);
+    setProgress(0);
+  }, [src]);
 
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
     el.muted = muted;
-  }, [muted]);
+  }, [muted, retryKey]);
 
   useEffect(() => {
     const el = videoRef.current;
-    if (!el) return;
+    if (!el || hasError) return;
 
     if (!active || paused) {
       el.pause();
@@ -65,11 +72,36 @@ function ReelVideoFrame({
         }
       });
     }
-  }, [active, paused, src, onFallbackMute]);
+  }, [active, paused, src, hasError, retryKey, onFallbackMute]);
+
+  if (hasError) {
+    return (
+      <div className="flex h-full w-full flex-col items-center justify-center bg-zinc-950 px-6 text-center text-white">
+        <p className="text-sm font-semibold">Não foi possível reproduzir este vídeo</p>
+        <p className="mt-1.5 text-xs text-zinc-400">
+          {src.startsWith('blob:')
+            ? 'Este vídeo antigo expirou porque foi salvo apenas na sessão local.'
+            : 'O codec do vídeo não é compatível com este navegador ou a mídia falhou ao carregar.'}
+        </p>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setHasError(false);
+            setRetryKey((k) => k + 1);
+          }}
+          className="mt-4 rounded-xl bg-white/15 px-4 py-2 text-xs font-semibold text-white hover:bg-white/25"
+        >
+          Tentar novamente
+        </button>
+      </div>
+    );
+  }
 
   return (
     <>
       <video
+        key={`${src}_${retryKey}`}
         ref={videoRef}
         src={src}
         autoPlay={active}
@@ -77,6 +109,7 @@ function ReelVideoFrame({
         muted={muted}
         playsInline
         preload="auto"
+        onError={() => setHasError(true)}
         onTimeUpdate={(e) => {
           const v = e.currentTarget;
           if (v.duration > 0) {
