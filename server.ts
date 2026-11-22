@@ -30,6 +30,7 @@ const ADMIN_AUTH_FILE = path.join(ROOT_DIR, '.lumina-admin-auth.json');
 const ADMIN_STATE_FILE = path.join(ROOT_DIR, '.lumina-admin-state.json');
 const USER_AUTH_FILE = path.join(ROOT_DIR, '.lumina-user-auth.json');
 const SOCIAL_STATE_FILE = path.join(ROOT_DIR, '.lumina-social-state.json');
+const POST_PREVIEWS_FILE = path.join(ROOT_DIR, '.lumina-post-previews.json');
 const UPLOADS_DIR = path.join(ROOT_DIR, '.lumina-uploads');
 
 const FALLBACK_RANDOM_KEY = crypto.randomBytes(32);
@@ -168,10 +169,23 @@ interface SharedSocialState {
   notifications: Record<string, unknown>[];
 }
 
+interface PostPreviewRecord {
+  id: string;
+  authorUsername: string;
+  authorDisplayName: string;
+  caption: string;
+  isReel: boolean;
+  imageUrl?: string;
+  authorAvatarUrl?: string;
+  videoUrl?: string;
+  updatedAt: number;
+}
+
 let memoryAuthRecord: AdminAuthRecord | null = null;
 let memoryAdminState: IntegrationState | null = null;
 let memoryUserAuthRecords: UserAuthRecord[] | null = null;
 let memorySocialState: SharedSocialState | null = null;
+let memoryPostPreviews: Map<string, PostPreviewRecord> | null = null;
 
 interface IntegrationState {
   aws: {
@@ -636,6 +650,109 @@ function collectAllowlistedProjectFiles(): ZipEntryInput[] {
   return entries;
 }
 
+function isSafePreviewMediaUrl(raw?: string): boolean {
+  if (typeof raw !== 'string') return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 560_000) return false;
+  if (/^https?:\/\//i.test(trimmed)) return true;
+  if (/^\/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]+$/.test(trimmed)) return true;
+  if (/^data:image\/(jpeg|jpg|png|webp|gif);base64,[a-zA-Z0-9+/=]+$/i.test(trimmed)) {
+    return true;
+  }
+  return false;
+}
+
+function readPostPreviewsMap(): Map<string, PostPreviewRecord> {
+  if (memoryPostPreviews) return memoryPostPreviews;
+  const map = new Map<string, PostPreviewRecord>();
+  try {
+    if (fs.existsSync(POST_PREVIEWS_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(POST_PREVIEWS_FILE, 'utf8'));
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (item && typeof item.id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(item.id)) {
+            map.set(item.id, item as PostPreviewRecord);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore malformed preview store
+  }
+  memoryPostPreviews = map;
+  return map;
+}
+
+function writePostPreviewsMap(map: Map<string, PostPreviewRecord>): void {
+  memoryPostPreviews = map;
+  try {
+    const entries = Array.from(map.values())
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 300);
+    fs.writeFileSync(POST_PREVIEWS_FILE, JSON.stringify(entries), 'utf8');
+  } catch {
+    // Keep in memory if filesystem is read-only
+  }
+}
+
+function resolvePostPreviewData(postId: string): {
+  authorLabel: string;
+  caption: string;
+  isReel: boolean;
+  rawImage?: string;
+  rawVideo?: string;
+} | null {
+  const previewMap = readPostPreviewsMap();
+  const cached = previewMap.get(postId);
+  if (cached) {
+    const authorLabel = cached.authorUsername
+      ? `@${cached.authorUsername.replace(/^@/, '')}`
+      : cached.authorDisplayName || 'Lumina';
+    return {
+      authorLabel,
+      caption: cached.caption || '',
+      isReel: Boolean(cached.isReel),
+      rawImage: cached.imageUrl || cached.authorAvatarUrl,
+      rawVideo: cached.videoUrl,
+    };
+  }
+
+  const sharedState = readSharedSocialState();
+  const matchedPost = sharedState?.posts.find((p) => p.id === postId) as
+    | {
+        authorId?: string;
+        caption?: string;
+        isReel?: boolean;
+        media?: { url?: string; mediaType?: string }[];
+      }
+    | undefined;
+  if (!matchedPost) return null;
+
+  const matchedAuthor = sharedState?.users.find((u) => u.id === matchedPost.authorId) as
+    | { username?: string; displayName?: string; avatarUrl?: string }
+    | undefined;
+  const authorLabel = matchedAuthor?.username
+    ? `@${matchedAuthor.username.replace(/^@/, '')}`
+    : matchedAuthor?.displayName || 'Lumina';
+  const firstImg = matchedPost.media?.find(
+    (m) => m.mediaType !== 'video' && isSafePreviewMediaUrl(m.url)
+  )?.url;
+  const firstVid = matchedPost.media?.find(
+    (m) => m.mediaType === 'video' && typeof m.url === 'string' && /^https?:\/\//i.test(m.url)
+  )?.url;
+  const fallbackAvatar = isSafePreviewMediaUrl(matchedAuthor?.avatarUrl)
+    ? matchedAuthor?.avatarUrl
+    : undefined;
+
+  return {
+    authorLabel,
+    caption: typeof matchedPost.caption === 'string' ? matchedPost.caption.trim() : '',
+    isReel: Boolean(matchedPost.isReel),
+    rawImage: firstImg || fallbackAvatar,
+    rawVideo: firstVid,
+  };
+}
+
 function escapeHtmlAttr(value: string): string {
   return value
     .replace(/&/g, '&amp;')
@@ -676,59 +793,59 @@ function injectLinkPreviewMeta(html: string, req: Request): string {
     'Rede social visual com feed em tempo real, stories interativos, reels em vídeo, estúdio de filtros e mensagens diretas na Lumina.';
   const defaultImage = `${origin}/og-preview.jpg`;
 
+  let ogType = 'website';
   let title = defaultTitle;
   let description = defaultDescription;
   let imageUrl = defaultImage;
+  let imageAlt = 'Lumina — Rede Social Visual com feed, stories, reels e mensagens';
   let canonicalUrl = `${origin}/`;
 
-  const postParam = typeof req.query.post === 'string' ? req.query.post.trim() : '';
+  const queryPostParam = typeof req.query.post === 'string' ? req.query.post.trim() : '';
+  const pathMatch = req.path.match(/^\/(?:p|post)\/([a-zA-Z0-9_-]{1,128})\/?$/);
+  const postParam = queryPostParam || (pathMatch ? pathMatch[1] : '');
   const inviteParam = typeof req.query.invite === 'string' ? req.query.invite.trim().toUpperCase() : '';
 
   if (postParam && /^[a-zA-Z0-9_-]{1,128}$/.test(postParam)) {
     canonicalUrl = `${origin}/?post=${encodeURIComponent(postParam)}`;
-    const sharedState = readSharedSocialState();
-    const matchedPost = sharedState?.posts.find((p) => p.id === postParam) as
-      | {
-          authorId?: string;
-          caption?: string;
-          isReel?: boolean;
-          media?: { url?: string; mediaType?: string }[];
-        }
-      | undefined;
+    const resolved = resolvePostPreviewData(postParam);
 
-    if (matchedPost) {
-      const matchedAuthor = sharedState?.users.find((u) => u.id === matchedPost.authorId) as
-        | { username?: string; displayName?: string }
-        | undefined;
-      const authorLabel = matchedAuthor?.username
-        ? `@${matchedAuthor.username}`
-        : matchedAuthor?.displayName || 'Lumina';
-      title = matchedPost.isReel
-        ? `Reel de ${authorLabel} na Lumina`
-        : `Publicação de ${authorLabel} na Lumina`;
-      if (typeof matchedPost.caption === 'string' && matchedPost.caption.trim()) {
-        description = matchedPost.caption.trim().slice(0, 155);
+    if (resolved) {
+      ogType = resolved.isReel ? 'video.other' : 'article';
+      title = resolved.isReel
+        ? `Reel de ${resolved.authorLabel} na Lumina`
+        : `Publicação de ${resolved.authorLabel} na Lumina`;
+      imageAlt = title;
+      if (resolved.caption) {
+        description = resolved.caption.slice(0, 155);
       }
-      const firstImg = matchedPost.media?.find(
-        (m) => m.mediaType !== 'video' && typeof m.url === 'string' && /^https?:\/\//i.test(m.url)
-      )?.url;
-      if (firstImg) {
-        imageUrl = firstImg;
+      if (resolved.rawImage) {
+        if (/^https?:\/\//i.test(resolved.rawImage)) {
+          imageUrl = resolved.rawImage;
+        } else if (resolved.rawImage.startsWith('data:image/')) {
+          imageUrl = `${origin}/api/og/image/${encodeURIComponent(postParam)}.jpg`;
+        } else if (resolved.rawImage.startsWith('/')) {
+          imageUrl = `${origin}${resolved.rawImage}`;
+        }
       }
     } else {
+      ogType = 'article';
       title = 'Publicação na Lumina — Rede Social Visual';
+      imageAlt = title;
     }
   } else if (inviteParam && /^[A-Z0-9_-]{4,32}$/.test(inviteParam)) {
     canonicalUrl = `${origin}/?invite=${encodeURIComponent(inviteParam)}`;
     title = 'Convite exclusivo para entrar na Lumina';
     description =
       'Você recebeu um convite para criar sua conta e compartilhar fotos, stories e reels na Lumina.';
+    imageAlt = title;
   }
 
+  const safeType = escapeHtmlAttr(ogType);
   const safeTitle = escapeHtmlAttr(title);
   const safeDesc = escapeHtmlAttr(description);
   const safeUrl = escapeHtmlAttr(canonicalUrl);
   const safeImage = escapeHtmlAttr(imageUrl);
+  const safeAlt = escapeHtmlAttr(imageAlt);
 
   return html
     .replace(/<title>[\s\S]*?<\/title>/i, `<title>${safeTitle}</title>`)
@@ -739,6 +856,10 @@ function injectLinkPreviewMeta(html: string, req: Request): string {
     .replace(
       /<link\s+rel="canonical"[^>]*>/i,
       `<link rel="canonical" href="${safeUrl}" />`
+    )
+    .replace(
+      /<meta\s+property="og:type"[^>]*>/i,
+      `<meta property="og:type" content="${safeType}" />`
     )
     .replace(
       /<meta\s+property="og:url"[^>]*>/i,
@@ -761,6 +882,10 @@ function injectLinkPreviewMeta(html: string, req: Request): string {
       `<meta property="og:image:secure_url" content="${safeImage}" />`
     )
     .replace(
+      /<meta\s+property="og:image:alt"[^>]*>/i,
+      `<meta property="og:image:alt" content="${safeAlt}" />`
+    )
+    .replace(
       /<meta\s+name="twitter:title"[^>]*>/i,
       `<meta name="twitter:title" content="${safeTitle}" />`
     )
@@ -771,6 +896,10 @@ function injectLinkPreviewMeta(html: string, req: Request): string {
     .replace(
       /<meta\s+name="twitter:image"\s+content="[^"]*"[^>]*>/i,
       `<meta name="twitter:image" content="${safeImage}" />`
+    )
+    .replace(
+      /<meta\s+name="twitter:image:alt"[^>]*>/i,
+      `<meta name="twitter:image:alt" content="${safeAlt}" />`
     );
 }
 
@@ -2205,6 +2334,111 @@ async function startServer() {
     res.json({ ok: true, version: nextState.version, updatedAt: nextState.updatedAt });
   });
 
+  // Public post OpenGraph preview index (synced from Firestore & local posts for external link cards)
+  app.get('/api/social/previews/status', (_req, res) => {
+    const map = readPostPreviewsMap();
+    res.json({ ok: true, ssrActive: true, cachedPosts: map.size });
+  });
+
+  app.post('/api/social/previews', express.json({ limit: '6mb' }), (req, res) => {
+    const rawItems = Array.isArray(req.body?.items)
+      ? (req.body.items as unknown[])
+      : req.body?.item
+      ? [req.body.item]
+      : [];
+    if (rawItems.length === 0) {
+      res.status(400).json({ error: 'Nenhum item de pré-visualização informado.' });
+      return;
+    }
+
+    const map = readPostPreviewsMap();
+    let upserted = 0;
+    for (const raw of rawItems.slice(0, 200)) {
+      if (!raw || typeof raw !== 'object') continue;
+      const item = raw as Record<string, unknown>;
+      const id = typeof item.id === 'string' ? item.id.trim() : '';
+      if (!/^[a-zA-Z0-9_-]{1,128}$/.test(id)) continue;
+
+      const authorUsername =
+        typeof item.authorUsername === 'string'
+          ? item.authorUsername.trim().replace(/^@/, '').slice(0, 40)
+          : '';
+      const authorDisplayName =
+        typeof item.authorDisplayName === 'string' ? item.authorDisplayName.trim().slice(0, 80) : '';
+      const caption = typeof item.caption === 'string' ? item.caption.trim().slice(0, 400) : '';
+      const isReel = Boolean(item.isReel);
+      const imageUrl =
+        typeof item.imageUrl === 'string' && isSafePreviewMediaUrl(item.imageUrl)
+          ? item.imageUrl.trim()
+          : undefined;
+      const authorAvatarUrl =
+        typeof item.authorAvatarUrl === 'string' && isSafePreviewMediaUrl(item.authorAvatarUrl)
+          ? item.authorAvatarUrl.trim()
+          : undefined;
+      const videoUrl =
+        typeof item.videoUrl === 'string' && /^https?:\/\//i.test(item.videoUrl.trim())
+          ? item.videoUrl.trim().slice(0, 500)
+          : undefined;
+
+      map.set(id, {
+        id,
+        authorUsername,
+        authorDisplayName,
+        caption,
+        isReel,
+        imageUrl,
+        authorAvatarUrl,
+        videoUrl,
+        updatedAt: Date.now(),
+      });
+      upserted += 1;
+    }
+
+    if (upserted > 0) {
+      writePostPreviewsMap(map);
+    }
+    res.json({ ok: true, upserted, totalCached: map.size });
+  });
+
+  // Serve decoded OpenGraph preview image (converts data:image/... posts into crawlable HTTPS image URLs)
+  app.get('/api/og/image/:postFile', (req, res) => {
+    const rawParam = String(req.params.postFile || '').replace(/\.(jpg|jpeg|png|webp|gif)$/i, '');
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(rawParam)) {
+      res.status(400).end();
+      return;
+    }
+
+    const preview = resolvePostPreviewData(rawParam);
+    const imgSrc = preview?.rawImage || '';
+    const dataMatch = imgSrc.match(/^data:(image\/(?:jpeg|jpg|png|webp|gif));base64,([a-zA-Z0-9+/=]+)$/i);
+    if (dataMatch) {
+      try {
+        const mime = dataMatch[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : dataMatch[1].toLowerCase();
+        const buf = Buffer.from(dataMatch[2], 'base64');
+        res.setHeader('Content-Type', mime);
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.send(buf);
+        return;
+      } catch {
+        // Fallback to default OG banner
+      }
+    }
+
+    if (/^https?:\/\//i.test(imgSrc)) {
+      res.redirect(302, imgSrc);
+      return;
+    }
+
+    const fallbackBanner = path.join(ROOT_DIR, 'public', 'og-preview.jpg');
+    if (fs.existsSync(fallbackBanner)) {
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.sendFile(fallbackBanner);
+      return;
+    }
+    res.status(404).end();
+  });
+
   // Download Complete Self-Hosted WordPress Kit (.zip)
   app.get('/api/admin/wordpress/download-kit', requireAdminAuth, (_req, res) => {
     const state = readAdminState();
@@ -2397,14 +2631,15 @@ Este pacote dá controle total da infraestrutura ao administrador:
     });
 
     app.get('*', async (req, res, next) => {
-      const accept = req.headers.accept || '';
+      const accept = String(req.headers.accept || '').toLowerCase();
+      const wantsHtmlOrCrawler = !accept || accept.includes('text/html') || accept.includes('*/*');
       if (
         req.path.startsWith('/api/') ||
         req.path.startsWith('/@') ||
         req.path.startsWith('/src/') ||
         req.path.startsWith('/node_modules/') ||
         path.extname(req.path) !== '' ||
-        !accept.includes('text/html')
+        !wantsHtmlOrCrawler
       ) {
         next();
         return;

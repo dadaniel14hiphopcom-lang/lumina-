@@ -443,7 +443,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const [exploreQuery, setExploreQuery] = useState('');
   const [selectedPostId, setSelectedPostId] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null;
-    return new URLSearchParams(window.location.search).get('post')?.trim() || null;
+    const fromQuery = new URLSearchParams(window.location.search).get('post')?.trim();
+    if (fromQuery) return fromQuery;
+    const pathMatch = window.location.pathname.match(/^\/(?:p|post)\/([a-zA-Z0-9_-]{1,128})\/?$/);
+    return pathMatch ? pathMatch[1] : null;
   });
   const [activeStoryAuthorId, setActiveStoryAuthorId] = useState<string | null>(null);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
@@ -540,7 +543,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   // Keep client-side canonical URL and OpenGraph preview metadata synchronized
   useEffect(() => {
     if (typeof window === 'undefined' || typeof document === 'undefined') return;
-    const baseUrl = `${window.location.origin}${window.location.pathname}`;
+    const baseUrl = `${window.location.origin}/`;
     const activePost = selectedPostId
       ? state.posts.find((p) => p.id === selectedPostId)
       : undefined;
@@ -552,11 +555,18 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       ? `${baseUrl}?post=${encodeURIComponent(activePost.id)}`
       : baseUrl;
     const nextTitle = activePost
-      ? `${activePost.isReel ? 'Reel' : 'Publicação'} de @${activeAuthor?.username || 'lumina'} — Lumina`
+      ? `${activePost.isReel ? 'Reel' : 'Publicação'} de @${activeAuthor?.username || 'lumina'} na Lumina`
       : 'Lumina — Rede Social Visual';
     const nextDesc =
       activePost?.caption?.trim().slice(0, 155) ||
       'Rede social visual com feed em tempo real, stories interativos, reels em vídeo, estúdio de filtros e mensagens diretas na Lumina.';
+    const rawFirstImg = activePost?.media.find((m) => m.mediaType !== 'video')?.url;
+    const nextImage =
+      rawFirstImg && /^https?:\/\//i.test(rawFirstImg)
+        ? rawFirstImg
+        : activePost && rawFirstImg?.startsWith('data:image/') && serverSyncAvailable
+        ? `${window.location.origin}/api/og/image/${encodeURIComponent(activePost.id)}.jpg`
+        : `${window.location.origin}/og-preview.jpg`;
 
     document.title = nextTitle;
     const setMeta = (selector: string, value: string, attr = 'content') => {
@@ -567,10 +577,18 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     setMeta('meta[property="og:url"]', nextUrl);
     setMeta('meta[property="og:title"]', nextTitle);
     setMeta('meta[property="og:description"]', nextDesc);
+    setMeta('meta[property="og:image"]', nextImage);
+    setMeta('meta[property="og:image:secure_url"]', nextImage);
+    setMeta('meta[property="og:image:alt"]', nextTitle);
     setMeta('meta[name="twitter:title"]', nextTitle);
     setMeta('meta[name="twitter:description"]', nextDesc);
+    setMeta('meta[name="twitter:image"]', nextImage);
+    setMeta('meta[name="twitter:image:alt"]', nextTitle);
     if (!window.location.search.includes('invite=')) {
       const url = new URL(window.location.href);
+      if (/^\/(?:p|post)\//.test(url.pathname)) {
+        url.pathname = '/';
+      }
       if (selectedPostId) {
         url.searchParams.set('post', selectedPostId);
       } else {
@@ -581,7 +599,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         window.history.replaceState({}, '', nextRelative);
       }
     }
-  }, [selectedPostId, state.posts, state.users]);
+  }, [selectedPostId, state.posts, state.users, serverSyncAvailable]);
 
   // Helper to merge remote records cleanly by ID without losing local seed fallback
   const mergeRecordsById = <T extends { id: string }>(localList: T[], remoteList: T[]): T[] => {
@@ -875,6 +893,34 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         .catch(() => {});
     }
   }, [state, serverSyncAvailable]);
+
+  // Always index public post previews on Node SSR server (even for posts loaded from Firestore)
+  useEffect(() => {
+    if (!serverSyncAvailable || state.posts.length === 0) return;
+    const timer = window.setTimeout(() => {
+      const items = state.posts.slice(0, 60).map((post) => {
+        const author = state.users.find((u) => u.id === post.authorId);
+        const firstImg = post.media.find((m) => m.mediaType !== 'video')?.url;
+        const firstVid = post.media.find((m) => m.mediaType === 'video')?.url;
+        return {
+          id: post.id,
+          authorUsername: author?.username || 'lumina',
+          authorDisplayName: author?.displayName || 'Lumina',
+          authorAvatarUrl: author?.avatarUrl,
+          caption: (post.caption || '').slice(0, 400),
+          isReel: Boolean(post.isReel),
+          imageUrl: firstImg,
+          videoUrl: firstVid && /^https?:\/\//i.test(firstVid) ? firstVid : undefined,
+        };
+      });
+      fetch('/api/social/previews', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+      }).catch(() => {});
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [state.posts, state.users, serverSyncAvailable]);
 
   useEffect(() => {
     if (skipNextInvitesBroadcastRef.current) {
