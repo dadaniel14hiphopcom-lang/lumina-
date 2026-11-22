@@ -10,7 +10,7 @@ import {
 import { useMemo, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { PostCategory } from '../types';
-import { isVideoAsset } from '../utils/media';
+import { isVideoAsset, resolvePlayableMediaUrl } from '../utils/media';
 import { formatCompactCount } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -221,7 +221,7 @@ export function ExploreView() {
               >
                 {isVideoAsset(post.media[0]) ? (
                   <video
-                    src={post.media[0]?.url}
+                    src={resolvePlayableMediaUrl(post.media[0]?.url)}
                     muted
                     playsInline
                     preload="metadata"

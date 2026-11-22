@@ -7,6 +7,7 @@ import {
   Pause,
   Play,
   Send,
+  Trash2,
   Volume2,
   VolumeX,
   X,
@@ -14,7 +15,11 @@ import {
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { Post } from '../types';
-import { isVideoAsset } from '../utils/media';
+import {
+  diagnoseVideoPlaybackError,
+  isVideoAsset,
+  resolvePlayableMediaUrl,
+} from '../utils/media';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -28,6 +33,7 @@ function ReelVideoFrame({
   paused,
   filterCss,
   onFallbackMute,
+  onDeleteBroken,
 }: {
   src: string;
   muted: boolean;
@@ -35,16 +41,20 @@ function ReelVideoFrame({
   paused: boolean;
   filterCss?: string;
   onFallbackMute: () => void;
+  onDeleteBroken?: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const resolvedSrc = resolvePlayableMediaUrl(src);
   const [progress, setProgress] = useState(0);
   const [hasError, setHasError] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string>('');
   const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
     setHasError(false);
+    setErrorMessage('');
     setProgress(0);
-  }, [src]);
+  }, [resolvedSrc]);
 
   useEffect(() => {
     const el = videoRef.current;
@@ -72,28 +82,45 @@ function ReelVideoFrame({
         }
       });
     }
-  }, [active, paused, src, hasError, retryKey, onFallbackMute]);
+  }, [active, paused, resolvedSrc, hasError, retryKey, onFallbackMute]);
 
   if (hasError) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center bg-zinc-950 px-6 text-center text-white">
         <p className="text-sm font-semibold">Não foi possível reproduzir este vídeo</p>
         <p className="mt-1.5 text-xs text-zinc-400">
-          {src.startsWith('blob:')
-            ? 'Este vídeo antigo expirou porque foi salvo apenas na sessão local.'
-            : 'O codec do vídeo não é compatível com este navegador ou a mídia falhou ao carregar.'}
+          {errorMessage ||
+            (resolvedSrc.startsWith('blob:')
+              ? 'Este vídeo antigo expirou porque foi salvo apenas na sessão local.'
+              : 'O codec do vídeo não é compatível com este navegador ou a mídia falhou ao carregar.')}
         </p>
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            setHasError(false);
-            setRetryKey((k) => k + 1);
-          }}
-          className="mt-4 rounded-xl bg-white/15 px-4 py-2 text-xs font-semibold text-white hover:bg-white/25"
-        >
-          Tentar novamente
-        </button>
+        <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setHasError(false);
+              setErrorMessage('');
+              setRetryKey((k) => k + 1);
+            }}
+            className="rounded-xl bg-white/15 px-4 py-2 text-xs font-semibold text-white hover:bg-white/25"
+          >
+            Tentar novamente
+          </button>
+          {onDeleteBroken && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDeleteBroken();
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600/85 px-4 py-2 text-xs font-semibold text-white hover:bg-rose-600"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              <span>Excluir Reel</span>
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -101,15 +128,20 @@ function ReelVideoFrame({
   return (
     <>
       <video
-        key={`${src}_${retryKey}`}
+        key={`${resolvedSrc}_${retryKey}`}
         ref={videoRef}
-        src={src}
+        src={resolvedSrc}
         autoPlay={active}
         loop
         muted={muted}
         playsInline
         preload="auto"
-        onError={() => setHasError(true)}
+        onError={() => {
+          setHasError(true);
+          diagnoseVideoPlaybackError(resolvedSrc)
+            .then((msg) => setErrorMessage(msg))
+            .catch(() => {});
+        }}
         onTimeUpdate={(e) => {
           const v = e.currentTarget;
           if (v.duration > 0) {
@@ -436,6 +468,7 @@ export function ReelsView() {
     toggleLikePost,
     toggleSavePost,
     toggleFollow,
+    deletePost,
     setSharePostId,
     openProfile,
   } = useSocial();
@@ -559,6 +592,7 @@ export function ReelsView() {
                       paused={isManuallyPaused}
                       filterCss={reel.media[0].filterCss}
                       onFallbackMute={() => setMuted(true)}
+                      onDeleteBroken={isOwn ? () => deletePost(reel.id) : undefined}
                     />
                   ) : (
                     <MediaImage

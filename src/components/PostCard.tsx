@@ -16,7 +16,11 @@ import { AnimatePresence, motion } from 'motion/react';
 import React, { useEffect, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { Post } from '../types';
-import { isVideoAsset } from '../utils/media';
+import {
+  diagnoseVideoPlaybackError,
+  isVideoAsset,
+  resolvePlayableMediaUrl,
+} from '../utils/media';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -31,13 +35,16 @@ function AutoPlayFeedVideo({
   filterCss?: string;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const resolvedSrc = resolvePlayableMediaUrl(src);
   const [muted, setMuted] = useState(true);
   const [hasError, setHasError] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
   const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
     setHasError(false);
-  }, [src]);
+    setErrorMessage('');
+  }, [resolvedSrc]);
 
   useEffect(() => {
     const el = videoRef.current;
@@ -64,22 +71,24 @@ function AutoPlayFeedVideo({
 
     observer.observe(el);
     return () => observer.disconnect();
-  }, [src, hasError, retryKey]);
+  }, [resolvedSrc, hasError, retryKey]);
 
   if (hasError) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center bg-zinc-950 px-6 text-center text-white">
         <p className="text-sm font-semibold">Não foi possível reproduzir este vídeo</p>
         <p className="mt-1 text-xs text-zinc-400">
-          {src?.startsWith('blob:')
-            ? 'Vídeo salvo apenas na sessão local anterior.'
-            : 'Codec incompatível com este navegador ou falha de carregamento.'}
+          {errorMessage ||
+            (resolvedSrc.startsWith('blob:')
+              ? 'Vídeo salvo apenas na sessão local anterior.'
+              : 'Codec incompatível com este navegador ou falha de carregamento.')}
         </p>
         <button
           type="button"
           onClick={(e) => {
             e.stopPropagation();
             setHasError(false);
+            setErrorMessage('');
             setRetryKey((k) => k + 1);
           }}
           className="mt-3 rounded-xl bg-white/15 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-white/25"
@@ -93,14 +102,19 @@ function AutoPlayFeedVideo({
   return (
     <div className="relative h-full w-full">
       <video
-        key={`${src || ''}_${retryKey}`}
+        key={`${resolvedSrc}_${retryKey}`}
         ref={videoRef}
-        src={src}
+        src={resolvedSrc}
         muted={muted}
         playsInline
         loop
         preload="auto"
-        onError={() => setHasError(true)}
+        onError={() => {
+          setHasError(true);
+          diagnoseVideoPlaybackError(resolvedSrc)
+            .then((msg) => setErrorMessage(msg))
+            .catch(() => {});
+        }}
         onClick={() => {
           const el = videoRef.current;
           if (!el) return;

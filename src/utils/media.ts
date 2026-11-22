@@ -8,6 +8,57 @@ export function isVideoAsset(media?: Partial<MediaAsset> | null): boolean {
   return false;
 }
 
+/**
+ * Rewrites /api/media/... URLs saved on another preview origin (e.g. ais-dev vs ais-pre)
+ * to a relative path on the active origin so auth proxies do not block <video> playback.
+ */
+export function resolvePlayableMediaUrl(rawUrl?: string): string {
+  const url = (rawUrl || '').trim();
+  if (!url) return '';
+  if (url.startsWith('/') || url.startsWith('data:') || url.startsWith('blob:')) {
+    return url;
+  }
+  try {
+    const parsed = new URL(url);
+    if (
+      parsed.pathname.startsWith('/api/media/') &&
+      typeof window !== 'undefined' &&
+      parsed.origin !== window.location.origin
+    ) {
+      return `${parsed.pathname}${parsed.search}`;
+    }
+  } catch {
+    // Keep original URL
+  }
+  return url;
+}
+
+export async function diagnoseVideoPlaybackError(
+  playableSrc: string
+): Promise<string> {
+  if (!playableSrc) return 'Endereço do vídeo não encontrado.';
+  if (playableSrc.startsWith('blob:')) {
+    return 'Este vídeo expirou porque foi salvo apenas na sessão local anterior. Publique novamente para enviá-lo à nuvem.';
+  }
+  if (playableSrc.startsWith('/api/media/')) {
+    try {
+      const res = await fetch(playableSrc, {
+        method: 'GET',
+        headers: { Range: 'bytes=0-1' },
+      });
+      if (res.status === 404) {
+        return 'Este vídeo antigo não existe mais no armazenamento temporário do servidor. Publique o Reel novamente ou ative a Amazon S3 no Painel ADM.';
+      }
+      if (res.status === 503) {
+        return 'As credenciais da Amazon AWS S3 não estão configuradas no servidor para reproduzir este vídeo.';
+      }
+    } catch {
+      return 'Não foi possível conectar ao servidor para carregar este vídeo.';
+    }
+  }
+  return 'O codec do vídeo não é compatível com este navegador ou o arquivo não pôde ser carregado.';
+}
+
 export interface MediaStatusInfo {
   uploadAvailable: boolean;
   storageProvider: 'aws-s3' | 'server-disk';

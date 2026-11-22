@@ -25,7 +25,11 @@ import {
 import React, { useMemo, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { ASSETS, STUDIO_SAMPLE_IMAGES } from '../data/seed';
-import { compressImageFile, isVideoAsset } from '../utils/media';
+import {
+  compressImageFile,
+  isVideoAsset,
+  resolvePlayableMediaUrl,
+} from '../utils/media';
 import { formatCompactCount } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -540,7 +544,7 @@ export function ProfileView() {
               >
                 {isVideoAsset(post.media[0]) ? (
                   <video
-                    src={post.media[0]?.url}
+                    src={resolvePlayableMediaUrl(post.media[0]?.url)}
                     muted
                     playsInline
                     preload="metadata"

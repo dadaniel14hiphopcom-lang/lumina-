@@ -27,6 +27,7 @@ import {
   compressImageFile,
   fetchMediaDeliveryStatus,
   MediaStatusInfo,
+  resolvePlayableMediaUrl,
   uploadMediaToCloud,
 } from '../utils/media';
 import { MediaImage } from './MediaImage';
@@ -249,6 +250,7 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     const uploadedUrl = await uploadVideoBlobToCloud(file, file.name);
     if (!uploadedUrl) return;
 
+    setPreviewVideoError(false);
     setMediaItems([
       {
         url: uploadedUrl,
@@ -526,8 +528,9 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
             {step === 'edit' && (
               <button
                 type="button"
+                disabled={isActiveVideo && previewVideoError}
                 onClick={() => setStep('details')}
-                className="rounded-lg bg-sky-600 px-3.5 py-1.5 text-sm font-semibold text-white hover:bg-sky-700"
+                className="rounded-lg bg-sky-600 px-3.5 py-1.5 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
               >
                 Avançar
               </button>
@@ -867,7 +870,7 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                     </div>
                   ) : (
                     <video
-                      src={activeItem.url}
+                      src={resolvePlayableMediaUrl(activeItem.url)}
                       controls
                       playsInline
                       loop
@@ -986,7 +989,7 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                             >
                               {isActiveVideo ? (
                                 <video
-                                  src={activeItem.url}
+                                  src={resolvePlayableMediaUrl(activeItem.url)}
                                   muted
                                   playsInline
                                   preload="metadata"

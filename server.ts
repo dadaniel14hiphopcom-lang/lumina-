@@ -20,6 +20,7 @@ import {
   resolveReelPlaybackUrl,
   uploadReelToS3,
 } from './server/s3Service.ts';
+import { normalizeVideoFileForWeb } from './server/videoTranscoder.ts';
 
 dotenv.config();
 
@@ -1133,28 +1134,60 @@ async function startServer() {
     }
 
     const state = readAdminState();
+    const uploadsDir = getWritableUploadsDir();
     const awsCreds = getAwsCredentialsFromEnv();
     const awsTarget = resolveAwsMediaTarget(state);
 
+    let finalPath = session.tempPartPath;
+    let finalContentType = session.contentType;
+    let finalObjectKey = session.objectKey;
+    let finalFileName = session.fileName;
+    let cleanupNormalized = () => {};
+
+    if (session.kind === 'video') {
+      const origExt = path.extname(session.fileName).replace('.', '') || 'mp4';
+      const normalized = await normalizeVideoFileForWeb({
+        inputPath: session.tempPartPath,
+        originalExt: origExt,
+        originalContentType: session.contentType,
+        workDir: uploadsDir,
+      });
+      finalPath = normalized.filePath;
+      finalContentType = normalized.contentType;
+      cleanupNormalized = normalized.cleanupTempFiles;
+      if (normalized.ext !== origExt) {
+        finalObjectKey = buildReelObjectKey(normalized.ext, 'video');
+        finalFileName = path.posix.basename(finalObjectKey);
+      }
+      if (normalized.transcoded) {
+        cleanupPart();
+      }
+    }
+
+    const finalSizeBytes = fs.existsSync(finalPath)
+      ? fs.statSync(finalPath).size
+      : session.receivedBytes;
+
     if (awsCreds && state.aws.s3Enabled) {
       try {
-        const bodyBuffer = fs.readFileSync(session.tempPartPath);
+        const bodyBuffer = fs.readFileSync(finalPath);
         const uploadResult = await uploadReelToS3({
-          key: session.objectKey,
+          key: finalObjectKey,
           body: bodyBuffer,
-          contentType: session.contentType,
+          contentType: finalContentType,
           config: awsTarget,
         });
         if (uploadResult.ok) {
           cleanupPart();
-          const deliveryUrl = resolveReelPlaybackUrl(session.objectKey, awsTarget);
+          cleanupNormalized();
+          const deliveryUrl = resolveReelPlaybackUrl(finalObjectKey, awsTarget);
           res.json({
             ok: true,
             url: deliveryUrl,
             storageProvider: awsTarget.hasRealCloudFront ? 'aws-cloudfront' : 'aws-s3',
-            key: session.objectKey,
-            sizeBytes: session.receivedBytes,
-            contentType: session.contentType,
+            key: finalObjectKey,
+            sizeBytes: finalSizeBytes,
+            contentType: finalContentType,
           });
           return;
         }
@@ -1165,24 +1198,26 @@ async function startServer() {
     }
 
     try {
-      const uploadsDir = getWritableUploadsDir();
-      const safePath = path.resolve(uploadsDir, session.fileName);
+      const safePath = path.resolve(uploadsDir, finalFileName);
       if (!safePath.startsWith(uploadsDir + path.sep)) {
         cleanupPart();
+        cleanupNormalized();
         res.status(400).json({ error: 'Caminho de arquivo inválido.' });
         return;
       }
-      fs.renameSync(session.tempPartPath, safePath);
+      fs.renameSync(finalPath, safePath);
+      cleanupPart();
       res.json({
         ok: true,
-        url: `/api/media/file/${session.fileName}`,
+        url: `/api/media/file/${finalFileName}`,
         storageProvider: 'server-disk',
-        key: session.fileName,
-        sizeBytes: session.receivedBytes,
-        contentType: session.contentType,
+        key: finalFileName,
+        sizeBytes: finalSizeBytes,
+        contentType: finalContentType,
       });
     } catch {
       cleanupPart();
+      cleanupNormalized();
       res.status(500).json({ error: 'Não foi possível finalizar o vídeo no servidor.' });
     }
   });
@@ -1227,7 +1262,44 @@ async function startServer() {
         return;
       }
 
-      const objectKey = buildReelObjectKey(spec.ext, spec.kind);
+      const uploadsDir = getWritableUploadsDir();
+      let finalBuffer = bodyBuffer;
+      let finalContentType = rawType;
+      let finalExt = spec.ext;
+
+      if (spec.kind === 'video') {
+        const tempRawPath = path.resolve(
+          uploadsDir,
+          `raw_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${spec.ext}`
+        );
+        if (tempRawPath.startsWith(uploadsDir + path.sep)) {
+          let cleanupNormalized = () => {};
+          try {
+            fs.writeFileSync(tempRawPath, bodyBuffer);
+            const normalized = await normalizeVideoFileForWeb({
+              inputPath: tempRawPath,
+              originalExt: spec.ext,
+              originalContentType: rawType,
+              workDir: uploadsDir,
+            });
+            cleanupNormalized = normalized.cleanupTempFiles;
+            if (normalized.transcoded && fs.existsSync(normalized.filePath)) {
+              finalBuffer = fs.readFileSync(normalized.filePath);
+              finalContentType = normalized.contentType;
+              finalExt = normalized.ext;
+            }
+          } finally {
+            cleanupNormalized();
+            try {
+              if (fs.existsSync(tempRawPath)) fs.unlinkSync(tempRawPath);
+            } catch {
+              // Ignore temp cleanup
+            }
+          }
+        }
+      }
+
+      const objectKey = buildReelObjectKey(finalExt, spec.kind);
       const fileName = path.posix.basename(objectKey);
       const awsCreds = getAwsCredentialsFromEnv();
       const awsTarget = resolveAwsMediaTarget(state);
@@ -1236,8 +1308,8 @@ async function startServer() {
         try {
           const uploadResult = await uploadReelToS3({
             key: objectKey,
-            body: bodyBuffer,
-            contentType: rawType,
+            body: finalBuffer,
+            contentType: finalContentType,
             config: awsTarget,
           });
           if (uploadResult.ok) {
@@ -1247,8 +1319,8 @@ async function startServer() {
               url: deliveryUrl,
               storageProvider: awsTarget.hasRealCloudFront ? 'aws-cloudfront' : 'aws-s3',
               key: objectKey,
-              sizeBytes: bodyBuffer.length,
-              contentType: rawType,
+              sizeBytes: finalBuffer.length,
+              contentType: finalContentType,
             });
             return;
           }
@@ -1260,20 +1332,19 @@ async function startServer() {
 
       // Server local disk stream fallback with full HTTP 206 byte-range seeking
       try {
-        const uploadsDir = getWritableUploadsDir();
         const safePath = path.resolve(uploadsDir, fileName);
         if (!safePath.startsWith(uploadsDir + path.sep)) {
           res.status(400).json({ error: 'Caminho de arquivo inválido.' });
           return;
         }
-        fs.writeFileSync(safePath, bodyBuffer);
+        fs.writeFileSync(safePath, finalBuffer);
         res.json({
           ok: true,
           url: `/api/media/file/${fileName}`,
           storageProvider: 'server-disk',
           key: fileName,
-          sizeBytes: bodyBuffer.length,
-          contentType: rawType,
+          sizeBytes: finalBuffer.length,
+          contentType: finalContentType,
         });
       } catch {
         res.status(500).json({ error: 'Não foi possível salvar a mídia no servidor.' });

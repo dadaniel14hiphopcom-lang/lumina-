@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import React, { useEffect, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
-import { isVideoAsset } from '../utils/media';
+import { isVideoAsset, resolvePlayableMediaUrl } from '../utils/media';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -105,7 +105,7 @@ export function PostDetailModal() {
         <div className="relative flex h-[34vh] max-h-[260px] w-full shrink-0 items-center justify-center bg-black md:h-full md:max-h-none md:flex-1">
           {isVideoAsset(post.media[slide]) ? (
             <video
-              src={post.media[slide]?.url}
+              src={resolvePlayableMediaUrl(post.media[slide]?.url)}
               controls
               autoPlay
               playsInline
