@@ -43,7 +43,7 @@ export const SEED_USERS: UserProfile[] = [
     website: 'lumina.social/daniel',
     verified: true,
     isOnline: true,
-    isDemoSeed: false,
+    isDemoSeed: true,
     restricted: false,
     boosted: false,
     followers: ['user_clara', 'user_lucas', 'user_marina'],

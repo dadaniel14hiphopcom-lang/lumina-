@@ -9,9 +9,11 @@ import {
   MoreHorizontal,
   Send,
   Trash2,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { Post } from '../types';
 import { isVideoAsset } from '../utils/media';
@@ -20,6 +22,76 @@ import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
 import { ProfileHoverCard } from './ProfileHoverCard';
 import { RichCaption } from './RichCaption';
+
+function AutoPlayFeedVideo({
+  src,
+  filterCss,
+}: {
+  src?: string;
+  filterCss?: string;
+}) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [muted, setMuted] = useState(true);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (!entry) return;
+        if (entry.isIntersecting && entry.intersectionRatio >= 0.55) {
+          el.play().catch(() => {
+            if (!el.muted) {
+              el.muted = true;
+              setMuted(true);
+              el.play().catch(() => {});
+            }
+          });
+        } else {
+          el.pause();
+        }
+      },
+      { threshold: [0, 0.55, 0.85] }
+    );
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [src]);
+
+  return (
+    <div className="relative h-full w-full">
+      <video
+        ref={videoRef}
+        src={src}
+        muted={muted}
+        playsInline
+        loop
+        preload="auto"
+        onClick={() => {
+          const el = videoRef.current;
+          if (!el) return;
+          if (el.paused) el.play().catch(() => {});
+          else el.pause();
+        }}
+        className="h-full w-full cursor-pointer object-cover"
+        style={{ filter: filterCss || 'none' }}
+      />
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setMuted((m) => !m);
+        }}
+        aria-label={muted ? 'Ativar áudio do vídeo' : 'Silenciar vídeo'}
+        className="absolute right-3 bottom-3 flex h-8 w-8 items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-xs hover:bg-black/75"
+      >
+        {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+      </button>
+    </div>
+  );
+}
 
 interface PostCardProps {
   post: Post;
@@ -226,13 +298,9 @@ export function PostCard({ post }: PostCardProps) {
         className={`relative w-full select-none overflow-hidden bg-zinc-100 dark:bg-zinc-900 ${aspectClass}`}
       >
         {isVideoAsset(post.media[slide]) ? (
-          <video
+          <AutoPlayFeedVideo
             src={post.media[slide]?.url}
-            controls
-            playsInline
-            loop
-            className="h-full w-full object-cover"
-            style={{ filter: post.media[slide]?.filterCss || 'none' }}
+            filterCss={post.media[slide]?.filterCss}
           />
         ) : (
           <MediaImage

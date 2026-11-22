@@ -45,8 +45,11 @@ export function RightSidebar() {
   const [loginLoading, setLoginLoading] = useState(false);
 
   const registeredAccounts = useMemo(
-    () => users.filter((u) => !u.isDemoSeed),
-    [users]
+    () =>
+      users.filter(
+        (u) => !u.isDemoSeed && (hasPasswordForUser(u.id) || Boolean(u.uid))
+      ),
+    [users, hasPasswordForUser]
   );
 
   const trendingUsers = useMemo(() => {

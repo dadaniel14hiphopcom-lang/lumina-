@@ -9,7 +9,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { isVideoAsset } from '../utils/media';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
@@ -35,8 +35,10 @@ export function PostDetailModal() {
   } = useSocial();
 
   const [slide, setSlide] = useState(0);
+  const [composerOpen, setComposerOpen] = useState(false);
   const [commentText, setCommentText] = useState('');
   const [replyingTo, setReplyingTo] = useState<{ id: string; username: string } | null>(null);
+  const commentInputRef = useRef<HTMLInputElement | null>(null);
 
   const post = posts.find((p) => p.id === selectedPostId);
   const author = post ? getUserById(post.authorId) : undefined;
@@ -45,7 +47,14 @@ export function PostDetailModal() {
     setSlide(0);
     setCommentText('');
     setReplyingTo(null);
+    setComposerOpen(false);
   }, [selectedPostId]);
+
+  useEffect(() => {
+    if (composerOpen) {
+      window.setTimeout(() => commentInputRef.current?.focus(), 40);
+    }
+  }, [composerOpen, replyingTo]);
 
   useEffect(() => {
     if (!selectedPostId) return;
@@ -68,6 +77,7 @@ export function PostDetailModal() {
     addComment(post.id, commentText, replyingTo?.id);
     setCommentText('');
     setReplyingTo(null);
+    setComposerOpen(false);
   };
 
   return (
@@ -92,7 +102,7 @@ export function PostDetailModal() {
         className="flex h-full w-full max-w-5xl flex-col overflow-hidden bg-white dark:bg-zinc-950 md:h-[85vh] md:max-h-[760px] md:flex-row md:rounded-2xl md:border md:border-zinc-200 dark:md:border-zinc-800"
       >
         {/* Left: Media Viewer */}
-        <div className="relative flex aspect-square w-full shrink-0 items-center justify-center bg-black md:aspect-auto md:h-full md:flex-1">
+        <div className="relative flex h-[34vh] max-h-[260px] w-full shrink-0 items-center justify-center bg-black md:h-full md:max-h-none md:flex-1">
           {isVideoAsset(post.media[slide]) ? (
             <video
               src={post.media[slide]?.url}
@@ -186,7 +196,7 @@ export function PostDetailModal() {
           </div>
 
           {/* Scrollable Comments */}
-          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-4 py-4">
             {/* Caption as top entry */}
             {post.caption && (
               <div className="flex gap-3">
@@ -265,9 +275,10 @@ export function PostDetailModal() {
                           )}
                           <button
                             type="button"
-                            onClick={() =>
-                              setReplyingTo({ id: comment.id, username: cUser.username })
-                            }
+                            onClick={() => {
+                              setReplyingTo({ id: comment.id, username: cUser.username });
+                              setComposerOpen(true);
+                            }}
                             className="font-semibold hover:text-zinc-800 dark:hover:text-zinc-200"
                           >
                             Responder
@@ -317,8 +328,8 @@ export function PostDetailModal() {
             )}
           </div>
 
-          {/* Actions & Composer */}
-          <div className="border-t border-zinc-200 px-4 py-3 dark:border-zinc-800">
+          {/* Actions & Collapsible Composer */}
+          <div className="shrink-0 border-t border-zinc-200 px-4 py-3 dark:border-zinc-800">
             <div className="flex items-center justify-between pb-2">
               <div className="flex items-center gap-2">
                 <button
@@ -335,7 +346,10 @@ export function PostDetailModal() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setReplyingTo(null)}
+                  onClick={() => {
+                    setReplyingTo(null);
+                    setComposerOpen((o) => !o);
+                  }}
                   aria-label="Comentar"
                   className="flex h-9 w-9 items-center justify-center rounded-full text-zinc-900 hover:bg-zinc-100 dark:text-zinc-100 dark:hover:bg-zinc-900"
                 >
@@ -368,39 +382,66 @@ export function PostDetailModal() {
               {formatRelativeTime(post.createdAt)}
             </p>
 
-            {replyingTo && (
-              <div className="mb-2 flex items-center justify-between rounded-lg bg-zinc-100 px-3 py-1.5 text-xs text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
-                <span>Respondendo a @{replyingTo.username}</span>
-                <button
-                  type="button"
-                  onClick={() => setReplyingTo(null)}
-                  className="font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-white"
-                >
-                  Cancelar
-                </button>
-              </div>
-            )}
+            {composerOpen ? (
+              <div className="space-y-2">
+                {replyingTo && (
+                  <div className="flex items-center justify-between rounded-lg bg-zinc-100 px-3 py-1.5 text-xs text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+                    <span>Respondendo a @{replyingTo.username}</span>
+                    <button
+                      type="button"
+                      onClick={() => setReplyingTo(null)}
+                      className="font-semibold text-zinc-500 hover:text-zinc-900 dark:hover:text-white"
+                    >
+                      Cancelar
+                    </button>
+                  </div>
+                )}
 
-            <form onSubmit={handleSubmit} className="flex items-center gap-2">
-              <input
-                type="text"
-                value={commentText}
-                onChange={(e) => setCommentText(e.target.value)}
-                placeholder={
-                  replyingTo
-                    ? `Responder para @${replyingTo.username}...`
-                    : 'Adicione um comentário...'
-                }
-                className="h-10 flex-1 rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
-              />
+                <form onSubmit={handleSubmit} className="flex items-center gap-2">
+                  <input
+                    ref={commentInputRef}
+                    type="text"
+                    value={commentText}
+                    onChange={(e) => setCommentText(e.target.value)}
+                    placeholder={
+                      replyingTo
+                        ? `Responder para @${replyingTo.username}...`
+                        : 'Adicione um comentário...'
+                    }
+                    className="h-10 flex-1 rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
+                  />
+                  <button
+                    type="submit"
+                    disabled={!commentText.trim()}
+                    className="h-10 rounded-lg bg-zinc-900 px-3.5 text-sm font-semibold text-white transition-colors hover:bg-zinc-800 disabled:opacity-40 dark:bg-white dark:text-zinc-950"
+                  >
+                    Enviar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setComposerOpen(false);
+                      setReplyingTo(null);
+                    }}
+                    aria-label="Ocultar caixa de comentário"
+                    className="flex h-10 w-9 items-center justify-center rounded-lg border border-zinc-200 text-zinc-500 hover:text-zinc-900 dark:border-zinc-800 dark:hover:text-white"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </form>
+              </div>
+            ) : (
               <button
-                type="submit"
-                disabled={!commentText.trim()}
-                className="h-10 rounded-lg bg-zinc-900 px-4 text-sm font-semibold text-white transition-colors hover:bg-zinc-800 disabled:opacity-40 dark:bg-white dark:text-zinc-950"
+                type="button"
+                onClick={() => setComposerOpen(true)}
+                className="flex h-9 w-full items-center justify-between rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-xs font-medium text-zinc-500 hover:border-zinc-300 hover:text-zinc-800 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200"
               >
-                Enviar
+                <span>Escrever um comentário...</span>
+                <span className="font-semibold text-sky-600 dark:text-sky-400">
+                  Comentar
+                </span>
               </button>
-            </form>
+            )}
           </div>
         </div>
       </div>

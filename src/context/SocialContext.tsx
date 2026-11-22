@@ -222,23 +222,26 @@ function loadInitialState(): PersistedState {
     if (raw) {
       const parsed = JSON.parse(raw) as PersistedState;
       if (parsed && Array.isArray(parsed.users) && Array.isArray(parsed.posts)) {
+        const mappedUsers = parsed.users.map((u) => {
+          const seedMatch = SEED_USERS.find((s) => s.id === u.id);
+          return {
+            ...u,
+            isOnline: u.isOnline !== undefined ? u.isOnline : seedMatch?.isOnline ?? true,
+            coverUrl: u.coverUrl || seedMatch?.coverUrl,
+            isDemoSeed: seedMatch
+              ? seedMatch.isDemoSeed
+              : u.isDemoSeed !== undefined
+              ? u.isDemoSeed
+              : false,
+          };
+        });
+        const current = mappedUsers.find((u) => u.id === parsed.currentUserId);
+        const canRestoreAuth =
+          parsed.isAuthenticated === true && Boolean(current && !current.isDemoSeed);
         return {
           ...parsed,
-          isAuthenticated: parsed.isAuthenticated !== false,
-          users: parsed.users.map((u) => {
-            const seedMatch = SEED_USERS.find((s) => s.id === u.id);
-            return {
-              ...u,
-              isOnline: u.isOnline !== undefined ? u.isOnline : seedMatch?.isOnline ?? true,
-              coverUrl: u.coverUrl || seedMatch?.coverUrl,
-              isDemoSeed:
-                u.isDemoSeed !== undefined
-                  ? u.isDemoSeed
-                  : seedMatch
-                  ? seedMatch.isDemoSeed
-                  : false,
-            };
-          }),
+          isAuthenticated: canRestoreAuth,
+          users: mappedUsers,
         };
       }
     }
@@ -247,7 +250,7 @@ function loadInitialState(): PersistedState {
   }
   return {
     currentUserId: 'user_daniel',
-    isAuthenticated: true,
+    isAuthenticated: false,
     users: SEED_USERS,
     posts: SEED_POSTS,
     stories: SEED_STORIES,
@@ -1038,8 +1041,13 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
   const switchUser = (userId: string) => {
     const target = state.users.find((item) => item.id === userId);
-    if (!target || target.isDemoSeed) {
+    if (
+      !target ||
+      target.isDemoSeed ||
+      (!hasPasswordForUser(target.id) && !target.uid)
+    ) {
       showToast('Apenas contas cadastradas podem entrar');
+      openAuthModal('login');
       return;
     }
     setState((prev) => ({ ...prev, currentUserId: userId, isAuthenticated: true }));
