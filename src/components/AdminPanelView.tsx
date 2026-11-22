@@ -31,8 +31,13 @@ import {
 } from 'lucide-react';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_VIDEO_RULES, encodeInviteMeta, useSocial } from '../context/SocialContext';
-import { ADMIN_EMAIL, isExclusiveAdminUser } from '../lib/firebase';
+import { ADMIN_EMAIL, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
 import { InviteRecord, VideoRulesConfig } from '../types';
+import {
+  claimOrUpdateStaticAdminPasscode,
+  hasStaticAdminPasscode,
+  verifyStaticAdminPasscode,
+} from '../utils/staticAdminAuth';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { buildWordPressKitEntries, createBrowserZipBlob } from '../utils/zipClient';
 import { AvatarRing } from './AvatarRing';
@@ -251,6 +256,7 @@ export function AdminPanelView() {
     setAdminMemoryToken,
     activateAdminProfileSession,
     loginWithGoogle,
+    loginWithGoogleRedirect,
   } = useSocial();
 
   // Auth held strictly in React memory (never localStorage)
@@ -340,11 +346,11 @@ export function AdminPanelView() {
           });
         }
       } catch {
-        // Static / SPA hosting fallback: exclusive Google/Firebase Admin authentication only
+        // Static / SPA hosting fallback: support both Google Admin & PBKDF2 local ADM passcode
         if (!cancelled) {
           setAuthStatus({
             loading: false,
-            claimed: false,
+            claimed: hasStaticAdminPasscode(),
             envConfigured: false,
             serverAvailable: false,
           });
@@ -501,15 +507,23 @@ export function AdminPanelView() {
     }
   };
 
+  const handleExclusiveGoogleRedirectLogin = async () => {
+    setAuthError(null);
+    setManualLock(false);
+    setFirebaseAdminLoading(true);
+    try {
+      const res = await loginWithGoogleRedirect('admin');
+      if (!res.ok) {
+        setAuthError(res.error || 'Não foi possível redirecionar para o login Google.');
+      }
+    } finally {
+      setFirebaseAdminLoading(false);
+    }
+  };
+
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
-    if (!authStatus.serverAvailable) {
-      setAuthError(
-        `Servidor /api indisponível nesta hospedagem estática. Use o login Google (${ADMIN_EMAIL}).`
-      );
-      return;
-    }
     const isFirstRunClaim = !authStatus.claimed && !authStatus.envConfigured;
     if (isFirstRunClaim) {
       if (passcodeInput.trim().length < 6) {
@@ -522,6 +536,43 @@ export function AdminPanelView() {
       }
     } else if (!passcodeInput.trim()) {
       setAuthError('Informe a senha administrativa para entrar.');
+      return;
+    }
+
+    if (!authStatus.serverAvailable) {
+      setAuthSubmitting(true);
+      try {
+        if (isFirstRunClaim) {
+          const claimRes = await claimOrUpdateStaticAdminPasscode(passcodeInput.trim());
+          if (!claimRes.ok) {
+            setAuthError(claimRes.error || 'Não foi possível salvar a senha administrativa.');
+            return;
+          }
+        } else {
+          const valid = await verifyStaticAdminPasscode(passcodeInput.trim());
+          if (!valid) {
+            setAuthError('Senha administrativa incorreta neste navegador.');
+            return;
+          }
+        }
+        const staticToken = 'static_admin_local';
+        setManualLock(false);
+        setAdminToken(staticToken);
+        setAdminMemoryToken(staticToken);
+        activateAdminProfileSession(staticToken);
+        setPasscodeInput('');
+        setConfirmInput('');
+        setShowPasscode(false);
+        setAuthStatus((prev) => ({ ...prev, claimed: true }));
+        loadLocalOverview();
+        showToast(
+          isFirstRunClaim
+            ? `Senha de ADM salva nesta hospedagem para ${ADMIN_EMAIL}! Painel desbloqueado.`
+            : `Bem-vindo, administrador (${ADMIN_EMAIL}).`
+        );
+      } finally {
+        setAuthSubmitting(false);
+      }
       return;
     }
 
@@ -579,6 +630,16 @@ export function AdminPanelView() {
     }
     setUpdatingAdminPasscode(true);
     try {
+      if (!authStatus.serverAvailable) {
+        const res = await claimOrUpdateStaticAdminPasscode(cleanNext);
+        if (!res.ok) {
+          showToast(res.error || 'Não foi possível atualizar a senha de ADM');
+          return;
+        }
+        setNewAdminPasscode('');
+        showToast(`Nova senha de ADM salva nesta hospedagem para ${ADMIN_EMAIL}`);
+        return;
+      }
       const res = await authFetch('/api/admin/auth/change-passcode', {
         method: 'POST',
         body: JSON.stringify({ newPasscode: cleanNext }),
@@ -1244,116 +1305,129 @@ ${itemsXml}
                 </span>
               </button>
 
-              {authStatus.serverAvailable ? (
-                <div className="border-t border-zinc-200 pt-4 dark:border-zinc-800">
-                  <div className="mb-3 flex items-center justify-between gap-2">
-                    <div>
-                      <p className="text-xs font-bold text-zinc-900 dark:text-zinc-100">
-                        {!authStatus.claimed && !authStatus.envConfigured
-                          ? 'Definir senha de ADM para esta conta'
-                          : 'Entrar com e-mail e senha de ADM'}
-                      </p>
-                      <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                        Vinculada exclusivamente a {ADMIN_EMAIL}
-                      </p>
-                    </div>
-                    {!authStatus.claimed && !authStatus.envConfigured && (
+              {typeof window !== 'undefined' && window.self === window.top && !isAdminGoogleReady && (
+                <button
+                  type="button"
+                  disabled={firebaseAdminLoading}
+                  onClick={() => void handleExclusiveGoogleRedirectLogin()}
+                  className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <Globe className="h-3.5 w-3.5 text-sky-500" />
+                  <span>Usar redirecionamento Google (se o pop-up falhar)</span>
+                </button>
+              )}
+
+              <div className="border-t border-zinc-200 pt-4 dark:border-zinc-800">
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-bold text-zinc-900 dark:text-zinc-100">
+                      {!authStatus.claimed && !authStatus.envConfigured
+                        ? 'Definir senha de ADM para esta conta'
+                        : 'Entrar com senha de ADM'}
+                    </p>
+                    <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                      Vinculada exclusivamente a {ADMIN_EMAIL}
+                    </p>
+                  </div>
+                  {!authStatus.claimed && !authStatus.envConfigured && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const generated = generateStrongPasscode();
+                        setPasscodeInput(generated);
+                        setConfirmInput(generated);
+                        setShowPasscode(true);
+                        showToast('Senha forte gerada! Copie e clique em Salvar senha e entrar.');
+                      }}
+                      className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-zinc-950 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950 dark:hover:bg-zinc-200"
+                    >
+                      <Sparkles className="h-3.5 w-3.5" />
+                      <span>Gerar senha</span>
+                    </button>
+                  )}
+                </div>
+
+                <form onSubmit={handleAuthSubmit} className="space-y-3">
+                  <label className="block space-y-1.5">
+                    <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                      {!authStatus.claimed && !authStatus.envConfigured
+                        ? 'Nova senha de Administrador'
+                        : 'Senha de Administrador'}
+                    </span>
+                    <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                      <KeyRound className="h-4 w-4 text-zinc-400" />
+                      <input
+                        type={showPasscode ? 'text' : 'password'}
+                        value={passcodeInput}
+                        onChange={(e) => setPasscodeInput(e.target.value)}
+                        placeholder="Mínimo 6 caracteres"
+                        className="h-10 flex-1 bg-transparent font-mono text-sm text-zinc-950 focus:outline-none dark:text-white"
+                      />
                       <button
                         type="button"
-                        onClick={() => {
-                          const generated = generateStrongPasscode();
-                          setPasscodeInput(generated);
-                          setConfirmInput(generated);
-                          setShowPasscode(true);
-                          showToast('Senha forte gerada! Copie e clique em Salvar senha e entrar.');
-                        }}
-                        className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-zinc-950 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950 dark:hover:bg-zinc-200"
+                        onClick={() => setShowPasscode((v) => !v)}
+                        aria-label={showPasscode ? 'Ocultar senha' : 'Mostrar senha'}
+                        className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
                       >
-                        <Sparkles className="h-3.5 w-3.5" />
-                        <span>Gerar senha</span>
+                        {showPasscode ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                       </button>
-                    )}
-                  </div>
-
-                  <form onSubmit={handleAuthSubmit} className="space-y-3">
-                    <label className="block space-y-1.5">
-                      <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
-                        {!authStatus.claimed && !authStatus.envConfigured
-                          ? 'Nova senha de Administrador'
-                          : 'Senha de Administrador'}
-                      </span>
-                      <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
-                        <KeyRound className="h-4 w-4 text-zinc-400" />
-                        <input
-                          type={showPasscode ? 'text' : 'password'}
-                          value={passcodeInput}
-                          onChange={(e) => setPasscodeInput(e.target.value)}
-                          placeholder="Mínimo 6 caracteres"
-                          className="h-10 flex-1 bg-transparent font-mono text-sm text-zinc-950 focus:outline-none dark:text-white"
-                        />
+                      {passcodeInput && (
                         <button
                           type="button"
-                          onClick={() => setShowPasscode((v) => !v)}
-                          aria-label={showPasscode ? 'Ocultar senha' : 'Mostrar senha'}
+                          onClick={() => {
+                            void navigator.clipboard?.writeText(passcodeInput);
+                            showToast('Senha copiada para a área de transferência');
+                          }}
+                          aria-label="Copiar senha"
                           className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
                         >
-                          {showPasscode ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                          <Copy className="h-4 w-4" />
                         </button>
-                        {passcodeInput && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              void navigator.clipboard?.writeText(passcodeInput);
-                              showToast('Senha copiada para a área de transferência');
-                            }}
-                            aria-label="Copiar senha"
-                            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
-                          >
-                            <Copy className="h-4 w-4" />
-                          </button>
-                        )}
+                      )}
+                    </div>
+                  </label>
+
+                  {!authStatus.claimed && !authStatus.envConfigured && (
+                    <label className="block space-y-1.5">
+                      <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                        Confirmar senha de Administrador
+                      </span>
+                      <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                        <Lock className="h-4 w-4 text-zinc-400" />
+                        <input
+                          type={showPasscode ? 'text' : 'password'}
+                          value={confirmInput}
+                          onChange={(e) => setConfirmInput(e.target.value)}
+                          placeholder="Repita a senha"
+                          className="h-10 flex-1 bg-transparent font-mono text-sm text-zinc-950 focus:outline-none dark:text-white"
+                        />
                       </div>
                     </label>
+                  )}
 
-                    {!authStatus.claimed && !authStatus.envConfigured && (
-                      <label className="block space-y-1.5">
-                        <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
-                          Confirmar senha de Administrador
-                        </span>
-                        <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
-                          <Lock className="h-4 w-4 text-zinc-400" />
-                          <input
-                            type={showPasscode ? 'text' : 'password'}
-                            value={confirmInput}
-                            onChange={(e) => setConfirmInput(e.target.value)}
-                            placeholder="Repita a senha"
-                            className="h-10 flex-1 font-mono text-sm text-zinc-950 focus:outline-none dark:text-white"
-                          />
-                        </div>
-                      </label>
-                    )}
+                  <button
+                    type="submit"
+                    disabled={authSubmitting}
+                    className="h-10 w-full rounded-xl bg-zinc-950 text-xs font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-white dark:text-zinc-950"
+                  >
+                    {authSubmitting
+                      ? 'Validando...'
+                      : !authStatus.claimed && !authStatus.envConfigured
+                      ? 'Salvar senha de ADM e entrar'
+                      : 'Entrar com senha de ADM'}
+                  </button>
+                </form>
+              </div>
 
-                    <button
-                      type="submit"
-                      disabled={authSubmitting}
-                      className="h-10 w-full rounded-xl bg-zinc-950 text-xs font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-white dark:text-zinc-950"
-                    >
-                      {authSubmitting
-                        ? 'Validando...'
-                        : !authStatus.claimed && !authStatus.envConfigured
-                        ? 'Salvar senha de ADM e entrar'
-                        : 'Entrar com senha de ADM'}
-                    </button>
-                  </form>
-                </div>
-              ) : (
+              {!authStatus.serverAvailable && (
                 <div className="space-y-2 rounded-xl border border-amber-500/30 bg-amber-50 p-3.5 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
                   <p className="font-semibold">
-                    Hospedagem estática detectada (sem servidor /api)
+                    Hospedagem estática · Projeto Firebase: <span className="font-mono">{FIREBASE_PROJECT_ID}</span>
                   </p>
                   <p>
-                    Se o login com Google falhar neste endereço, adicione o domínio atual em{' '}
-                    <strong>Firebase Console → Authentication → Settings → Authorized domains</strong>:
+                    Para usar o login Google neste endereço, confirme que o domínio abaixo (sem https://) está adicionado no projeto{' '}
+                    <strong className="font-mono">{FIREBASE_PROJECT_ID}</strong> em{' '}
+                    <strong>Firebase Console → Authentication → Settings → Authorized domains</strong>, ou defina/use sua senha de ADM acima:
                   </p>
                   {typeof window !== 'undefined' && (
                     <div className="flex items-center justify-between gap-2 rounded-lg bg-white/80 px-2.5 py-1.5 font-mono text-[11px] text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">
@@ -2609,7 +2683,7 @@ ${itemsXml}
               </button>
             </section>
 
-            {authStatus.serverAvailable && !authStatus.envConfigured && (
+            {!authStatus.envConfigured && (
               <section className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
                 <div className="flex items-center justify-between gap-2">
                   <div>

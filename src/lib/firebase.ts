@@ -4,6 +4,8 @@ import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 export const ADMIN_EMAIL = 'dadaniel14hiphop.com@gmail.com';
+export const FIREBASE_PROJECT_ID = firebaseConfig.projectId;
+export const FIREBASE_AUTH_DOMAIN = firebaseConfig.authDomain;
 
 export function isExclusiveAdminUser(
   user?: { email?: string | null; emailVerified?: boolean } | null

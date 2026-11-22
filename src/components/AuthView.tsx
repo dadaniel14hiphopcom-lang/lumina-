@@ -23,6 +23,7 @@ export function AuthView() {
     toggleTheme,
     loginWithCredentials,
     loginWithGoogle,
+    loginWithGoogleRedirect,
     openAuthModal,
     hasPasswordForUser,
     setGuestBrowsing,
@@ -162,13 +163,33 @@ export function AuthView() {
             type="button"
             onClick={handleGoogleSignIn}
             disabled={googleLoading}
-            className="mb-4 inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-white text-sm font-semibold text-zinc-900 transition-colors hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white dark:hover:bg-zinc-800"
+            className="mb-2 inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-white text-sm font-semibold text-zinc-900 transition-colors hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white dark:hover:bg-zinc-800"
           >
             <Cloud className="h-4 w-4 text-sky-600 dark:text-sky-400" />
             <span>
               {googleLoading ? 'Conectando...' : 'Entrar com Google (Nuvem)'}
             </span>
           </button>
+
+          {error && typeof window !== 'undefined' && window.self === window.top && (
+            <button
+              type="button"
+              onClick={async () => {
+                setError(null);
+                setGoogleLoading(true);
+                try {
+                  const res = await loginWithGoogleRedirect('feed');
+                  if (!res.ok) setError(res.error || 'Falha no redirecionamento Google.');
+                } finally {
+                  setGoogleLoading(false);
+                }
+              }}
+              disabled={googleLoading}
+              className="mb-4 inline-flex h-9 w-full items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+            >
+              <span>Tentar Google por redirecionamento</span>
+            </button>
+          )}
 
           <div className="mb-4 flex items-center gap-3">
             <span className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />

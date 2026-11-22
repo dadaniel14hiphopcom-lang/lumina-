@@ -1,6 +1,20 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, type User as FirebaseUser } from 'firebase/auth';
-import { ADMIN_EMAIL, auth, googleProvider, isExclusiveAdminUser } from '../lib/firebase';
+import {
+  getRedirectResult,
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut,
+  type User as FirebaseUser,
+} from 'firebase/auth';
+import {
+  ADMIN_EMAIL,
+  auth,
+  FIREBASE_PROJECT_ID,
+  googleProvider,
+  isExclusiveAdminUser,
+} from '../lib/firebase';
+import { verifyStaticAdminPasscode } from '../utils/staticAdminAuth';
 import {
   adminUpdateProfileFlagsInCloud,
   createInviteInCloud,
@@ -302,6 +316,7 @@ interface SocialContextValue {
   setAdminMemoryToken: React.Dispatch<React.SetStateAction<string | null>>;
   activateAdminProfileSession: (token: string) => void;
   loginWithGoogle: () => Promise<{ ok: boolean; error?: string }>;
+  loginWithGoogleRedirect: (target?: 'feed' | 'admin') => Promise<{ ok: boolean; error?: string }>;
   logout: () => void;
   hasPasswordForCurrentUser: boolean;
   hasPasswordForUser: (userId: string) => boolean;
@@ -609,9 +624,135 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     return Array.from(map.values());
   };
 
+  const isAuthenticatedRef = useRef(Boolean(state.isAuthenticated));
+  isAuthenticatedRef.current = Boolean(state.isAuthenticated);
+  const usersRef = useRef(state.users);
+  usersRef.current = state.users;
+
+  const hydrateGoogleProfileSession = (
+    fbUser: FirebaseUser,
+    options?: { silent?: boolean; openAdminIfEligible?: boolean }
+  ) => {
+    void ensureAdminDocIfMatched(fbUser).catch(() => {});
+
+    const isExclusiveAdmin = isExclusiveAdminUser(fbUser);
+    const cleanEmail = (fbUser.email || '').trim().toLowerCase();
+    const existingMatch = usersRef.current.find(
+      (u) =>
+        !u.isDemoSeed &&
+        (u.uid === fbUser.uid ||
+          u.id === fbUser.uid ||
+          (cleanEmail && u.email?.toLowerCase() === cleanEmail))
+    );
+
+    let activeProfile: UserProfile;
+    if (existingMatch) {
+      activeProfile = {
+        ...existingMatch,
+        uid: fbUser.uid,
+        email: existingMatch.email || cleanEmail || undefined,
+        avatarUrl: existingMatch.avatarUrl || fbUser.photoURL || SEED_USERS[0].avatarUrl,
+        verified: isExclusiveAdmin ? true : existingMatch.verified,
+        isOnline: true,
+        isDemoSeed: false,
+      };
+      setState((prev) => ({
+        ...prev,
+        users: prev.users.map((u) => (u.id === existingMatch.id ? activeProfile : u)),
+        currentUserId: activeProfile.id,
+        isAuthenticated: true,
+      }));
+    } else {
+      const baseHandle = (
+        fbUser.email?.split('@')[0] ||
+        fbUser.displayName ||
+        'usuario'
+      )
+        .toLowerCase()
+        .replace(/[^a-z0-9._]/g, '')
+        .slice(0, 24);
+      const safeHandle =
+        baseHandle.length >= 3
+          ? usersRef.current.some((u) => u.username.toLowerCase() === baseHandle)
+            ? `${baseHandle}.${fbUser.uid.slice(0, 4).toLowerCase()}`
+            : baseHandle
+          : `user.${fbUser.uid.slice(0, 6).toLowerCase()}`;
+
+      activeProfile = {
+        id: fbUser.uid,
+        uid: fbUser.uid,
+        username: safeHandle,
+        displayName: fbUser.displayName?.trim() || safeHandle,
+        avatarUrl: fbUser.photoURL || SEED_USERS[0].avatarUrl,
+        coverUrl: SEED_USERS[0].coverUrl,
+        bio: isExclusiveAdmin
+          ? 'Administrador exclusivo da rede Lumina.'
+          : 'Perfil conectado na nuvem Lumina.',
+        email: cleanEmail || undefined,
+        verified: isExclusiveAdmin,
+        isOnline: true,
+        isDemoSeed: false,
+        followers: [],
+        following: [],
+      };
+      setState((prev) => ({
+        ...prev,
+        users: [activeProfile, ...prev.users.filter((u) => u.id !== activeProfile.id)],
+        currentUserId: activeProfile.id,
+        isAuthenticated: true,
+      }));
+    }
+
+    setGuestBrowsing(false);
+    setViewingProfileId(null);
+    setIsInviteModalOpen(false);
+    if (options?.openAdminIfEligible && isExclusiveAdmin) {
+      setActiveNav('admin');
+    }
+
+    void (async () => {
+      await upsertOwnProfileInCloud(activeProfile, fbUser).catch(() => {});
+      if (isExclusiveAdmin) {
+        await adminUpdateProfileFlagsInCloud(activeProfile, fbUser).catch(() => {});
+      }
+    })();
+
+    if (!options?.silent) {
+      showToast(
+        isExclusiveAdmin
+          ? `Administrador conectado: @${activeProfile.username}`
+          : `Conectado na nuvem como @${activeProfile.username}`
+      );
+    }
+    return activeProfile;
+  };
+
   // Firebase Auth & Firestore real-time cross-device sync
   useEffect(() => {
     let unsubCloud: (() => void) | null = null;
+
+    getRedirectResult(auth)
+      .then((result) => {
+        const fbUser = result?.user;
+        if (fbUser && fbUser.emailVerified) {
+          let openAdmin = false;
+          try {
+            openAdmin = sessionStorage.getItem('lumina_google_redirect_target') === 'admin';
+            sessionStorage.removeItem('lumina_google_redirect_target');
+          } catch {
+            // Ignore storage access errors
+          }
+          hydrateGoogleProfileSession(fbUser, { openAdminIfEligible: openAdmin });
+        }
+      })
+      .catch(() => {
+        try {
+          sessionStorage.removeItem('lumina_google_redirect_target');
+        } catch {
+          // Ignore
+        }
+      });
+
     const unsubAuth = onAuthStateChanged(auth, (fbUser) => {
       setFirebaseUser(fbUser);
       if (unsubCloud) {
@@ -621,6 +762,19 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       if (!fbUser || !fbUser.emailVerified) return;
 
       void ensureAdminDocIfMatched(fbUser).catch(() => {});
+      if (!isAuthenticatedRef.current) {
+        let openAdmin = false;
+        try {
+          openAdmin = sessionStorage.getItem('lumina_google_redirect_target') === 'admin';
+          if (openAdmin) sessionStorage.removeItem('lumina_google_redirect_target');
+        } catch {
+          // Ignore
+        }
+        hydrateGoogleProfileSession(fbUser, {
+          silent: true,
+          openAdminIfEligible: openAdmin,
+        });
+      }
 
       unsubCloud = subscribeToCloudState(fbUser, {
         onProfiles: (cloudProfiles) => {
@@ -1034,6 +1188,33 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     return false;
   };
 
+  const formatGoogleAuthError = (err: unknown): string => {
+    const code =
+      typeof err === 'object' && err !== null && 'code' in err
+        ? String((err as { code?: unknown }).code || '')
+        : '';
+    const host = typeof window !== 'undefined' ? window.location.hostname : '';
+    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+      return 'Janela de login do Google fechada antes de concluir.';
+    }
+    if (code === 'auth/popup-blocked') {
+      return 'O navegador bloqueou o pop-up do Google. Use o botão "Usar redirecionamento Google" abaixo ou entre com sua senha de administrador.';
+    }
+    if (code === 'auth/unauthorized-domain') {
+      return `O domínio "${host}" precisa estar em Authorized domains do projeto Firebase "${FIREBASE_PROJECT_ID}" (Authentication > Settings > Authorized domains) ou entre com a senha de administrador.`;
+    }
+    if (code === 'auth/operation-not-allowed') {
+      return 'O provedor Google não está habilitado no Firebase Authentication. Use a senha de administrador ou ative o Google no console.';
+    }
+    if (code === 'auth/network-request-failed') {
+      return 'Falha de conexão ao autenticar com o Google. Verifique sua internet ou use a senha de administrador.';
+    }
+    if (code) {
+      return `Erro no login Google (${code}). Use "Redirecionamento Google" ou entre com a senha de administrador.`;
+    }
+    return 'Não foi possível conectar com o Google. Tente novamente ou use a senha de administrador.';
+  };
+
   const loginWithGoogle = async (): Promise<{ ok: boolean; error?: string }> => {
     try {
       const cred = await signInWithPopup(auth, googleProvider);
@@ -1041,115 +1222,31 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       if (!fbUser || !fbUser.emailVerified) {
         return { ok: false, error: 'Use uma conta Google com e-mail verificado.' };
       }
-
-      await ensureAdminDocIfMatched(fbUser).catch(() => {});
-
-      const isExclusiveAdmin = isExclusiveAdminUser(fbUser);
-      const cleanEmail = (fbUser.email || '').trim().toLowerCase();
-      const existingMatch = state.users.find(
-        (u) =>
-          !u.isDemoSeed &&
-          (u.uid === fbUser.uid ||
-            u.id === fbUser.uid ||
-            (cleanEmail && u.email?.toLowerCase() === cleanEmail))
-      );
-
-      let activeProfile: UserProfile;
-      if (existingMatch) {
-        activeProfile = {
-          ...existingMatch,
-          uid: fbUser.uid,
-          email: existingMatch.email || cleanEmail || undefined,
-          avatarUrl: existingMatch.avatarUrl || fbUser.photoURL || SEED_USERS[0].avatarUrl,
-          verified: isExclusiveAdmin ? true : existingMatch.verified,
-          isOnline: true,
-          isDemoSeed: false,
-        };
-        setState((prev) => ({
-          ...prev,
-          users: prev.users.map((u) => (u.id === existingMatch.id ? activeProfile : u)),
-          currentUserId: activeProfile.id,
-          isAuthenticated: true,
-        }));
-      } else {
-        const baseHandle = (
-          fbUser.email?.split('@')[0] ||
-          fbUser.displayName ||
-          'usuario'
-        )
-          .toLowerCase()
-          .replace(/[^a-z0-9._]/g, '')
-          .slice(0, 24);
-        const safeHandle =
-          baseHandle.length >= 3
-            ? state.users.some((u) => u.username.toLowerCase() === baseHandle)
-              ? `${baseHandle}.${fbUser.uid.slice(0, 4).toLowerCase()}`
-              : baseHandle
-            : `user.${fbUser.uid.slice(0, 6).toLowerCase()}`;
-
-        activeProfile = {
-          id: fbUser.uid,
-          uid: fbUser.uid,
-          username: safeHandle,
-          displayName: fbUser.displayName?.trim() || safeHandle,
-          avatarUrl: fbUser.photoURL || SEED_USERS[0].avatarUrl,
-          coverUrl: SEED_USERS[0].coverUrl,
-          bio: isExclusiveAdmin
-            ? 'Administrador exclusivo da rede Lumina.'
-            : 'Perfil conectado na nuvem Lumina.',
-          email: cleanEmail || undefined,
-          verified: isExclusiveAdmin,
-          isOnline: true,
-          isDemoSeed: false,
-          followers: [],
-          following: [],
-        };
-        setState((prev) => ({
-          ...prev,
-          users: [activeProfile, ...prev.users.filter((u) => u.id !== activeProfile.id)],
-          currentUserId: activeProfile.id,
-          isAuthenticated: true,
-        }));
-      }
-
-      setGuestBrowsing(false);
-      setViewingProfileId(null);
-      setIsInviteModalOpen(false);
-      void (async () => {
-        await upsertOwnProfileInCloud(activeProfile, fbUser).catch(() => {});
-        if (isExclusiveAdmin) {
-          await adminUpdateProfileFlagsInCloud(activeProfile, fbUser).catch(() => {});
-        }
-      })();
-      showToast(
-        isExclusiveAdmin
-          ? `Administrador conectado: @${activeProfile.username}`
-          : `Conectado na nuvem como @${activeProfile.username}`
-      );
+      hydrateGoogleProfileSession(fbUser);
       return { ok: true };
     } catch (err) {
-      const code =
-        typeof err === 'object' && err !== null && 'code' in err
-          ? String((err as { code?: unknown }).code || '')
-          : '';
-      const host = typeof window !== 'undefined' ? window.location.hostname : '';
-      let msg = 'Não foi possível conectar com o Google. Tente novamente.';
-      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
-        msg = 'Janela de login do Google fechada antes de concluir.';
-      } else if (code === 'auth/popup-blocked') {
-        msg =
-          'O navegador bloqueou o pop-up do Google. Libere pop-ups para este site ou use sua senha de administrador.';
-      } else if (code === 'auth/unauthorized-domain') {
-        msg = `O domínio "${host}" precisa ser autorizado no Firebase Console (Authentication > Settings > Authorized domains) ou entre com a senha de administrador.`;
-      } else if (code === 'auth/operation-not-allowed') {
-        msg =
-          'O provedor Google não está habilitado no Firebase Authentication. Use a senha de administrador ou ative o Google no console.';
-      } else if (code === 'auth/network-request-failed') {
-        msg = 'Falha de conexão ao autenticar com o Google. Verifique sua internet ou use a senha de administrador.';
-      } else if (code) {
-        msg = `Erro no login Google (${code}). Use a senha de administrador no painel ou tente novamente.`;
+      return { ok: false, error: formatGoogleAuthError(err) };
+    }
+  };
+
+  const loginWithGoogleRedirect = async (
+    target: 'feed' | 'admin' = 'feed'
+  ): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      try {
+        sessionStorage.setItem('lumina_google_redirect_target', target);
+      } catch {
+        // Ignore sessionStorage restrictions
       }
-      return { ok: false, error: msg };
+      await signInWithRedirect(auth, googleProvider);
+      return { ok: true };
+    } catch (err) {
+      try {
+        sessionStorage.removeItem('lumina_google_redirect_target');
+      } catch {
+        // Ignore
+      }
+      return { ok: false, error: formatGoogleAuthError(err) };
     }
   };
 
@@ -1552,6 +1649,16 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       }
     } catch {
       // Static hosting without backend auth endpoint
+    }
+
+    // Static hosting fallback for exclusive admin passcode (PBKDF2 in browser storage)
+    if (rawId === ADMIN_EMAIL.toLowerCase() || cleanHandle === 'dadaniel14hiphop') {
+      const okStatic = await verifyStaticAdminPasscode(password);
+      if (okStatic) {
+        activateAdminProfileSession('static_admin_local');
+        showToast('Administrador conectado: @dadaniel14hiphop');
+        return { ok: true };
+      }
     }
 
     return { ok: false, error: 'Usuário/e-mail ou senha incorretos.' };
@@ -2300,6 +2407,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         setAdminMemoryToken,
         activateAdminProfileSession,
         loginWithGoogle,
+        loginWithGoogleRedirect,
         logout,
         hasPasswordForCurrentUser,
         hasPasswordForUser,
