@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import express from 'express';
@@ -777,7 +778,13 @@ const ALLOWED_MEDIA_MIME_EXT: Record<string, { ext: string; kind: 'video' | 'ima
   'video/webm': { ext: 'webm', kind: 'video' },
   'video/quicktime': { ext: 'mov', kind: 'video' },
   'video/x-m4v': { ext: 'm4v', kind: 'video' },
+  'video/mp4v-es': { ext: 'mp4', kind: 'video' },
   'video/ogg': { ext: 'ogv', kind: 'video' },
+  'video/3gpp': { ext: '3gp', kind: 'video' },
+  'video/3gpp2': { ext: '3g2', kind: 'video' },
+  'video/x-matroska': { ext: 'mkv', kind: 'video' },
+  'video/mpeg': { ext: 'mpg', kind: 'video' },
+  'video/avi': { ext: 'mp4', kind: 'video' },
   'image/jpeg': { ext: 'jpg', kind: 'image' },
   'image/jpg': { ext: 'jpg', kind: 'image' },
   'image/png': { ext: 'png', kind: 'image' },
@@ -791,11 +798,66 @@ const EXT_TO_CONTENT_TYPE: Record<string, string> = {
   mov: 'video/quicktime',
   m4v: 'video/x-m4v',
   ogv: 'video/ogg',
+  '3gp': 'video/3gpp',
+  '3g2': 'video/3gpp2',
+  mkv: 'video/x-matroska',
+  mpg: 'video/mpeg',
   jpg: 'image/jpeg',
   png: 'image/png',
   webp: 'image/webp',
   gif: 'image/gif',
 };
+
+let resolvedUploadsDirCache: string | null = null;
+
+function getWritableUploadsDir(): string {
+  if (resolvedUploadsDirCache && fs.existsSync(resolvedUploadsDirCache)) {
+    return resolvedUploadsDirCache;
+  }
+  const candidates = [UPLOADS_DIR, path.join(os.tmpdir(), 'lumina-uploads')];
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.accessSync(dir, fs.constants.W_OK);
+      resolvedUploadsDirCache = dir;
+      return dir;
+    } catch {
+      // Try next writable directory
+    }
+  }
+  return UPLOADS_DIR;
+}
+
+interface PendingChunkUpload {
+  id: string;
+  objectKey: string;
+  fileName: string;
+  contentType: string;
+  kind: 'video' | 'image';
+  expectedBytes: number;
+  receivedBytes: number;
+  nextIndex: number;
+  tempPartPath: string;
+  createdAt: number;
+}
+
+const pendingChunkUploads = new Map<string, PendingChunkUpload>();
+
+function cleanupExpiredChunkUploads() {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [id, session] of pendingChunkUploads.entries()) {
+    if (session.createdAt < cutoff) {
+      pendingChunkUploads.delete(id);
+      try {
+        if (fs.existsSync(session.tempPartPath)) fs.unlinkSync(session.tempPartPath);
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+  }
+}
 
 function resolveAwsMediaTarget(state: IntegrationState) {
   return resolveAwsS3Config({
@@ -914,12 +976,223 @@ async function startServer() {
     });
   });
 
+  // Chunked upload session initialization (bypasses proxy single-request body limits for Reels videos)
+  app.post('/api/media/upload-init', (req, res) => {
+    cleanupExpiredChunkUploads();
+    const state = readAdminState();
+    const rawType = String(req.body?.contentType || '')
+      .split(';')[0]
+      .trim()
+      .toLowerCase();
+    const spec = ALLOWED_MEDIA_MIME_EXT[rawType];
+    if (!spec) {
+      res.status(415).json({
+        error:
+          'Formato de mídia não suportado. Envie MP4, WebM, MOV, M4V, 3GP, MKV, JPG, PNG ou WebP.',
+      });
+      return;
+    }
+
+    const totalBytes = Number(req.body?.sizeBytes || 0);
+    if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
+      res.status(400).json({ error: 'Tamanho de arquivo inválido.' });
+      return;
+    }
+
+    const maxVideoBytes = state.site.videoRules.maxVideoSizeMB * 1024 * 1024;
+    const maxImageBytes = 15 * 1024 * 1024;
+    const maxAllowedBytes = spec.kind === 'video' ? maxVideoBytes : maxImageBytes;
+    if (totalBytes > maxAllowedBytes) {
+      res.status(413).json({
+        error: `Arquivo excede o limite de ${
+          spec.kind === 'video' ? `${state.site.videoRules.maxVideoSizeMB} MB` : '15 MB'
+        }.`,
+      });
+      return;
+    }
+
+    const uploadsDir = getWritableUploadsDir();
+    const uploadId = crypto.randomBytes(16).toString('hex');
+    const objectKey = buildReelObjectKey(spec.ext, spec.kind);
+    const fileName = path.posix.basename(objectKey);
+    const tempPartPath = path.resolve(uploadsDir, `part_${uploadId}.bin`);
+    if (!tempPartPath.startsWith(uploadsDir + path.sep)) {
+      res.status(400).json({ error: 'Caminho temporário inválido.' });
+      return;
+    }
+
+    try {
+      fs.writeFileSync(tempPartPath, Buffer.alloc(0));
+    } catch {
+      res.status(500).json({ error: 'Não foi possível preparar o armazenamento temporário.' });
+      return;
+    }
+
+    pendingChunkUploads.set(uploadId, {
+      id: uploadId,
+      objectKey,
+      fileName,
+      contentType: rawType,
+      kind: spec.kind,
+      expectedBytes: Math.round(totalBytes),
+      receivedBytes: 0,
+      nextIndex: 0,
+      tempPartPath,
+      createdAt: Date.now(),
+    });
+
+    res.json({
+      ok: true,
+      uploadId,
+      chunkSizeBytes: 3 * 1024 * 1024,
+    });
+  });
+
+  // Append a binary chunk (<= 6 MB) to an active chunked upload session
+  app.post(
+    '/api/media/upload-chunk',
+    express.raw({ type: () => true, limit: '8mb' }),
+    (req, res) => {
+      const uploadId = String(req.headers['x-upload-id'] || '').trim();
+      const chunkIndex = Number(req.headers['x-chunk-index']);
+      if (!/^[a-f0-9]{32}$/.test(uploadId) || !Number.isInteger(chunkIndex) || chunkIndex < 0) {
+        res.status(400).json({ error: 'Identificador de envio em partes inválido.' });
+        return;
+      }
+
+      const session = pendingChunkUploads.get(uploadId);
+      if (!session) {
+        res.status(404).json({ error: 'Sessão de envio expirada ou não encontrada.' });
+        return;
+      }
+
+      if (chunkIndex !== session.nextIndex) {
+        res.status(409).json({ error: 'Ordem dos blocos de envio inconsistente.' });
+        return;
+      }
+
+      const chunk = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (chunk.length === 0) {
+        res.status(400).json({ error: 'Bloco de dados vazio.' });
+        return;
+      }
+
+      if (session.receivedBytes + chunk.length > session.expectedBytes) {
+        pendingChunkUploads.delete(uploadId);
+        try {
+          if (fs.existsSync(session.tempPartPath)) fs.unlinkSync(session.tempPartPath);
+        } catch {
+          // Ignore cleanup errors
+        }
+        res.status(413).json({ error: 'Tamanho total excedeu o declarado inicialmente.' });
+        return;
+      }
+
+      try {
+        fs.appendFileSync(session.tempPartPath, chunk);
+        session.receivedBytes += chunk.length;
+        session.nextIndex += 1;
+        res.json({
+          ok: true,
+          receivedBytes: session.receivedBytes,
+          expectedBytes: session.expectedBytes,
+        });
+      } catch {
+        res.status(500).json({ error: 'Falha ao gravar bloco de mídia no servidor.' });
+      }
+    }
+  );
+
+  // Finalize a chunked upload: push to Amazon S3 (with fallback to local HTTP 206 streaming)
+  app.post('/api/media/upload-complete', async (req, res) => {
+    const uploadId = typeof req.body?.uploadId === 'string' ? req.body.uploadId.trim() : '';
+    if (!/^[a-f0-9]{32}$/.test(uploadId)) {
+      res.status(400).json({ error: 'Identificador de envio inválido.' });
+      return;
+    }
+
+    const session = pendingChunkUploads.get(uploadId);
+    if (!session) {
+      res.status(404).json({ error: 'Sessão de envio não encontrada ou expirada.' });
+      return;
+    }
+    pendingChunkUploads.delete(uploadId);
+
+    const cleanupPart = () => {
+      try {
+        if (fs.existsSync(session.tempPartPath)) fs.unlinkSync(session.tempPartPath);
+      } catch {
+        // Ignore cleanup errors
+      }
+    };
+
+    if (session.receivedBytes !== session.expectedBytes || !fs.existsSync(session.tempPartPath)) {
+      cleanupPart();
+      res.status(400).json({ error: 'Upload incompleto. Tente enviar o vídeo novamente.' });
+      return;
+    }
+
+    const state = readAdminState();
+    const awsCreds = getAwsCredentialsFromEnv();
+    const awsTarget = resolveAwsMediaTarget(state);
+
+    if (awsCreds && state.aws.s3Enabled) {
+      try {
+        const bodyBuffer = fs.readFileSync(session.tempPartPath);
+        const uploadResult = await uploadReelToS3({
+          key: session.objectKey,
+          body: bodyBuffer,
+          contentType: session.contentType,
+          config: awsTarget,
+        });
+        if (uploadResult.ok) {
+          cleanupPart();
+          const deliveryUrl = resolveReelPlaybackUrl(session.objectKey, awsTarget);
+          res.json({
+            ok: true,
+            url: deliveryUrl,
+            storageProvider: awsTarget.hasRealCloudFront ? 'aws-cloudfront' : 'aws-s3',
+            key: session.objectKey,
+            sizeBytes: session.receivedBytes,
+            contentType: session.contentType,
+          });
+          return;
+        }
+        console.error(`AWS S3 chunk upload HTTP ${uploadResult.status}: ${uploadResult.message}`);
+      } catch (err) {
+        console.error('AWS S3 chunk upload failed, falling back to server stream:', err);
+      }
+    }
+
+    try {
+      const uploadsDir = getWritableUploadsDir();
+      const safePath = path.resolve(uploadsDir, session.fileName);
+      if (!safePath.startsWith(uploadsDir + path.sep)) {
+        cleanupPart();
+        res.status(400).json({ error: 'Caminho de arquivo inválido.' });
+        return;
+      }
+      fs.renameSync(session.tempPartPath, safePath);
+      res.json({
+        ok: true,
+        url: `/api/media/file/${session.fileName}`,
+        storageProvider: 'server-disk',
+        key: session.fileName,
+        sizeBytes: session.receivedBytes,
+        contentType: session.contentType,
+      });
+    } catch {
+      cleanupPart();
+      res.status(500).json({ error: 'Não foi possível finalizar o vídeo no servidor.' });
+    }
+  });
+
   // Upload Reel video or photo directly to Amazon S3 (with CloudFront/Presigned delivery) or local HTTP-206 disk store
   app.post(
     '/api/media/upload',
     express.raw({
-      type: ['video/*', 'image/*', 'application/octet-stream'],
-      limit: '260mb',
+      type: () => true,
+      limit: '30mb',
     }),
     async (req, res) => {
       const state = readAdminState();
@@ -931,7 +1204,7 @@ async function startServer() {
       if (!spec) {
         res.status(415).json({
           error:
-            'Formato de mídia não suportado. Envie MP4, WebM, MOV, M4V, JPG, PNG ou WebP.',
+            'Formato de mídia não suportado. Envie MP4, WebM, MOV, M4V, 3GP, MKV, JPG, PNG ou WebP.',
         });
         return;
       }
@@ -987,11 +1260,9 @@ async function startServer() {
 
       // Server local disk stream fallback with full HTTP 206 byte-range seeking
       try {
-        if (!fs.existsSync(UPLOADS_DIR)) {
-          fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-        }
-        const safePath = path.resolve(UPLOADS_DIR, fileName);
-        if (!safePath.startsWith(UPLOADS_DIR + path.sep)) {
+        const uploadsDir = getWritableUploadsDir();
+        const safePath = path.resolve(uploadsDir, fileName);
+        if (!safePath.startsWith(uploadsDir + path.sep)) {
           res.status(400).json({ error: 'Caminho de arquivo inválido.' });
           return;
         }
@@ -1035,13 +1306,16 @@ async function startServer() {
   // Stream uploaded server media with full HTTP 206 Partial Content Range support for mobile/desktop video playback
   app.get('/api/media/file/:filename', (req, res) => {
     const filename = String(req.params.filename || '').trim();
-    const match = filename.match(/^([a-zA-Z0-9_-]{4,80})\.(mp4|webm|mov|m4v|ogv|jpg|png|webp|gif)$/i);
+    const match = filename.match(
+      /^([a-zA-Z0-9_-]{4,80})\.(mp4|webm|mov|m4v|ogv|3gp|3g2|mkv|mpg|jpg|png|webp|gif)$/i
+    );
     if (!match) {
       res.status(400).json({ error: 'Nome de arquivo inválido.' });
       return;
     }
-    const safePath = path.resolve(UPLOADS_DIR, filename);
-    if (!safePath.startsWith(UPLOADS_DIR + path.sep) || !fs.existsSync(safePath)) {
+    const uploadsDir = getWritableUploadsDir();
+    const safePath = path.resolve(uploadsDir, filename);
+    if (!safePath.startsWith(uploadsDir + path.sep) || !fs.existsSync(safePath)) {
       res.status(404).json({ error: 'Mídia não encontrada.' });
       return;
     }

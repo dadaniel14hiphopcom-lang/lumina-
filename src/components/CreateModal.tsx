@@ -91,6 +91,7 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
   const [audioTrack, setAudioTrack] = useState('Luz Natural · Instrumental');
   const [isPublishing, setIsPublishing] = useState(false);
   const [uploadingMedia, setUploadingMedia] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [mediaDeliveryStatus, setMediaDeliveryStatus] = useState<MediaStatusInfo | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [previewVideoError, setPreviewVideoError] = useState(false);
@@ -161,8 +162,11 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     fileName?: string
   ): Promise<string | null> => {
     setUploadingMedia(true);
+    setUploadProgress(5);
     try {
-      const result = await uploadMediaToCloud(blob, fileName);
+      const result = await uploadMediaToCloud(blob, fileName, (pct) => {
+        setUploadProgress(pct);
+      });
       if (!result.fallbackNeeded) {
         if (result.storageProvider === 'aws-cloudfront' || result.storageProvider === 'aws-s3') {
           showToast('Vídeo hospedado na Amazon AWS S3');
@@ -191,6 +195,7 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
       return null;
     } finally {
       setUploadingMedia(false);
+      setUploadProgress(0);
     }
   };
 
@@ -244,7 +249,11 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     e.target.value = '';
     if (files.length === 0) return;
 
-    const firstVideo = files.find((f) => f.type.startsWith('video/'));
+    const firstVideo = files.find(
+      (f) =>
+        f.type.startsWith('video/') ||
+        /\.(mp4|webm|mov|m4v|ogv|ogg|3gp|3g2|mkv|mpg)$/i.test(f.name)
+    );
     if (firstVideo) {
       if (mode !== 'reel') {
         setMediaError('Vídeos curtos devem ser publicados no modo Reel.');
@@ -591,8 +600,8 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                 <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
                 <span>
                   {mediaDeliveryStatus?.storageProvider === 'aws-s3'
-                    ? `Enviando vídeo para Amazon S3 (${mediaDeliveryStatus.bucket})...`
-                    : 'Enviando vídeo para o servidor de streaming...'}
+                    ? `Enviando vídeo para Amazon S3 (${mediaDeliveryStatus.bucket})... ${uploadProgress}%`
+                    : `Enviando vídeo para o servidor de streaming... ${uploadProgress}%`}
                 </span>
               </div>
             )}
