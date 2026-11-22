@@ -32,11 +32,13 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
     toggleTheme,
     isAuthenticated,
     firebaseUser,
+    adminMemoryToken,
     logout,
     openAuthModal,
   } = useSocial();
 
-  const canSeeAdminNav = !isAuthenticated || isExclusiveAdminUser(firebaseUser);
+  const canSeeAdminNav =
+    !isAuthenticated || isExclusiveAdminUser(firebaseUser) || Boolean(adminMemoryToken);
 
   const unreadNotifs = notifications.filter(
     (n) => n.recipientId === currentUser.id && !n.read

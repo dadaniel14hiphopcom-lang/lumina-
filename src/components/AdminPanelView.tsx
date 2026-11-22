@@ -8,6 +8,8 @@ import {
   Copy,
   Database,
   Download,
+  Eye,
+  EyeOff,
   FileCode2,
   Globe,
   KeyRound,
@@ -19,6 +21,7 @@ import {
   Send,
   Server,
   Shield,
+  Sparkles,
   Trash2,
   TrendingUp,
   Upload,
@@ -244,13 +247,15 @@ export function AdminPanelView() {
     revokeInvite,
     purgeDemoUsers,
     firebaseUser,
+    adminMemoryToken,
+    setAdminMemoryToken,
+    activateAdminProfileSession,
     loginWithGoogle,
   } = useSocial();
 
   // Auth held strictly in React memory (never localStorage)
-  const [adminToken, setAdminToken] = useState<string | null>(null);
+  const [adminToken, setAdminToken] = useState<string | null>(() => adminMemoryToken);
   const [manualLock, setManualLock] = useState(false);
-  const [showServerPasscodeForm, setShowServerPasscodeForm] = useState(false);
   const [firebaseAdminLoading, setFirebaseAdminLoading] = useState(false);
   const [authStatus, setAuthStatus] = useState<{
     loading: boolean;
@@ -260,8 +265,26 @@ export function AdminPanelView() {
   }>({ loading: true, claimed: false, envConfigured: false, serverAvailable: true });
   const [passcodeInput, setPasscodeInput] = useState('');
   const [confirmInput, setConfirmInput] = useState('');
+  const [showPasscode, setShowPasscode] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSubmitting, setAuthSubmitting] = useState(false);
+
+  // In-panel admin password rotation state
+  const [newAdminPasscode, setNewAdminPasscode] = useState('');
+  const [showNewAdminPasscode, setShowNewAdminPasscode] = useState(false);
+  const [updatingAdminPasscode, setUpdatingAdminPasscode] = useState(false);
+
+  const generateStrongPasscode = () => {
+    const charset = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*';
+    const length = 14;
+    const out: string[] = [];
+    const buf = new Uint32Array(length);
+    window.crypto.getRandomValues(buf);
+    for (let i = 0; i < length; i++) {
+      out.push(charset[buf[i] % charset.length]);
+    }
+    return `Adm-${out.join('')}`;
+  };
 
   // Dashboard state
   const [activeTab, setActiveTab] = useState<AdminTab>('users');
@@ -436,6 +459,7 @@ export function AdminPanelView() {
         return false;
       }
       setAdminToken(data.token);
+      setAdminMemoryToken(data.token);
       await loadOverview(data.token, true);
       return true;
     } catch {
@@ -446,13 +470,18 @@ export function AdminPanelView() {
     }
   };
 
-  // Automatic direct access when the exclusive administrator Google account is active
+  // Sync admin token if authenticated from AuthView or active exclusive Google Admin session
   useEffect(() => {
-    if (authStatus.loading || adminToken || manualLock) return;
-    if (isExclusiveAdminUser(firebaseUser)) {
+    if (authStatus.loading || manualLock) return;
+    if (!adminToken && adminMemoryToken) {
+      setAdminToken(adminMemoryToken);
+      void loadOverview(adminMemoryToken, authStatus.serverAvailable);
+      return;
+    }
+    if (!adminToken && isExclusiveAdminUser(firebaseUser)) {
       void authenticateExclusiveAdminWithFirebase(firebaseUser);
     }
-  }, [authStatus.loading, authStatus.serverAvailable, firebaseUser, adminToken, manualLock]);
+  }, [authStatus.loading, authStatus.serverAvailable, firebaseUser, adminToken, adminMemoryToken, manualLock]);
 
   const handleExclusiveGoogleAdminLogin = async () => {
     setAuthError(null);
@@ -477,11 +506,12 @@ export function AdminPanelView() {
     setAuthError(null);
     if (!authStatus.serverAvailable) {
       setAuthError(
-        `Use o botão de entrada exclusiva (${ADMIN_EMAIL}) para acessar o painel na hospedagem estática.`
+        `Servidor /api indisponível nesta hospedagem estática. Use o login Google (${ADMIN_EMAIL}).`
       );
       return;
     }
-    if (!authStatus.claimed) {
+    const isFirstRunClaim = !authStatus.claimed && !authStatus.envConfigured;
+    if (isFirstRunClaim) {
       if (passcodeInput.trim().length < 6) {
         setAuthError('Escolha uma senha de acesso com pelo menos 6 caracteres.');
         return;
@@ -490,21 +520,22 @@ export function AdminPanelView() {
         setAuthError('As senhas não conferem.');
         return;
       }
+    } else if (!passcodeInput.trim()) {
+      setAuthError('Informe a senha administrativa para entrar.');
+      return;
     }
 
     setAuthSubmitting(true);
     try {
-      const endpoint = authStatus.claimed
-        ? '/api/admin/auth/login'
-        : '/api/admin/auth/claim';
+      const endpoint = isFirstRunClaim ? '/api/admin/auth/claim' : '/api/admin/auth/login';
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (!authStatus.claimed && firebaseUser && isExclusiveAdminUser(firebaseUser)) {
-        headers.Authorization = `Bearer ${await firebaseUser.getIdToken()}`;
-      }
       const res = await fetch(endpoint, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ passcode: passcodeInput.trim() }),
+        body: JSON.stringify({
+          email: ADMIN_EMAIL,
+          passcode: passcodeInput.trim(),
+        }),
       });
       const contentType = res.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
@@ -521,14 +552,50 @@ export function AdminPanelView() {
       }
       setManualLock(false);
       setAdminToken(data.token);
+      activateAdminProfileSession(data.token);
       setPasscodeInput('');
       setConfirmInput('');
+      setShowPasscode(false);
       setAuthStatus((prev) => ({ ...prev, claimed: true }));
       await loadOverview(data.token, true);
+      showToast(
+        isFirstRunClaim
+          ? `Senha de ADM salva para ${ADMIN_EMAIL}! Painel desbloqueado.`
+          : `Bem-vindo, administrador (${ADMIN_EMAIL}).`
+      );
     } catch {
       setAuthError('Erro de conexão com o servidor.');
     } finally {
       setAuthSubmitting(false);
+    }
+  };
+
+  const handleRotateAdminPasscode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanNext = newAdminPasscode.trim();
+    if (cleanNext.length < 6) {
+      showToast('A nova senha de ADM deve ter pelo menos 6 caracteres');
+      return;
+    }
+    setUpdatingAdminPasscode(true);
+    try {
+      const res = await authFetch('/api/admin/auth/change-passcode', {
+        method: 'POST',
+        body: JSON.stringify({ newPasscode: cleanNext }),
+      });
+      const data = (await res.json()) as { ok?: boolean; token?: string; error?: string };
+      if (!res.ok || !data.ok) {
+        showToast(data.error || 'Não foi possível atualizar a senha de ADM');
+        return;
+      }
+      if (data.token) {
+        setAdminToken(data.token);
+        setAdminMemoryToken(data.token);
+      }
+      setNewAdminPasscode('');
+      showToast(`Nova senha de ADM atualizada para ${ADMIN_EMAIL}`);
+    } finally {
+      setUpdatingAdminPasscode(false);
     }
   };
 
@@ -1167,70 +1234,135 @@ ${itemsXml}
                     ? 'Autenticando administrador...'
                     : isAdminGoogleReady
                     ? 'Entrar diretamente como Administrador'
-                    : 'Entrar como Administrador (Google)'}
+                    : 'Entrar com Google (dadaniel14hiphop.com@gmail.com)'}
                 </span>
               </button>
 
-              {authStatus.serverAvailable && (authStatus.envConfigured || authStatus.claimed || isAdminGoogleReady) && (
-                <div className="border-t border-zinc-200 pt-3 dark:border-zinc-800">
-                  <button
-                    type="button"
-                    onClick={() => setShowServerPasscodeForm((v) => !v)}
-                    className="w-full text-center text-xs font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200"
-                  >
-                    {showServerPasscodeForm
-                      ? 'Ocultar acesso por chave do servidor'
-                      : 'Usar chave administrativa do servidor (.env)'}
-                  </button>
+              {authStatus.serverAvailable ? (
+                <div className="border-t border-zinc-200 pt-4 dark:border-zinc-800">
+                  <div className="mb-3 flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-bold text-zinc-900 dark:text-zinc-100">
+                        {!authStatus.claimed && !authStatus.envConfigured
+                          ? 'Definir senha de ADM para esta conta'
+                          : 'Entrar com e-mail e senha de ADM'}
+                      </p>
+                      <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                        Vinculada exclusivamente a {ADMIN_EMAIL}
+                      </p>
+                    </div>
+                    {!authStatus.claimed && !authStatus.envConfigured && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const generated = generateStrongPasscode();
+                          setPasscodeInput(generated);
+                          setConfirmInput(generated);
+                          setShowPasscode(true);
+                          showToast('Senha forte gerada! Copie e clique em Salvar senha e entrar.');
+                        }}
+                        className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-zinc-950 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950 dark:hover:bg-zinc-200"
+                      >
+                        <Sparkles className="h-3.5 w-3.5" />
+                        <span>Gerar senha</span>
+                      </button>
+                    )}
+                  </div>
 
-                  {showServerPasscodeForm && (
-                    <form onSubmit={handleAuthSubmit} className="mt-3 space-y-3">
+                  <form onSubmit={handleAuthSubmit} className="space-y-3">
+                    <label className="block space-y-1.5">
+                      <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                        {!authStatus.claimed && !authStatus.envConfigured
+                          ? 'Nova senha de Administrador'
+                          : 'Senha de Administrador'}
+                      </span>
+                      <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                        <KeyRound className="h-4 w-4 text-zinc-400" />
+                        <input
+                          type={showPasscode ? 'text' : 'password'}
+                          value={passcodeInput}
+                          onChange={(e) => setPasscodeInput(e.target.value)}
+                          placeholder="Mínimo 6 caracteres"
+                          className="h-10 flex-1 bg-transparent font-mono text-sm text-zinc-950 focus:outline-none dark:text-white"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowPasscode((v) => !v)}
+                          aria-label={showPasscode ? 'Ocultar senha' : 'Mostrar senha'}
+                          className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                        >
+                          {showPasscode ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                        </button>
+                        {passcodeInput && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void navigator.clipboard?.writeText(passcodeInput);
+                              showToast('Senha copiada para a área de transferência');
+                            }}
+                            aria-label="Copiar senha"
+                            className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                          >
+                            <Copy className="h-4 w-4" />
+                          </button>
+                        )}
+                      </div>
+                    </label>
+
+                    {!authStatus.claimed && !authStatus.envConfigured && (
                       <label className="block space-y-1.5">
                         <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
-                          {authStatus.claimed ? 'Senha administrativa' : 'Definir senha extra do servidor'}
+                          Confirmar senha de Administrador
                         </span>
                         <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
-                          <KeyRound className="h-4 w-4 text-zinc-400" />
+                          <Lock className="h-4 w-4 text-zinc-400" />
                           <input
-                            type="password"
-                            value={passcodeInput}
-                            onChange={(e) => setPasscodeInput(e.target.value)}
-                            placeholder="Mínimo 6 caracteres"
-                            className="h-10 flex-1 bg-transparent text-sm text-zinc-950 focus:outline-none dark:text-white"
+                            type={showPasscode ? 'text' : 'password'}
+                            value={confirmInput}
+                            onChange={(e) => setConfirmInput(e.target.value)}
+                            placeholder="Repita a senha"
+                            className="h-10 flex-1 font-mono text-sm text-zinc-950 focus:outline-none dark:text-white"
                           />
                         </div>
                       </label>
+                    )}
 
-                      {!authStatus.claimed && (
-                        <label className="block space-y-1.5">
-                          <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
-                            Confirmar senha
-                          </span>
-                          <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
-                            <Lock className="h-4 w-4 text-zinc-400" />
-                            <input
-                              type="password"
-                              value={confirmInput}
-                              onChange={(e) => setConfirmInput(e.target.value)}
-                              placeholder="Repita a senha"
-                              className="h-10 flex-1 bg-transparent text-sm text-zinc-950 focus:outline-none dark:text-white"
-                            />
-                          </div>
-                        </label>
-                      )}
-
+                    <button
+                      type="submit"
+                      disabled={authSubmitting}
+                      className="h-10 w-full rounded-xl bg-zinc-950 text-xs font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-white dark:text-zinc-950"
+                    >
+                      {authSubmitting
+                        ? 'Validando...'
+                        : !authStatus.claimed && !authStatus.envConfigured
+                        ? 'Salvar senha de ADM e entrar'
+                        : 'Entrar com senha de ADM'}
+                    </button>
+                  </form>
+                </div>
+              ) : (
+                <div className="space-y-2 rounded-xl border border-amber-500/30 bg-amber-50 p-3.5 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                  <p className="font-semibold">
+                    Hospedagem estática detectada (sem servidor /api)
+                  </p>
+                  <p>
+                    Se o login com Google falhar neste endereço, adicione o domínio atual em{' '}
+                    <strong>Firebase Console → Authentication → Settings → Authorized domains</strong>:
+                  </p>
+                  {typeof window !== 'undefined' && (
+                    <div className="flex items-center justify-between gap-2 rounded-lg bg-white/80 px-2.5 py-1.5 font-mono text-[11px] text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">
+                      <span className="truncate">{window.location.hostname}</span>
                       <button
-                        type="submit"
-                        disabled={authSubmitting}
-                        className="h-10 w-full rounded-xl bg-zinc-950 text-xs font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-white dark:text-zinc-950"
+                        type="button"
+                        onClick={() => {
+                          void navigator.clipboard?.writeText(window.location.hostname);
+                          showToast('Domínio copiado!');
+                        }}
+                        className="shrink-0 font-sans font-semibold text-sky-600 hover:underline dark:text-sky-400"
                       >
-                        {authSubmitting
-                          ? 'Validando...'
-                          : authStatus.claimed
-                          ? 'Entrar com chave'
-                          : 'Salvar chave e entrar'}
+                        Copiar
                       </button>
-                    </form>
+                    </div>
                   )}
                 </div>
               )}
@@ -1249,8 +1381,7 @@ ${itemsXml}
       <header className="mb-6 flex flex-wrap items-center justify-between gap-4 border-b border-zinc-200 pb-4 dark:border-zinc-800">
         <div>
           <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
-            Lumina Admin · v{state?.site.version || '2.4.0'}
-            {isExclusiveAdminUser(firebaseUser) && ` · Exclusivo (${ADMIN_EMAIL})`}
+            Lumina Admin · v{state?.site.version || '2.4.0'} · Exclusivo ({ADMIN_EMAIL})
           </p>
           <h1 className="text-2xl font-bold tracking-tight text-zinc-950 dark:text-white">
             Painel Administrativo e Infraestrutura
@@ -1272,6 +1403,7 @@ ${itemsXml}
             onClick={() => {
               setManualLock(true);
               setAdminToken(null);
+              setAdminMemoryToken(null);
             }}
             className="inline-flex h-10 items-center gap-2 rounded-xl bg-zinc-100 px-3.5 text-xs font-semibold text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
           >
@@ -2466,6 +2598,73 @@ ${itemsXml}
                 Aplicar no site
               </button>
             </section>
+
+            {authStatus.serverAvailable && !authStatus.envConfigured && (
+              <section className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h2 className="text-sm font-bold text-zinc-950 dark:text-white">
+                      Senha Administrativa ({ADMIN_EMAIL})
+                    </h2>
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                      Gere ou altere a senha de acesso ao painel para esta conta.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const generated = generateStrongPasscode();
+                      setNewAdminPasscode(generated);
+                      setShowNewAdminPasscode(true);
+                      showToast('Nova senha gerada. Clique em Salvar nova senha.');
+                    }}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-zinc-100 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                    <span>Gerar senha</span>
+                  </button>
+                </div>
+
+                <form onSubmit={handleRotateAdminPasscode} className="space-y-2.5">
+                  <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                    <KeyRound className="h-4 w-4 text-zinc-400" />
+                    <input
+                      type={showNewAdminPasscode ? 'text' : 'password'}
+                      value={newAdminPasscode}
+                      onChange={(e) => setNewAdminPasscode(e.target.value)}
+                      placeholder="Nova senha de ADM (mín. 6 caracteres)"
+                      className="h-10 flex-1 bg-transparent font-mono text-xs text-zinc-950 focus:outline-none dark:text-white"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowNewAdminPasscode((v) => !v)}
+                      className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                    >
+                      {showNewAdminPasscode ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                    {newAdminPasscode && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void navigator.clipboard?.writeText(newAdminPasscode);
+                          showToast('Senha copiada');
+                        }}
+                        className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                      >
+                        <Copy className="h-4 w-4" />
+                      </button>
+                    )}
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={updatingAdminPasscode}
+                    className="h-10 w-full rounded-xl bg-sky-600 text-xs font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
+                  >
+                    {updatingAdminPasscode ? 'Salvando...' : 'Salvar nova senha de ADM'}
+                  </button>
+                </form>
+              </section>
+            )}
 
             <section className="rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
               <h2 className="mb-3 text-sm font-bold text-zinc-950 dark:text-white">

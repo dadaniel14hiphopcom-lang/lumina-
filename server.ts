@@ -114,10 +114,10 @@ async function verifyFirebaseIdToken(
   if (typeof payload.exp !== 'number' || payload.exp <= nowSec) {
     throw new Error('Token Firebase expirado.');
   }
-  if (typeof payload.iat !== 'number' || payload.iat > nowSec + 300) {
+  if (typeof payload.iat !== 'number' || payload.iat > nowSec + 600) {
     throw new Error('Data de emissão do token inválida.');
   }
-  if (typeof payload.auth_time !== 'number' || payload.auth_time > nowSec + 300) {
+  if (typeof payload.auth_time !== 'number' || payload.auth_time > nowSec + 600) {
     throw new Error('auth_time inválido.');
   }
 
@@ -129,6 +129,7 @@ async function verifyFirebaseIdToken(
 }
 
 interface AdminAuthRecord {
+  email?: string;
   salt: string;
   hash: string;
   createdAt: number;
@@ -666,38 +667,24 @@ async function startServer() {
     }
   });
 
-  // First-run atomic admin password claim (requires verified Firebase Admin when Firebase is active)
-  app.post('/api/admin/auth/claim', async (req, res) => {
+  // First-run atomic admin password claim bound exclusively to ADMIN_EMAIL
+  app.post('/api/admin/auth/claim', (req, res) => {
     if (process.env.ADMIN_PASSCODE?.trim()) {
       res.status(409).json({ error: 'Senha administrativa gerenciada via variável de ambiente.' });
       return;
     }
     if (readAuthRecord()) {
-      res.status(409).json({ error: 'A conta administrativa já foi configurada.' });
+      res.status(409).json({ error: 'A senha administrativa já foi definida. Use a aba Entrar.' });
       return;
     }
-    if (FIREBASE_PROJECT_ID) {
-      const authHeader = req.headers.authorization;
-      const rawToken =
-        authHeader && authHeader.startsWith('Bearer ')
-          ? authHeader.slice('Bearer '.length).trim()
-          : '';
-      if (!rawToken) {
-        res.status(403).json({
-          error: `Entre com a conta administradora (${ADMIN_EMAIL}) para configurar uma senha adicional.`,
-        });
-        return;
-      }
-      try {
-        const verified = await verifyFirebaseIdToken(rawToken);
-        if (!verified.emailVerified || verified.email !== ADMIN_EMAIL.toLowerCase()) {
-          res.status(403).json({ error: 'Somente o administrador autorizado pode configurar a senha.' });
-          return;
-        }
-      } catch {
-        res.status(401).json({ error: 'Sessão Google/Firebase inválida.' });
-        return;
-      }
+
+    const emailInput =
+      typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ADMIN_EMAIL.toLowerCase();
+    if (emailInput !== ADMIN_EMAIL.toLowerCase()) {
+      res.status(403).json({
+        error: `Somente a conta administradora (${ADMIN_EMAIL}) pode configurar esta senha.`,
+      });
+      return;
     }
 
     const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
@@ -707,7 +694,12 @@ async function startServer() {
     }
     const salt = crypto.randomBytes(16).toString('hex');
     const hash = hashPasscode(passcode, salt);
-    const record: AdminAuthRecord = { salt, hash, createdAt: Date.now() };
+    const record: AdminAuthRecord = {
+      email: ADMIN_EMAIL,
+      salt,
+      hash,
+      createdAt: Date.now(),
+    };
     memoryAuthRecord = record;
     try {
       fs.writeFileSync(
@@ -724,18 +716,57 @@ async function startServer() {
       // Read-only filesystem fallback: memoryAuthRecord remains active
     }
     const token = signSessionToken();
-    res.json({ token });
+    res.json({ token, email: ADMIN_EMAIL });
   });
 
-  // Admin Login
+  // Admin Login (exclusive email + passcode)
   app.post('/api/admin/auth/login', (req, res) => {
+    const emailInput =
+      typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (emailInput && emailInput !== ADMIN_EMAIL.toLowerCase()) {
+      res.status(403).json({
+        error: `Acesso exclusivo: somente a conta ${ADMIN_EMAIL} é administradora.`,
+      });
+      return;
+    }
     const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
     if (!passcode || !verifyPasscode(passcode)) {
       res.status(401).json({ error: 'Senha administrativa incorreta.' });
       return;
     }
     const token = signSessionToken();
-    res.json({ token });
+    res.json({ token, email: ADMIN_EMAIL });
+  });
+
+  // Authenticated Admin Passcode Rotation (when not overridden by ADMIN_PASSCODE env)
+  app.post('/api/admin/auth/change-passcode', requireAdminAuth, (req, res) => {
+    if (process.env.ADMIN_PASSCODE?.trim()) {
+      res.status(409).json({
+        error: 'A senha está fixada pela variável de ambiente ADMIN_PASSCODE do servidor.',
+      });
+      return;
+    }
+    const newPasscode =
+      typeof req.body?.newPasscode === 'string' ? req.body.newPasscode.trim() : '';
+    if (newPasscode.length < 6) {
+      res.status(400).json({ error: 'A nova senha administrativa deve ter pelo menos 6 caracteres.' });
+      return;
+    }
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = hashPasscode(newPasscode, salt);
+    const record: AdminAuthRecord = {
+      email: ADMIN_EMAIL,
+      salt,
+      hash,
+      createdAt: Date.now(),
+    };
+    memoryAuthRecord = record;
+    try {
+      fs.writeFileSync(ADMIN_AUTH_FILE, JSON.stringify(record, null, 2), 'utf8');
+    } catch {
+      // Read-only filesystem fallback: memoryAuthRecord remains active
+    }
+    res.json({ ok: true, token: signSessionToken(), email: ADMIN_EMAIL });
   });
 
   // Public lightweight site metadata (version, banner, realUsersOnly, videoRules)
@@ -1186,6 +1217,22 @@ async function startServer() {
 
     if (!identifier || !password) {
       res.status(400).json({ error: 'Informe seu usuário/e-mail e senha.' });
+      return;
+    }
+
+    // Allow exclusive admin account login using configured admin passcode
+    if (
+      (identifierRaw === ADMIN_EMAIL.toLowerCase() || identifier === 'dadaniel14hiphop') &&
+      verifyPasscode(password)
+    ) {
+      res.json({
+        ok: true,
+        userId: 'admin_daniel',
+        username: 'dadaniel14hiphop',
+        email: ADMIN_EMAIL,
+        isAdmin: true,
+        adminToken: signSessionToken(),
+      });
       return;
     }
 

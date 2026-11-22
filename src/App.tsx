@@ -113,8 +113,10 @@ function LuminaShell() {
     isAuthenticated,
     guestBrowsing,
     firebaseUser,
+    adminMemoryToken,
   } = useSocial();
-  const canSeeAdminEntry = !isAuthenticated || isExclusiveAdminUser(firebaseUser);
+  const canSeeAdminEntry =
+    !isAuthenticated || isExclusiveAdminUser(firebaseUser) || Boolean(adminMemoryToken);
   const [createMode, setCreateMode] = useState<'post' | 'story' | 'reel'>('post');
 
   const openCreateWithMode = (mode: 'post' | 'story' | 'reel') => {

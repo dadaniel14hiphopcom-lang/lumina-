@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, type User as FirebaseUser } from 'firebase/auth';
-import { auth, googleProvider, isExclusiveAdminUser } from '../lib/firebase';
+import { ADMIN_EMAIL, auth, googleProvider, isExclusiveAdminUser } from '../lib/firebase';
 import {
   adminUpdateProfileFlagsInCloud,
   createInviteInCloud,
@@ -298,6 +298,9 @@ interface SocialContextValue {
   setGuestBrowsing: (guest: boolean) => void;
   firebaseUser: FirebaseUser | null;
   cloudConnected: boolean;
+  adminMemoryToken: string | null;
+  setAdminMemoryToken: React.Dispatch<React.SetStateAction<string | null>>;
+  activateAdminProfileSession: (token: string) => void;
   loginWithGoogle: () => Promise<{ ok: boolean; error?: string }>;
   logout: () => void;
   hasPasswordForCurrentUser: boolean;
@@ -464,6 +467,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const [guestBrowsing, setGuestBrowsing] = useState(false);
   const [credentialsVersion, setCredentialsVersion] = useState(0);
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [adminMemoryToken, setAdminMemoryToken] = useState<string | null>(null);
   const [serverSyncAvailable, setServerSyncAvailable] = useState(false);
 
   const openAuthModal = (mode: 'register' | 'login') => {
@@ -1029,12 +1033,74 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       );
       return { ok: true };
     } catch (err) {
-      const msg =
-        err instanceof Error && err.message.includes('popup-closed-by-user')
-          ? 'Login com Google cancelado.'
-          : 'Não foi possível conectar com o Google. Tente novamente.';
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code || '')
+          : '';
+      const host = typeof window !== 'undefined' ? window.location.hostname : '';
+      let msg = 'Não foi possível conectar com o Google. Tente novamente.';
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        msg = 'Janela de login do Google fechada antes de concluir.';
+      } else if (code === 'auth/popup-blocked') {
+        msg =
+          'O navegador bloqueou o pop-up do Google. Libere pop-ups para este site ou use sua senha de administrador.';
+      } else if (code === 'auth/unauthorized-domain') {
+        msg = `O domínio "${host}" precisa ser autorizado no Firebase Console (Authentication > Settings > Authorized domains) ou entre com a senha de administrador.`;
+      } else if (code === 'auth/operation-not-allowed') {
+        msg =
+          'O provedor Google não está habilitado no Firebase Authentication. Use a senha de administrador ou ative o Google no console.';
+      } else if (code === 'auth/network-request-failed') {
+        msg = 'Falha de conexão ao autenticar com o Google. Verifique sua internet ou use a senha de administrador.';
+      } else if (code) {
+        msg = `Erro no login Google (${code}). Use a senha de administrador no painel ou tente novamente.`;
+      }
       return { ok: false, error: msg };
     }
+  };
+
+  const activateAdminProfileSession = (token: string) => {
+    setAdminMemoryToken(token);
+    setState((prev) => {
+      const existing = prev.users.find(
+        (u) =>
+          !u.isDemoSeed &&
+          (u.id === 'admin_daniel' ||
+            u.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase() ||
+            u.username.toLowerCase() === 'dadaniel14hiphop')
+      );
+      const adminProfile: UserProfile = existing
+        ? {
+            ...existing,
+            email: existing.email || ADMIN_EMAIL,
+            verified: true,
+            isOnline: true,
+            isDemoSeed: false,
+          }
+        : {
+            id: 'admin_daniel',
+            username: 'dadaniel14hiphop',
+            displayName: 'Daniel (Admin)',
+            avatarUrl: SEED_USERS[0].avatarUrl,
+            coverUrl: SEED_USERS[0].coverUrl,
+            bio: 'Administrador exclusivo da rede Lumina.',
+            email: ADMIN_EMAIL,
+            verified: true,
+            isOnline: true,
+            isDemoSeed: false,
+            followers: [],
+            following: [],
+          };
+      const remaining = prev.users.filter((u) => u.id !== adminProfile.id);
+      return {
+        ...prev,
+        users: [adminProfile, ...remaining],
+        currentUserId: adminProfile.id,
+        isAuthenticated: true,
+      };
+    });
+    setGuestBrowsing(false);
+    setViewingProfileId(null);
+    setIsInviteModalOpen(false);
   };
 
   const logout = () => {
@@ -1044,6 +1110,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     setSharePostId(null);
     setGuestBrowsing(false);
     setViewingProfileId(null);
+    setAdminMemoryToken(null);
     setActiveNav('feed');
     setState((prev) => ({ ...prev, isAuthenticated: false }));
     if (auth.currentUser) {
@@ -1362,9 +1429,16 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           ok?: boolean;
           userId?: string;
           username?: string;
+          isAdmin?: boolean;
+          adminToken?: string;
           error?: string;
         };
         if (res.ok && data.ok) {
+          if (data.isAdmin && data.adminToken) {
+            activateAdminProfileSession(data.adminToken);
+            showToast('Administrador conectado: @dadaniel14hiphop');
+            return { ok: true };
+          }
           const targetUser =
             state.users.find((u) => u.id === data.userId) ||
             state.users.find(
@@ -2127,6 +2201,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         setGuestBrowsing,
         firebaseUser,
         cloudConnected,
+        adminMemoryToken,
+        setAdminMemoryToken,
+        activateAdminProfileSession,
         loginWithGoogle,
         logout,
         hasPasswordForCurrentUser,
