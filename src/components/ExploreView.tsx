@@ -14,6 +14,7 @@ import { isVideoAsset } from '../utils/media';
 import { formatCompactCount } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
+import { ProfileHoverCard } from './ProfileHoverCard';
 
 const FILTER_TABS: ('Tudo' | PostCategory)[] = [
   'Tudo',
@@ -161,25 +162,31 @@ export function ExploreView() {
           </h2>
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {matchedUsers.map((u) => (
-              <button
-                key={u.id}
-                type="button"
-                onClick={() => {
-                  addRecentSearch(u.username);
-                  openProfile(u.id);
-                }}
-                className="flex items-center gap-3 rounded-xl border border-zinc-200 bg-white p-3 text-left transition-colors hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
-              >
-                <AvatarRing src={u.avatarUrl} alt={u.username} size="sm" />
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
-                    {u.username}
-                  </p>
-                  <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
-                    {u.displayName}
-                  </p>
-                </div>
-              </button>
+              <ProfileHoverCard key={u.id} userId={u.id} className="block w-full">
+                <button
+                  type="button"
+                  onClick={() => {
+                    addRecentSearch(u.username);
+                    openProfile(u.id);
+                  }}
+                  className="flex w-full items-center gap-3 rounded-xl border border-zinc-200 bg-white p-3 text-left transition-colors hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
+                >
+                  <AvatarRing
+                    src={u.avatarUrl}
+                    alt={u.username}
+                    size="sm"
+                    showOnlineIndicator={Boolean(u.isOnline)}
+                  />
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
+                      {u.username}
+                    </p>
+                    <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
+                      {u.displayName}
+                    </p>
+                  </div>
+                </button>
+              </ProfileHoverCard>
             ))}
           </div>
         </div>

@@ -15,6 +15,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const ROOT_DIR = path.resolve(process.cwd());
 const ADMIN_AUTH_FILE = path.join(ROOT_DIR, '.lumina-admin-auth.json');
 const ADMIN_STATE_FILE = path.join(ROOT_DIR, '.lumina-admin-state.json');
+const USER_AUTH_FILE = path.join(ROOT_DIR, '.lumina-user-auth.json');
 
 const FALLBACK_RANDOM_KEY = crypto.randomBytes(32);
 
@@ -24,8 +25,18 @@ interface AdminAuthRecord {
   createdAt: number;
 }
 
+interface UserAuthRecord {
+  userId: string;
+  username: string;
+  email?: string;
+  salt: string;
+  hash: string;
+  createdAt: number;
+}
+
 let memoryAuthRecord: AdminAuthRecord | null = null;
 let memoryAdminState: IntegrationState | null = null;
+let memoryUserAuthRecords: UserAuthRecord[] | null = null;
 
 interface IntegrationState {
   aws: {
@@ -247,6 +258,38 @@ function verifyPasscode(passcode: string): boolean {
   const record = readAuthRecord();
   if (!record) return false;
   const candidate = Buffer.from(hashPasscode(passcode, record.salt), 'hex');
+  const stored = Buffer.from(record.hash, 'hex');
+  if (candidate.length !== stored.length) return false;
+  return crypto.timingSafeEqual(candidate, stored);
+}
+
+function readUserAuthRecords(): UserAuthRecord[] {
+  if (memoryUserAuthRecords) return memoryUserAuthRecords;
+  try {
+    if (fs.existsSync(USER_AUTH_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(USER_AUTH_FILE, 'utf8'));
+      if (Array.isArray(parsed)) {
+        memoryUserAuthRecords = parsed;
+        return parsed;
+      }
+    }
+  } catch {
+    // Ignore malformed user auth store
+  }
+  return [];
+}
+
+function writeUserAuthRecords(records: UserAuthRecord[]): void {
+  memoryUserAuthRecords = records;
+  try {
+    fs.writeFileSync(USER_AUTH_FILE, JSON.stringify(records, null, 2), 'utf8');
+  } catch {
+    // Keep in memory if hosting filesystem is read-only
+  }
+}
+
+function verifyUserPassword(password: string, record: UserAuthRecord): boolean {
+  const candidate = Buffer.from(hashPasscode(password, record.salt), 'hex');
   const stored = Buffer.from(record.hash, 'hex');
   if (candidate.length !== stored.length) return false;
   return crypto.timingSafeEqual(candidate, stored);
@@ -879,6 +922,14 @@ async function startServer() {
   app.post('/api/invites/accept', (req, res) => {
     const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase() : '';
     const userId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+    const username =
+      typeof req.body?.username === 'string'
+        ? req.body.username.trim().toLowerCase().replace(/^@/, '')
+        : '';
+    const email =
+      typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
     if (!code) {
       res.status(400).json({ error: 'Código de convite obrigatório.' });
       return;
@@ -893,10 +944,60 @@ async function startServer() {
       res.status(409).json({ error: 'Este convite já foi usado, revogado ou expirou.' });
       return;
     }
+
+    if (password) {
+      if (password.length < 6) {
+        res.status(400).json({ error: 'A senha de acesso deve ter pelo menos 6 caracteres.' });
+        return;
+      }
+      if (userId && username) {
+        const salt = crypto.randomBytes(16).toString('hex');
+        const hash = hashPasscode(password, salt);
+        const existing = readUserAuthRecords().filter(
+          (r) => r.userId !== userId && r.username.toLowerCase() !== username
+        );
+        existing.unshift({
+          userId,
+          username,
+          email: email || invite.email.toLowerCase(),
+          salt,
+          hash,
+          createdAt: Date.now(),
+        });
+        writeUserAuthRecords(existing);
+      }
+    }
+
     invite.status = 'accepted';
     invite.acceptedByUserId = userId || undefined;
     writeAdminState(state);
-    res.json({ ok: true, invite });
+    res.json({ ok: true, invite, grantVerified: invite.grantVerified });
+  });
+
+  app.post('/api/auth/login', (req, res) => {
+    const identifierRaw =
+      typeof req.body?.identifier === 'string' ? req.body.identifier.trim().toLowerCase() : '';
+    const identifier = identifierRaw.replace(/^@/, '');
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+    if (!identifier || !password) {
+      res.status(400).json({ error: 'Informe seu usuário/e-mail e senha.' });
+      return;
+    }
+
+    const records = readUserAuthRecords();
+    const match = records.find(
+      (r) =>
+        r.username.toLowerCase() === identifier ||
+        (r.email && r.email.toLowerCase() === identifierRaw)
+    );
+
+    if (!match || !verifyUserPassword(password, match)) {
+      res.status(401).json({ error: 'Usuário/e-mail ou senha incorretos.' });
+      return;
+    }
+
+    res.json({ ok: true, userId: match.userId, username: match.username });
   });
 
   // Download Complete Self-Hosted WordPress Kit (.zip)

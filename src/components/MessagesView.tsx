@@ -162,10 +162,15 @@ export function MessagesView() {
     openProfile,
     showToast,
     siteMeta,
+    pendingChatUserId,
+    setPendingChatUserId,
   } = useSocial();
 
   const [selectedRecipientId, setSelectedRecipientId] = useState<string | null>(
     () => {
+      if (pendingChatUserId && pendingChatUserId !== currentUser.id) {
+        return pendingChatUserId;
+      }
       const first = threads.find((t) =>
         t.participantIds.includes(currentUser.id)
       );
@@ -173,6 +178,13 @@ export function MessagesView() {
       return first.participantIds.find((id) => id !== currentUser.id) || null;
     }
   );
+
+  useEffect(() => {
+    if (pendingChatUserId && pendingChatUserId !== currentUser.id) {
+      setSelectedRecipientId(pendingChatUserId);
+      setPendingChatUserId(null);
+    }
+  }, [pendingChatUserId, currentUser.id, setPendingChatUserId]);
   const [search, setSearch] = useState('');
   const [draft, setDraft] = useState('');
   const messagesEndRef = useRef<HTMLDivElement | null>(null);

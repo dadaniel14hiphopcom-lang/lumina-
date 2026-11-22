@@ -18,6 +18,7 @@ import { isVideoAsset } from '../utils/media';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
+import { ProfileHoverCard } from './ProfileHoverCard';
 import { RichCaption } from './RichCaption';
 
 interface PostCardProps {
@@ -94,26 +95,31 @@ export function PostCard({ post }: PostCardProps) {
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-3 sm:px-4">
         <div className="flex min-w-0 items-center gap-3">
-          <AvatarRing
-            src={author.avatarUrl}
-            alt={author.username}
-            size="sm"
-            hasStory={hasStory}
-            hasUnseenStory={hasUnseenStory}
-            onClick={() => {
-              if (hasStory) setActiveStoryAuthorId(author.id);
-              else openProfile(author.id);
-            }}
-          />
+          <ProfileHoverCard userId={author.id}>
+            <AvatarRing
+              src={author.avatarUrl}
+              alt={author.username}
+              size="sm"
+              hasStory={hasStory}
+              hasUnseenStory={hasUnseenStory}
+              showOnlineIndicator={Boolean(author.isOnline)}
+              onClick={() => {
+                if (hasStory) setActiveStoryAuthorId(author.id);
+                else openProfile(author.id);
+              }}
+            />
+          </ProfileHoverCard>
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => openProfile(author.id)}
-                className="truncate text-sm font-semibold text-zinc-950 hover:opacity-75 dark:text-zinc-100"
-              >
-                {author.username}
-              </button>
+              <ProfileHoverCard userId={author.id}>
+                <button
+                  type="button"
+                  onClick={() => openProfile(author.id)}
+                  className="truncate text-sm font-semibold text-zinc-950 hover:opacity-75 dark:text-zinc-100"
+                >
+                  {author.username}
+                </button>
+              </ProfileHoverCard>
               {author.verified && (
                 <BadgeCheck className="h-4 w-4 shrink-0 text-sky-500" aria-label="Perfil verificado" />
               )}
@@ -361,13 +367,15 @@ export function PostCard({ post }: PostCardProps) {
             {firstLikedFriend && post.likes.length > 1 ? (
               <p>
                 Curtido por{' '}
-                <button
-                  type="button"
-                  onClick={() => openProfile(firstLikedFriend.id)}
-                  className="font-semibold hover:underline"
-                >
-                  {firstLikedFriend.username}
-                </button>{' '}
+                <ProfileHoverCard userId={firstLikedFriend.id}>
+                  <button
+                    type="button"
+                    onClick={() => openProfile(firstLikedFriend.id)}
+                    className="font-semibold hover:underline"
+                  >
+                    {firstLikedFriend.username}
+                  </button>
+                </ProfileHoverCard>{' '}
                 e{' '}
                 <button
                   type="button"
@@ -389,13 +397,15 @@ export function PostCard({ post }: PostCardProps) {
 
         {post.caption && (
           <div className="text-sm leading-relaxed text-zinc-900 dark:text-zinc-100">
-            <button
-              type="button"
-              onClick={() => openProfile(author.id)}
-              className="mr-1.5 font-semibold hover:opacity-75"
-            >
-              {author.username}
-            </button>
+            <ProfileHoverCard userId={author.id}>
+              <button
+                type="button"
+                onClick={() => openProfile(author.id)}
+                className="mr-1.5 font-semibold hover:opacity-75"
+              >
+                {author.username}
+              </button>
+            </ProfileHoverCard>
             <span className={expandedCaption ? '' : 'line-clamp-2'}>
               <RichCaption text={post.caption} />
             </span>

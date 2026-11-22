@@ -3,6 +3,7 @@ import { useSocial } from '../context/SocialContext';
 import { formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
+import { ProfileHoverCard } from './ProfileHoverCard';
 
 export function NotificationsView() {
   const {
@@ -55,20 +56,25 @@ export function NotificationsView() {
                 className="flex items-center justify-between gap-3 py-3.5"
               >
                 <div className="flex min-w-0 items-center gap-3">
-                  <AvatarRing
-                    src={actor.avatarUrl}
-                    alt={actor.username}
-                    size="md"
-                    onClick={() => openProfile(actor.id)}
-                  />
-                  <div className="min-w-0 text-sm leading-snug text-zinc-900 dark:text-zinc-100">
-                    <button
-                      type="button"
+                  <ProfileHoverCard userId={actor.id}>
+                    <AvatarRing
+                      src={actor.avatarUrl}
+                      alt={actor.username}
+                      size="md"
+                      showOnlineIndicator={Boolean(actor.isOnline)}
                       onClick={() => openProfile(actor.id)}
-                      className="mr-1.5 font-semibold hover:underline"
-                    >
-                      {actor.username}
-                    </button>
+                    />
+                  </ProfileHoverCard>
+                  <div className="min-w-0 text-sm leading-snug text-zinc-900 dark:text-zinc-100">
+                    <ProfileHoverCard userId={actor.id}>
+                      <button
+                        type="button"
+                        onClick={() => openProfile(actor.id)}
+                        className="mr-1.5 font-semibold hover:underline"
+                      >
+                        {actor.username}
+                      </button>
+                    </ProfileHoverCard>
                     <span className="text-zinc-700 dark:text-zinc-300">
                       {item.type === 'like' && 'curtiu sua publicação.'}
                       {item.type === 'comment' &&

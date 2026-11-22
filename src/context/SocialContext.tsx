@@ -40,7 +40,108 @@ export interface PendingInviteMeta {
 
 const STORAGE_KEY = 'lumina_social_v1';
 const INVITES_KEY = 'lumina_invites_v1';
+const CREDENTIALS_KEY = 'lumina_user_credentials_v1';
 const REALTIME_CHANNEL = 'lumina_realtime_sync_v1';
+
+interface LocalUserCredential {
+  userId: string;
+  username: string;
+  email?: string;
+  salt: string;
+  hash: string;
+  createdAt: number;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.length % 2 === 0 ? hex : `0${hex}`;
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16) || 0;
+  }
+  return out;
+}
+
+function generateSaltHex(): string {
+  const buf = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(buf);
+  } else {
+    for (let i = 0; i < buf.length; i++) {
+      buf[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return bytesToHex(buf);
+}
+
+async function derivePasswordHash(password: string, saltHex: string): Promise<string> {
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw',
+      enc.encode(password),
+      'PBKDF2',
+      false,
+      ['deriveBits']
+    );
+    const bits = await crypto.subtle.deriveBits(
+      {
+        name: 'PBKDF2',
+        salt: hexToBytes(saltHex) as BufferSource,
+        iterations: 100_000,
+        hash: 'SHA-256',
+      },
+      keyMaterial,
+      256
+    );
+    return `pbkdf2:${bytesToHex(new Uint8Array(bits))}`;
+  }
+  // Fallback only if subtle crypto is unavailable in a non-secure context
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  const input = `${saltHex}:${password}`;
+  for (let i = 0; i < input.length; i++) {
+    const c = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b) >>> 0;
+  }
+  return `fb:${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function loadLocalCredentials(): LocalUserCredential[] {
+  try {
+    const raw = localStorage.getItem(CREDENTIALS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return [];
+}
+
+function saveLocalCredentials(records: LocalUserCredential[]): void {
+  try {
+    localStorage.setItem(CREDENTIALS_KEY, JSON.stringify(records));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
 
 export const DEFAULT_VIDEO_RULES: VideoRulesConfig = {
   maxVideoSizeMB: 25,
@@ -179,11 +280,20 @@ interface SocialContextValue {
     username: string;
     displayName: string;
     email: string;
+    password: string;
     bio: string;
     avatarUrl?: string;
     coverUrl?: string;
   }) => Promise<{ ok: boolean; error?: string }>;
+  loginWithCredentials: (
+    identifier: string,
+    password: string
+  ) => Promise<{ ok: boolean; error?: string }>;
   purgeDemoUsers: () => void;
+
+  pendingChatUserId: string | null;
+  setPendingChatUserId: (userId: string | null) => void;
+  openChatWithUser: (userId: string) => void;
 
   setActiveNav: (nav: NavSection) => void;
   openProfile: (userId: string) => void;
@@ -294,6 +404,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const [activeStoryAuthorId, setActiveStoryAuthorId] = useState<string | null>(null);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [sharePostId, setSharePostId] = useState<string | null>(null);
+  const [pendingChatUserId, setPendingChatUserId] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [siteMeta, setSiteMeta] = useState<SiteMeta>(DEFAULT_SITE_META);
 
@@ -561,6 +672,11 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     setActiveNav('profile');
   };
 
+  const openChatWithUser = (userId: string) => {
+    setPendingChatUserId(userId);
+    setActiveNav('messages');
+  };
+
   const openHashtagInExplore = (tag: string) => {
     setExploreQuery(tag);
     setSelectedPostId(null);
@@ -655,6 +771,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     username: string;
     displayName: string;
     email: string;
+    password: string;
     bio: string;
     avatarUrl?: string;
     coverUrl?: string;
@@ -673,11 +790,17 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       return { ok: false, error: 'Escolha um @usuario com pelo menos 3 caracteres.' };
     }
 
+    const password = payload.password || '';
+    if (password.length < 6) {
+      return { ok: false, error: 'Crie uma senha de acesso com pelo menos 6 caracteres.' };
+    }
+
     if (state.users.some((u) => u.username.toLowerCase() === cleanHandle)) {
       return { ok: false, error: `O nome @${cleanHandle} já está em uso.` };
     }
 
     const newId = `user_${Date.now()}`;
+    const cleanEmail = payload.email.trim().toLowerCase();
     let grantVerified = false;
     const localMatch = invites.find((i) => i.code.toUpperCase() === cleanCode);
 
@@ -703,7 +826,13 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         const res = await fetch('/api/invites/accept', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code: cleanCode, userId: newId }),
+          body: JSON.stringify({
+            code: cleanCode,
+            userId: newId,
+            username: cleanHandle,
+            email: cleanEmail || undefined,
+            password,
+          }),
         });
         const contentType = res.headers.get('content-type') || '';
         if (!contentType.includes('application/json')) {
@@ -713,24 +842,48 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           ok?: boolean;
           error?: string;
           grantVerified?: boolean;
+          invite?: { grantVerified?: boolean };
         };
         if (!res.ok || !data.ok) {
           return { ok: false, error: data.error || 'Código de convite inválido.' };
         }
-        grantVerified = Boolean(data.grantVerified);
+        grantVerified = Boolean(data.grantVerified ?? data.invite?.grantVerified);
       } catch {
         return { ok: false, error: 'Código de convite não encontrado ou inválido.' };
       }
     }
 
     // Notify server too if localMatch existed and server is reachable
-    if (localMatch) {
+    if (localMatch || pendingInviteMeta) {
       fetch('/api/invites/accept', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: cleanCode, userId: newId }),
+        body: JSON.stringify({
+          code: cleanCode,
+          userId: newId,
+          username: cleanHandle,
+          email: cleanEmail || localMatch?.email || pendingInviteMeta?.email,
+          password,
+        }),
       }).catch(() => {});
     }
+
+    // Persist salted PBKDF2 password hash locally in isolated store (never on UserProfile)
+    const salt = generateSaltHex();
+    const hash = await derivePasswordHash(password, salt);
+    const resolvedEmail = cleanEmail || localMatch?.email || pendingInviteMeta?.email;
+    const existingCreds = loadLocalCredentials().filter(
+      (c) => c.userId !== newId && c.username.toLowerCase() !== cleanHandle
+    );
+    existingCreds.unshift({
+      userId: newId,
+      username: cleanHandle,
+      email: resolvedEmail?.toLowerCase(),
+      salt,
+      hash,
+      createdAt: Date.now(),
+    });
+    saveLocalCredentials(existingCreds);
 
     const newUser: UserProfile = {
       id: newId,
@@ -739,7 +892,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       avatarUrl: payload.avatarUrl || SEED_USERS[0].avatarUrl,
       coverUrl: payload.coverUrl || SEED_USERS[0].coverUrl,
       bio: payload.bio.trim() || 'Novo membro convidado na Lumina.',
-      email: payload.email.trim() || localMatch?.email || pendingInviteMeta?.email,
+      email: resolvedEmail,
       verified: grantVerified,
       isOnline: true,
       isDemoSeed: false,
@@ -778,6 +931,78 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
     showToast(`Bem-vindo(a), @${cleanHandle}! Cadastro por convite concluído.`);
     return { ok: true };
+  };
+
+  const loginWithCredentials = async (
+    identifier: string,
+    password: string
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const rawId = identifier.trim().toLowerCase();
+    const cleanHandle = rawId.replace(/^@/, '');
+    if (!cleanHandle || !password) {
+      return { ok: false, error: 'Informe seu @usuário (ou e-mail) e senha de acesso.' };
+    }
+
+    const creds = loadLocalCredentials();
+    const localCred = creds.find(
+      (c) =>
+        c.username.toLowerCase() === cleanHandle ||
+        (c.email && c.email.toLowerCase() === rawId)
+    );
+
+    if (localCred) {
+      const candidateHash = await derivePasswordHash(password, localCred.salt);
+      if (constantTimeEqual(candidateHash, localCred.hash)) {
+        const targetUser =
+          state.users.find((u) => u.id === localCred.userId) ||
+          state.users.find((u) => u.username.toLowerCase() === localCred.username.toLowerCase());
+        if (targetUser) {
+          setState((prev) => ({ ...prev, currentUserId: targetUser.id }));
+          setViewingProfileId(null);
+          setIsInviteModalOpen(false);
+          showToast(`Conectado como @${targetUser.username}`);
+          return { ok: true };
+        }
+      }
+      return { ok: false, error: 'Usuário/e-mail ou senha incorretos.' };
+    }
+
+    // Fallback to backend verification when available
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier: rawId, password }),
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const data = (await res.json()) as {
+          ok?: boolean;
+          userId?: string;
+          username?: string;
+          error?: string;
+        };
+        if (res.ok && data.ok) {
+          const targetUser =
+            state.users.find((u) => u.id === data.userId) ||
+            state.users.find(
+              (u) => data.username && u.username.toLowerCase() === data.username.toLowerCase()
+            );
+          if (targetUser) {
+            setState((prev) => ({ ...prev, currentUserId: targetUser.id }));
+            setViewingProfileId(null);
+            setIsInviteModalOpen(false);
+            showToast(`Conectado como @${targetUser.username}`);
+            return { ok: true };
+          }
+        }
+        return { ok: false, error: data.error || 'Usuário/e-mail ou senha incorretos.' };
+      }
+    } catch {
+      // Static hosting without backend auth endpoint
+    }
+
+    return { ok: false, error: 'Usuário/e-mail ou senha incorretos.' };
   };
 
   const purgeDemoUsers = () => {
@@ -1385,7 +1610,11 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         createInvite,
         revokeInvite,
         registerWithInvite,
+        loginWithCredentials,
         purgeDemoUsers,
+        pendingChatUserId,
+        setPendingChatUserId,
+        openChatWithUser,
         setActiveNav: (nav) => {
           if (nav === 'profile') setViewingProfileId(currentUser.id);
           setActiveNav(nav);

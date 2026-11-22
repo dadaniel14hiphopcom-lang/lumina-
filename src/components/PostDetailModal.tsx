@@ -15,6 +15,7 @@ import { isVideoAsset } from '../utils/media';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
+import { ProfileHoverCard } from './ProfileHoverCard';
 import { RichCaption } from './RichCaption';
 
 export function PostDetailModal() {
@@ -140,27 +141,37 @@ export function PostDetailModal() {
         <div className="flex min-h-0 flex-1 flex-col md:w-[400px] md:flex-none md:border-l md:border-zinc-200 dark:md:border-zinc-800">
           {/* Author Header */}
           <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedPostId(null);
-                openProfile(author.id);
-              }}
-              className="flex items-center gap-3 text-left"
+            <ProfileHoverCard
+              userId={author.id}
+              onBeforeNavigate={() => setSelectedPostId(null)}
             >
-              <AvatarRing src={author.avatarUrl} alt={author.username} size="sm" />
-              <div>
-                <div className="flex items-center gap-1">
-                  <span className="text-sm font-semibold text-zinc-950 dark:text-zinc-100">
-                    {author.username}
-                  </span>
-                  {author.verified && <BadgeCheck className="h-4 w-4 text-sky-500" />}
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedPostId(null);
+                  openProfile(author.id);
+                }}
+                className="flex items-center gap-3 text-left"
+              >
+                <AvatarRing
+                  src={author.avatarUrl}
+                  alt={author.username}
+                  size="sm"
+                  showOnlineIndicator={Boolean(author.isOnline)}
+                />
+                <div>
+                  <div className="flex items-center gap-1">
+                    <span className="text-sm font-semibold text-zinc-950 dark:text-zinc-100">
+                      {author.username}
+                    </span>
+                    {author.verified && <BadgeCheck className="h-4 w-4 text-sky-500" />}
+                  </div>
+                  {post.location && (
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">{post.location}</p>
+                  )}
                 </div>
-                {post.location && (
-                  <p className="text-xs text-zinc-500 dark:text-zinc-400">{post.location}</p>
-                )}
-              </div>
-            </button>
+              </button>
+            </ProfileHoverCard>
 
             {isOwn && (
               <button
@@ -227,16 +238,21 @@ export function PostDetailModal() {
                       />
                       <div className="min-w-0 flex-1">
                         <p className="text-sm leading-snug text-zinc-900 dark:text-zinc-100">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setSelectedPostId(null);
-                              openProfile(cUser.id);
-                            }}
-                            className="mr-1.5 font-semibold hover:underline"
+                          <ProfileHoverCard
+                            userId={cUser.id}
+                            onBeforeNavigate={() => setSelectedPostId(null)}
                           >
-                            {cUser.username}
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedPostId(null);
+                                openProfile(cUser.id);
+                              }}
+                              className="mr-1.5 font-semibold hover:underline"
+                            >
+                              {cUser.username}
+                            </button>
+                          </ProfileHoverCard>
                           <RichCaption text={comment.text} />
                         </p>
                         <div className="mt-1 flex items-center gap-3 text-xs text-zinc-500 dark:text-zinc-400">
