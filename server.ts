@@ -8,6 +8,17 @@ import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import { createZipBuffer } from './server/zip.ts';
 import type { ZipEntryInput } from './server/zip.ts';
+import {
+  buildReelObjectKey,
+  getAwsCredentialsFromEnv,
+  getSignedReelDownloadUrl,
+  getSignedReelUploadUrl,
+  headS3Bucket,
+  isSafeS3ObjectKey,
+  resolveAwsS3Config,
+  resolveReelPlaybackUrl,
+  uploadReelToS3,
+} from './server/s3Service.ts';
 
 dotenv.config();
 
@@ -786,266 +797,13 @@ const EXT_TO_CONTENT_TYPE: Record<string, string> = {
   gif: 'image/gif',
 };
 
-function awsEncodeRfc3986(input: string): string {
-  return encodeURIComponent(input).replace(
-    /[!'()*]/g,
-    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`
-  );
-}
-
-function encodeS3ObjectKey(key: string): string {
-  const cleanSegments = key
-    .split('/')
-    .map((s) => s.trim())
-    .filter((s) => s && s !== '.' && s !== '..');
-  return cleanSegments.map(awsEncodeRfc3986).join('/');
-}
-
-function sha256Hex(data: Buffer | string): string {
-  return crypto.createHash('sha256').update(data).digest('hex');
-}
-
-function hmacSha256(key: Buffer | string, data: string): Buffer {
-  return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
-}
-
-function getAwsSigningKey(
-  secretAccessKey: string,
-  dateStamp: string,
-  region: string,
-  service = 's3'
-): Buffer {
-  const kDate = hmacSha256(`AWS4${secretAccessKey}`, dateStamp);
-  const kRegion = hmacSha256(kDate, region);
-  const kService = hmacSha256(kRegion, service);
-  return hmacSha256(kService, 'aws4_request');
-}
-
-function getAwsEnvCredentials(): {
-  accessKeyId: string;
-  secretAccessKey: string;
-  sessionToken?: string;
-} | null {
-  const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
-  const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
-  const sessionToken = process.env.AWS_SESSION_TOKEN?.trim() || undefined;
-  if (!accessKeyId || !secretAccessKey) return null;
-  return { accessKeyId, secretAccessKey, sessionToken };
-}
-
 function resolveAwsMediaTarget(state: IntegrationState) {
-  const region = sanitizeIdentifier(
-    process.env.AWS_REGION?.trim() || state.aws.region,
-    'sa-east-1'
-  );
-  const bucket = sanitizeHost(
-    process.env.AWS_S3_BUCKET?.trim() || state.aws.bucket,
-    'lumina-media-prod'
-  );
-  const cloudFrontDomain = sanitizeHost(
-    process.env.AWS_CLOUDFRONT_DOMAIN?.trim() || state.aws.cloudFrontDomain,
-    ''
-  );
-  const hasRealCloudFront =
-    state.aws.cloudFrontEnabled &&
-    Boolean(cloudFrontDomain) &&
-    (Boolean(process.env.AWS_CLOUDFRONT_DOMAIN?.trim()) ||
-      cloudFrontDomain !== 'cdn.lumina.social');
-  return { region, bucket, cloudFrontDomain, hasRealCloudFront };
-}
-
-async function uploadBufferToAwsS3(params: {
-  region: string;
-  bucket: string;
-  key: string;
-  body: Buffer;
-  contentType: string;
-  accessKeyId: string;
-  secretAccessKey: string;
-  sessionToken?: string;
-}): Promise<{ ok: boolean; status: number; message?: string }> {
-  const host = `${params.bucket}.s3.${params.region}.amazonaws.com`;
-  const encodedKey = encodeS3ObjectKey(params.key);
-  const canonicalUri = `/${encodedKey}`;
-  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
-  const dateStamp = amzDate.slice(0, 8);
-  const payloadHash = sha256Hex(params.body);
-
-  const canonicalHeadersList: [string, string][] = [
-    ['host', host],
-    ['x-amz-content-sha256', payloadHash],
-    ['x-amz-date', amzDate],
-  ];
-  if (params.sessionToken) {
-    canonicalHeadersList.push(['x-amz-security-token', params.sessionToken]);
-  }
-  canonicalHeadersList.sort((a, b) => a[0].localeCompare(b[0]));
-
-  const canonicalHeaders = canonicalHeadersList.map(([k, v]) => `${k}:${v}\n`).join('');
-  const signedHeaders = canonicalHeadersList.map(([k]) => k).join(';');
-  const canonicalRequest = [
-    'PUT',
-    canonicalUri,
-    '',
-    canonicalHeaders,
-    signedHeaders,
-    payloadHash,
-  ].join('\n');
-
-  const credentialScope = `${dateStamp}/${params.region}/s3/aws4_request`;
-  const stringToSign = [
-    'AWS4-HMAC-SHA256',
-    amzDate,
-    credentialScope,
-    sha256Hex(canonicalRequest),
-  ].join('\n');
-
-  const signingKey = getAwsSigningKey(params.secretAccessKey, dateStamp, params.region, 's3');
-  const signature = crypto
-    .createHmac('sha256', signingKey)
-    .update(stringToSign, 'utf8')
-    .digest('hex');
-
-  const authorization = `AWS4-HMAC-SHA256 Credential=${params.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-
-  const headers: Record<string, string> = {
-    'Content-Type': params.contentType,
-    'Content-Length': String(params.body.length),
-    'Cache-Control': 'public, max-age=31536000, immutable',
-    'x-amz-content-sha256': payloadHash,
-    'x-amz-date': amzDate,
-    Authorization: authorization,
-  };
-  if (params.sessionToken) {
-    headers['x-amz-security-token'] = params.sessionToken;
-  }
-
-  const resp = await fetch(`https://${host}${canonicalUri}`, {
-    method: 'PUT',
-    headers,
-    body: new Uint8Array(params.body),
-    signal: AbortSignal.timeout(45_000),
+  return resolveAwsS3Config({
+    region: state.aws.region,
+    bucket: state.aws.bucket,
+    cloudFrontDomain: state.aws.cloudFrontDomain,
+    cloudFrontEnabled: state.aws.cloudFrontEnabled,
   });
-
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => '');
-    return {
-      ok: false,
-      status: resp.status,
-      message: errText.slice(0, 240) || `HTTP ${resp.status}`,
-    };
-  }
-  return { ok: true, status: resp.status };
-}
-
-async function headAwsS3Bucket(params: {
-  region: string;
-  bucket: string;
-  accessKeyId: string;
-  secretAccessKey: string;
-  sessionToken?: string;
-}): Promise<{ ok: boolean; status: number }> {
-  const host = `${params.bucket}.s3.${params.region}.amazonaws.com`;
-  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
-  const dateStamp = amzDate.slice(0, 8);
-  const payloadHash = sha256Hex('');
-
-  const canonicalHeadersList: [string, string][] = [
-    ['host', host],
-    ['x-amz-content-sha256', payloadHash],
-    ['x-amz-date', amzDate],
-  ];
-  if (params.sessionToken) {
-    canonicalHeadersList.push(['x-amz-security-token', params.sessionToken]);
-  }
-  canonicalHeadersList.sort((a, b) => a[0].localeCompare(b[0]));
-
-  const canonicalHeaders = canonicalHeadersList.map(([k, v]) => `${k}:${v}\n`).join('');
-  const signedHeaders = canonicalHeadersList.map(([k]) => k).join(';');
-  const canonicalRequest = ['HEAD', '/', '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
-  const credentialScope = `${dateStamp}/${params.region}/s3/aws4_request`;
-  const stringToSign = [
-    'AWS4-HMAC-SHA256',
-    amzDate,
-    credentialScope,
-    sha256Hex(canonicalRequest),
-  ].join('\n');
-  const signingKey = getAwsSigningKey(params.secretAccessKey, dateStamp, params.region, 's3');
-  const signature = crypto
-    .createHmac('sha256', signingKey)
-    .update(stringToSign, 'utf8')
-    .digest('hex');
-
-  const headers: Record<string, string> = {
-    'x-amz-content-sha256': payloadHash,
-    'x-amz-date': amzDate,
-    Authorization: `AWS4-HMAC-SHA256 Credential=${params.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
-  };
-  if (params.sessionToken) {
-    headers['x-amz-security-token'] = params.sessionToken;
-  }
-
-  const resp = await fetch(`https://${host}/`, {
-    method: 'HEAD',
-    headers,
-    signal: AbortSignal.timeout(8000),
-  });
-  return { ok: resp.ok, status: resp.status };
-}
-
-function createAwsS3PresignedGetUrl(params: {
-  region: string;
-  bucket: string;
-  key: string;
-  accessKeyId: string;
-  secretAccessKey: string;
-  sessionToken?: string;
-  expiresSec?: number;
-}): string {
-  const expiresSec = params.expiresSec ?? 3600;
-  const host = `${params.bucket}.s3.${params.region}.amazonaws.com`;
-  const canonicalUri = `/${encodeS3ObjectKey(params.key)}`;
-  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
-  const dateStamp = amzDate.slice(0, 8);
-  const credentialScope = `${dateStamp}/${params.region}/s3/aws4_request`;
-
-  const queryEntries: [string, string][] = [
-    ['X-Amz-Algorithm', 'AWS4-HMAC-SHA256'],
-    ['X-Amz-Credential', `${params.accessKeyId}/${credentialScope}`],
-    ['X-Amz-Date', amzDate],
-    ['X-Amz-Expires', String(expiresSec)],
-    ['X-Amz-SignedHeaders', 'host'],
-  ];
-  if (params.sessionToken) {
-    queryEntries.push(['X-Amz-Security-Token', params.sessionToken]);
-  }
-  queryEntries.sort((a, b) => a[0].localeCompare(b[0]));
-
-  const canonicalQuery = queryEntries
-    .map(([k, v]) => `${awsEncodeRfc3986(k)}=${awsEncodeRfc3986(v)}`)
-    .join('&');
-  const canonicalRequest = [
-    'GET',
-    canonicalUri,
-    canonicalQuery,
-    `host:${host}\n`,
-    'host',
-    'UNSIGNED-PAYLOAD',
-  ].join('\n');
-
-  const stringToSign = [
-    'AWS4-HMAC-SHA256',
-    amzDate,
-    credentialScope,
-    sha256Hex(canonicalRequest),
-  ].join('\n');
-  const signingKey = getAwsSigningKey(params.secretAccessKey, dateStamp, params.region, 's3');
-  const signature = crypto
-    .createHmac('sha256', signingKey)
-    .update(stringToSign, 'utf8')
-    .digest('hex');
-
-  return `https://${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`;
 }
 
 async function startServer() {
@@ -1055,7 +813,7 @@ async function startServer() {
   // Media delivery capability check
   app.get('/api/media/status', (_req, res) => {
     const state = readAdminState();
-    const creds = getAwsEnvCredentials();
+    const creds = getAwsCredentialsFromEnv();
     const target = resolveAwsMediaTarget(state);
     const awsReady = Boolean(creds && state.aws.s3Enabled);
     res.json({
@@ -1067,6 +825,92 @@ async function startServer() {
       region: target.region,
       bucket: target.bucket,
       maxVideoSizeMB: state.site.videoRules.maxVideoSizeMB,
+    });
+  });
+
+  // Generate an AWS S3 SigV4 pre-signed PUT URL for direct Reel uploads (requires AWS env credentials)
+  app.post('/api/media/presign-upload', (req, res) => {
+    const state = readAdminState();
+    const creds = getAwsCredentialsFromEnv();
+    if (!creds || !state.aws.s3Enabled) {
+      res.status(503).json({
+        error:
+          'AWS S3 não configurado no servidor. Defina AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY ou use POST /api/media/upload.',
+      });
+      return;
+    }
+
+    const rawType = String(req.body?.contentType || '')
+      .split(';')[0]
+      .trim()
+      .toLowerCase();
+    const spec = ALLOWED_MEDIA_MIME_EXT[rawType];
+    if (!spec) {
+      res.status(415).json({
+        error:
+          'Formato de mídia não suportado. Envie MP4, WebM, MOV, M4V, JPG, PNG ou WebP.',
+      });
+      return;
+    }
+
+    const sizeBytes = Number(req.body?.sizeBytes || 0);
+    const maxVideoBytes = state.site.videoRules.maxVideoSizeMB * 1024 * 1024;
+    const maxImageBytes = 15 * 1024 * 1024;
+    const maxAllowedBytes = spec.kind === 'video' ? maxVideoBytes : maxImageBytes;
+    if (sizeBytes > 0 && sizeBytes > maxAllowedBytes) {
+      res.status(413).json({
+        error: `Arquivo excede o limite de ${
+          spec.kind === 'video' ? `${state.site.videoRules.maxVideoSizeMB} MB` : '15 MB'
+        }.`,
+      });
+      return;
+    }
+
+    const target = resolveAwsMediaTarget(state);
+    const objectKey = buildReelObjectKey(spec.ext, spec.kind);
+    const presigned = getSignedReelUploadUrl({
+      key: objectKey,
+      contentType: rawType,
+      expiresSec: 300,
+      config: target,
+    });
+
+    res.json({
+      ok: true,
+      ...presigned,
+      playbackUrl: resolveReelPlaybackUrl(objectKey, target),
+      bucket: target.bucket,
+      region: target.region,
+    });
+  });
+
+  // Generate a temporary AWS S3 SigV4 pre-signed GET URL for an existing Reel/media object
+  app.get('/api/media/s3-signed-url', (req, res) => {
+    const rawKey = typeof req.query.key === 'string' ? req.query.key.trim() : '';
+    if (!isSafeS3ObjectKey(rawKey) || !/^(reels|media)\//.test(rawKey)) {
+      res.status(400).json({ error: 'Chave S3 inválida.' });
+      return;
+    }
+    if (!getAwsCredentialsFromEnv()) {
+      res.status(503).json({ error: 'Credenciais AWS não configuradas no servidor.' });
+      return;
+    }
+    const expiresInput = Number(req.query.expiresSec || 3600);
+    const expiresSec = Number.isFinite(expiresInput)
+      ? Math.min(86400, Math.max(60, Math.round(expiresInput)))
+      : 3600;
+    const state = readAdminState();
+    const target = resolveAwsMediaTarget(state);
+    const signedUrl = getSignedReelDownloadUrl({
+      key: rawKey,
+      expiresSec,
+      config: target,
+    });
+    res.json({
+      ok: true,
+      key: rawKey,
+      signedUrl,
+      expiresSec,
     });
   });
 
@@ -1110,32 +954,21 @@ async function startServer() {
         return;
       }
 
-      const now = new Date();
-      const ym = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
-      const uniqueId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
-      const fileName = `${uniqueId}.${spec.ext}`;
-      const folder = spec.kind === 'video' ? 'reels' : 'media';
-      const objectKey = `${folder}/${ym}/${fileName}`;
-
-      const awsCreds = getAwsEnvCredentials();
+      const objectKey = buildReelObjectKey(spec.ext, spec.kind);
+      const fileName = path.posix.basename(objectKey);
+      const awsCreds = getAwsCredentialsFromEnv();
       const awsTarget = resolveAwsMediaTarget(state);
 
       if (awsCreds && state.aws.s3Enabled) {
         try {
-          const uploadResult = await uploadBufferToAwsS3({
-            region: awsTarget.region,
-            bucket: awsTarget.bucket,
+          const uploadResult = await uploadReelToS3({
             key: objectKey,
             body: bodyBuffer,
             contentType: rawType,
-            accessKeyId: awsCreds.accessKeyId,
-            secretAccessKey: awsCreds.secretAccessKey,
-            sessionToken: awsCreds.sessionToken,
+            config: awsTarget,
           });
           if (uploadResult.ok) {
-            const deliveryUrl = awsTarget.hasRealCloudFront
-              ? `https://${awsTarget.cloudFrontDomain}/${encodeS3ObjectKey(objectKey)}`
-              : `/api/media/s3/${objectKey}`;
+            const deliveryUrl = resolveReelPlaybackUrl(objectKey, awsTarget);
             res.json({
               ok: true,
               url: deliveryUrl,
@@ -1180,25 +1013,20 @@ async function startServer() {
   // Redirect to a short-lived AWS S3 SigV4 presigned GET URL (supports private buckets & Range seeking)
   app.get('/api/media/s3/*', (req, res) => {
     const rawKey = String((req.params as Record<string, string>)[0] || '').trim();
-    if (!rawKey || rawKey.includes('..') || !/^[a-zA-Z0-9/_.-]{4,240}$/.test(rawKey)) {
+    if (!isSafeS3ObjectKey(rawKey)) {
       res.status(400).json({ error: 'Chave S3 inválida.' });
       return;
     }
-    const awsCreds = getAwsEnvCredentials();
-    if (!awsCreds) {
+    if (!getAwsCredentialsFromEnv()) {
       res.status(503).json({ error: 'Credenciais AWS não configuradas no servidor.' });
       return;
     }
     const state = readAdminState();
     const target = resolveAwsMediaTarget(state);
-    const signedUrl = createAwsS3PresignedGetUrl({
-      region: target.region,
-      bucket: target.bucket,
+    const signedUrl = getSignedReelDownloadUrl({
       key: rawKey,
-      accessKeyId: awsCreds.accessKeyId,
-      secretAccessKey: awsCreds.secretAccessKey,
-      sessionToken: awsCreds.sessionToken,
       expiresSec: 3600,
+      config: target,
     });
     res.setHeader('Cache-Control', 'private, max-age=3000');
     res.redirect(302, signedUrl);
@@ -1517,7 +1345,7 @@ async function startServer() {
     const state = readAdminState();
 
     if (provider === 'aws') {
-      const awsCreds = getAwsEnvCredentials();
+      const awsCreds = getAwsCredentialsFromEnv();
       const target = resolveAwsMediaTarget(state);
       state.aws.lastVerifiedAt = Date.now();
       writeAdminState(state);
@@ -1532,13 +1360,7 @@ async function startServer() {
       }
 
       try {
-        const probe = await headAwsS3Bucket({
-          region: target.region,
-          bucket: target.bucket,
-          accessKeyId: awsCreds.accessKeyId,
-          secretAccessKey: awsCreds.secretAccessKey,
-          sessionToken: awsCreds.sessionToken,
-        });
+        const probe = await headS3Bucket(target);
         res.json({
           ok: true,
           reachable: probe.ok,
