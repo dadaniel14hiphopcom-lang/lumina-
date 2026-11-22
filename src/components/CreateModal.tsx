@@ -92,6 +92,8 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
   const [isPublishing, setIsPublishing] = useState(false);
   const [uploadingMedia, setUploadingMedia] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStage, setUploadStage] = useState('');
+  const [uploadBytes, setUploadBytes] = useState<{ loaded: number; total: number } | null>(null);
   const [mediaDeliveryStatus, setMediaDeliveryStatus] = useState<MediaStatusInfo | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [previewVideoError, setPreviewVideoError] = useState(false);
@@ -154,8 +156,13 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     setMediaError(null);
     setPreviewVideoError(false);
     setUploadingMedia(false);
+    setUploadProgress(0);
+    setUploadStage('');
+    setUploadBytes(null);
     setIsCreateOpen(false);
   };
+
+  const formatMegabytes = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 
   const uploadVideoBlobToCloud = async (
     blob: Blob,
@@ -163,10 +170,20 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
   ): Promise<string | null> => {
     setUploadingMedia(true);
     setUploadProgress(5);
+    setUploadStage('Preparando envio do vídeo...');
+    setUploadBytes({ loaded: 0, total: blob.size });
     try {
-      const result = await uploadMediaToCloud(blob, fileName, (pct) => {
-        setUploadProgress(pct);
-      });
+      const result = await uploadMediaToCloud(
+        blob,
+        fileName,
+        (pct, stage, loadedBytes, totalBytes) => {
+          setUploadProgress(pct);
+          if (stage) setUploadStage(stage);
+          if (typeof loadedBytes === 'number' && typeof totalBytes === 'number') {
+            setUploadBytes({ loaded: loadedBytes, total: totalBytes });
+          }
+        }
+      );
       if (!result.fallbackNeeded) {
         if (result.storageProvider === 'aws-cloudfront' || result.storageProvider === 'aws-s3') {
           showToast('Vídeo hospedado na Amazon AWS S3');
@@ -196,6 +213,8 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     } finally {
       setUploadingMedia(false);
       setUploadProgress(0);
+      setUploadStage('');
+      setUploadBytes(null);
     }
   };
 
@@ -596,13 +615,49 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
             )}
 
             {uploadingMedia && (
-              <div className="mb-4 flex items-center gap-3 rounded-xl border border-sky-500/30 bg-sky-50 px-4 py-3 text-xs font-medium text-sky-800 dark:bg-sky-950/30 dark:text-sky-200">
-                <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
-                <span>
-                  {mediaDeliveryStatus?.storageProvider === 'aws-s3'
-                    ? `Enviando vídeo para Amazon S3 (${mediaDeliveryStatus.bucket})... ${uploadProgress}%`
-                    : `Enviando vídeo para o servidor de streaming... ${uploadProgress}%`}
-                </span>
+              <div
+                className="mb-5 rounded-2xl border border-sky-500/30 bg-sky-50/90 p-4 dark:border-sky-500/25 dark:bg-sky-950/30"
+                role="status"
+                aria-live="polite"
+              >
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <Loader2 className="h-4 w-4 shrink-0 animate-spin text-sky-600 dark:text-sky-400" />
+                    <span className="truncate text-xs font-semibold text-sky-950 dark:text-sky-100">
+                      {mediaDeliveryStatus?.storageProvider === 'aws-s3'
+                        ? `Enviando vídeo para Amazon S3 (${mediaDeliveryStatus.bucket})`
+                        : 'Enviando vídeo para armazenamento na nuvem'}
+                    </span>
+                  </div>
+                  <span className="shrink-0 font-mono text-xs font-bold text-sky-700 tabular-nums dark:text-sky-300">
+                    {uploadProgress}%
+                  </span>
+                </div>
+
+                <div
+                  role="progressbar"
+                  aria-label="Progresso do envio do vídeo"
+                  aria-valuenow={uploadProgress}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  className="h-2.5 w-full overflow-hidden rounded-full bg-sky-200/80 dark:bg-sky-900/60"
+                >
+                  <div
+                    className="h-full rounded-full bg-sky-600 transition-[width] duration-200 ease-out dark:bg-sky-400"
+                    style={{ width: `${Math.min(100, Math.max(4, uploadProgress))}%` }}
+                  />
+                </div>
+
+                <div className="mt-2 flex items-center justify-between gap-2 text-[11px] text-sky-800/80 dark:text-sky-200/80">
+                  <span className="truncate">
+                    {uploadStage || 'Processando arquivo...'}
+                  </span>
+                  {uploadBytes && uploadBytes.total > 0 && (
+                    <span className="shrink-0 font-mono tabular-nums">
+                      {formatMegabytes(uploadBytes.loaded)} / {formatMegabytes(uploadBytes.total)}
+                    </span>
+                  )}
+                </div>
               </div>
             )}
 

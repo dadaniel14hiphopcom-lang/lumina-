@@ -83,11 +83,72 @@ export async function fetchMediaDeliveryStatus(): Promise<MediaStatusInfo | null
   }
 }
 
+export type MediaUploadProgressCallback = (
+  percent: number,
+  stage?: string,
+  loadedBytes?: number,
+  totalBytes?: number
+) => void;
+
+interface XhrUploadResponse {
+  status: number;
+  contentType: string;
+  text: string;
+}
+
+function sendXhrBinary(
+  url: string,
+  body: Blob,
+  headers: Record<string, string>,
+  onByteProgress?: (loaded: number, total: number) => void
+): Promise<XhrUploadResponse> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+    Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && onByteProgress) {
+        onByteProgress(ev.loaded, ev.total);
+      }
+    };
+
+    xhr.onload = () => {
+      resolve({
+        status: xhr.status,
+        contentType: (xhr.getResponseHeader('content-type') || '').toLowerCase(),
+        text: xhr.responseText || '',
+      });
+    };
+    xhr.onerror = () => reject(new Error('Falha de conexão durante o envio do vídeo.'));
+    xhr.onabort = () => reject(new Error('Envio do vídeo cancelado.'));
+    xhr.send(body);
+  });
+}
+
+function isStaticSpaFallbackRaw(status: number, contentType: string): boolean {
+  if (
+    status === 404 ||
+    status === 405 ||
+    status === 501 ||
+    status === 502 ||
+    status === 503
+  ) {
+    return true;
+  }
+  if (status >= 200 && status < 300 && contentType && !contentType.includes('application/json')) {
+    return true;
+  }
+  return false;
+}
+
 async function uploadMediaChunked(
   blob: Blob,
   contentType: string,
-  onProgress?: (percent: number) => void
+  onProgress?: MediaUploadProgressCallback
 ): Promise<MediaUploadResult | MediaUploadFallback> {
+  onProgress?.(2, 'Iniciando envio para a nuvem...', 0, blob.size);
+
   let initRes: Response;
   try {
     initRes = await fetch('/api/media/upload-init', {
@@ -124,29 +185,43 @@ async function uploadMediaChunked(
     const end = Math.min(blob.size, start + chunkSize);
     const slice = blob.slice(start, end);
 
-    const chunkRes = await fetch('/api/media/upload-chunk', {
-      method: 'POST',
-      headers: {
+    const chunkXhr = await sendXhrBinary(
+      '/api/media/upload-chunk',
+      slice,
+      {
         'Content-Type': 'application/octet-stream',
         'x-upload-id': initData.uploadId,
         'x-chunk-index': String(index),
       },
-      body: slice,
-    });
+      (chunkLoaded) => {
+        const overallLoaded = Math.min(blob.size, start + chunkLoaded);
+        const pct = Math.min(92, Math.max(4, Math.round((overallLoaded / blob.size) * 92)));
+        onProgress?.(
+          pct,
+          `Enviando parte ${index + 1} de ${totalChunks}...`,
+          overallLoaded,
+          blob.size
+        );
+      }
+    );
 
-    const chunkData = (await chunkRes.json().catch(() => ({}))) as {
-      ok?: boolean;
-      error?: string;
-    };
-    if (!chunkRes.ok || !chunkData.ok) {
+    const chunkData = (() => {
+      try {
+        return JSON.parse(chunkXhr.text || '{}') as { ok?: boolean; error?: string };
+      } catch {
+        return {};
+      }
+    })();
+
+    if (chunkXhr.status < 200 || chunkXhr.status >= 300 || !chunkData.ok) {
       throw new Error(
         chunkData.error ||
-          `Falha ao enviar parte ${index + 1}/${totalChunks} do vídeo (HTTP ${chunkRes.status}).`
+          `Falha ao enviar parte ${index + 1}/${totalChunks} do vídeo (HTTP ${chunkXhr.status}).`
       );
     }
-
-    onProgress?.(Math.min(95, Math.round(((index + 1) / totalChunks) * 90)));
   }
+
+  onProgress?.(95, 'Salvando vídeo no armazenamento AWS S3...', blob.size, blob.size);
 
   const completeRes = await fetch('/api/media/upload-complete', {
     method: 'POST',
@@ -167,7 +242,7 @@ async function uploadMediaChunked(
     );
   }
 
-  onProgress?.(100);
+  onProgress?.(100, 'Upload concluído!', blob.size, blob.size);
   return {
     url: completeData.url,
     storageProvider: completeData.storageProvider || 'server-disk',
@@ -178,7 +253,7 @@ async function uploadMediaChunked(
 export async function uploadMediaToCloud(
   blob: Blob,
   fileName?: string,
-  onProgress?: (percent: number) => void
+  onProgress?: MediaUploadProgressCallback
 ): Promise<MediaUploadResult | MediaUploadFallback> {
   const contentType = inferMediaMimeType(blob, fileName);
 
@@ -187,45 +262,56 @@ export async function uploadMediaToCloud(
     return uploadMediaChunked(blob, contentType, onProgress);
   }
 
-  let res: Response;
+  onProgress?.(5, 'Enviando vídeo para a nuvem...', 0, blob.size);
+
+  let xhrRes: XhrUploadResponse;
   try {
-    res = await fetch('/api/media/upload', {
-      method: 'POST',
-      headers: {
-        'Content-Type': contentType,
-      },
-      body: blob,
-    });
+    xhrRes = await sendXhrBinary(
+      '/api/media/upload',
+      blob,
+      { 'Content-Type': contentType },
+      (loaded, total) => {
+        const effectiveTotal = total > 0 ? total : blob.size;
+        const pct = Math.min(92, Math.max(8, Math.round((loaded / effectiveTotal) * 92)));
+        onProgress?.(pct, 'Enviando vídeo para o servidor...', loaded, effectiveTotal);
+      }
+    );
   } catch {
     return { fallbackNeeded: true };
   }
 
-  if (isStaticSpaFallbackResponse(res)) {
+  if (isStaticSpaFallbackRaw(xhrRes.status, xhrRes.contentType)) {
     return { fallbackNeeded: true };
   }
 
-  if (res.status === 413) {
-    const errJson = (await res.json().catch(() => null)) as { error?: string } | null;
-    if (!errJson?.error) {
+  const data = (() => {
+    try {
+      return JSON.parse(xhrRes.text || '{}') as {
+        ok?: boolean;
+        url?: string;
+        storageProvider?: 'aws-cloudfront' | 'aws-s3' | 'server-disk';
+        error?: string;
+      };
+    } catch {
+      return {};
+    }
+  })();
+
+  if (xhrRes.status === 413) {
+    if (!data.error) {
       return uploadMediaChunked(blob, contentType, onProgress);
     }
-    throw new Error(errJson.error);
+    throw new Error(data.error);
   }
 
-  const data = (await res.json().catch(() => ({}))) as {
-    ok?: boolean;
-    url?: string;
-    storageProvider?: 'aws-cloudfront' | 'aws-s3' | 'server-disk';
-    error?: string;
-  };
-
-  if (!res.ok || !data.ok || !data.url) {
+  if (xhrRes.status < 200 || xhrRes.status >= 300 || !data.ok || !data.url) {
     throw new Error(
-      data.error || `O servidor rejeitou o envio deste arquivo de mídia (HTTP ${res.status}).`
+      data.error ||
+        `O servidor rejeitou o envio deste arquivo de mídia (HTTP ${xhrRes.status}).`
     );
   }
 
-  onProgress?.(100);
+  onProgress?.(100, 'Upload concluído!', blob.size, blob.size);
   return {
     url: data.url,
     storageProvider: data.storageProvider || 'server-disk',
