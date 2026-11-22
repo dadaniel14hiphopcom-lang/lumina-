@@ -8,6 +8,7 @@ import {
   Lock,
   LogIn,
   Moon,
+  Share2,
   Shield,
   Sun,
 } from 'lucide-react';
@@ -26,6 +27,7 @@ export function AuthView() {
     hasPasswordForUser,
     setGuestBrowsing,
     setActiveNav,
+    showToast,
   } = useSocial();
 
   const [identifier, setIdentifier] = useState('');
@@ -99,6 +101,32 @@ export function AuthView() {
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={async () => {
+              const url = `${window.location.origin}${window.location.pathname}`;
+              if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+                try {
+                  await navigator.share({
+                    title: 'Lumina — Rede Social Visual',
+                    text: 'Conheça a Lumina: feed visual, stories, reels e mensagens diretas.',
+                    url,
+                  });
+                  return;
+                } catch {
+                  // Fallback to clipboard
+                }
+              }
+              await navigator.clipboard?.writeText(url).catch(() => {});
+              showToast('Link da plataforma copiado com cartão de visualização!');
+            }}
+            aria-label="Compartilhar link da plataforma"
+            title="Compartilhar plataforma"
+            className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-900"
+          >
+            <Share2 className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Compartilhar</span>
+          </button>
           <button
             type="button"
             onClick={() => setActiveNav('admin')}

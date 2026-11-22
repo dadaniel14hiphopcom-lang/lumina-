@@ -441,7 +441,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const [activeNav, setActiveNav] = useState<NavSection>('feed');
   const [viewingProfileId, setViewingProfileId] = useState<string | null>(null);
   const [exploreQuery, setExploreQuery] = useState('');
-  const [selectedPostId, setSelectedPostId] = useState<string | null>(null);
+  const [selectedPostId, setSelectedPostId] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    return new URLSearchParams(window.location.search).get('post')?.trim() || null;
+  });
   const [activeStoryAuthorId, setActiveStoryAuthorId] = useState<string | null>(null);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [sharePostId, setSharePostId] = useState<string | null>(null);
@@ -533,6 +536,52 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     refreshSiteMeta();
   }, []);
+
+  // Keep client-side canonical URL and OpenGraph preview metadata synchronized
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+    const baseUrl = `${window.location.origin}${window.location.pathname}`;
+    const activePost = selectedPostId
+      ? state.posts.find((p) => p.id === selectedPostId)
+      : undefined;
+    const activeAuthor = activePost
+      ? state.users.find((u) => u.id === activePost.authorId)
+      : undefined;
+
+    const nextUrl = activePost
+      ? `${baseUrl}?post=${encodeURIComponent(activePost.id)}`
+      : baseUrl;
+    const nextTitle = activePost
+      ? `${activePost.isReel ? 'Reel' : 'Publicação'} de @${activeAuthor?.username || 'lumina'} — Lumina`
+      : 'Lumina — Rede Social Visual';
+    const nextDesc =
+      activePost?.caption?.trim().slice(0, 155) ||
+      'Rede social visual com feed em tempo real, stories interativos, reels em vídeo, estúdio de filtros e mensagens diretas na Lumina.';
+
+    document.title = nextTitle;
+    const setMeta = (selector: string, value: string, attr = 'content') => {
+      const el = document.querySelector(selector);
+      if (el) el.setAttribute(attr, value);
+    };
+    setMeta('link[rel="canonical"]', nextUrl, 'href');
+    setMeta('meta[property="og:url"]', nextUrl);
+    setMeta('meta[property="og:title"]', nextTitle);
+    setMeta('meta[property="og:description"]', nextDesc);
+    setMeta('meta[name="twitter:title"]', nextTitle);
+    setMeta('meta[name="twitter:description"]', nextDesc);
+    if (!window.location.search.includes('invite=')) {
+      const url = new URL(window.location.href);
+      if (selectedPostId) {
+        url.searchParams.set('post', selectedPostId);
+      } else {
+        url.searchParams.delete('post');
+      }
+      const nextRelative = url.pathname + url.search + url.hash;
+      if (nextRelative !== window.location.pathname + window.location.search + window.location.hash) {
+        window.history.replaceState({}, '', nextRelative);
+      }
+    }
+  }, [selectedPostId, state.posts, state.users]);
 
   // Helper to merge remote records cleanly by ID without losing local seed fallback
   const mergeRecordsById = <T extends { id: string }>(localList: T[], remoteList: T[]): T[] => {

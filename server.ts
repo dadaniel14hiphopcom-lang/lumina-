@@ -618,7 +618,146 @@ function collectAllowlistedProjectFiles(): ZipEntryInput[] {
 
   walkDir('src');
   walkDir('server');
+  walkDir('public');
   return entries;
+}
+
+function escapeHtmlAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function resolvePublicOrigin(req: Request): string {
+  const envUrl = process.env.APP_URL?.trim();
+  if (envUrl && envUrl !== 'MY_APP_URL') {
+    try {
+      const parsed = new URL(envUrl);
+      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+        return parsed.origin;
+      }
+    } catch {
+      // Fallback to request host headers
+    }
+  }
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const proto = forwardedProto === 'https' || req.secure ? 'https' : 'http';
+  const rawHost = String(req.headers['x-forwarded-host'] || req.headers.host || '')
+    .split(',')[0]
+    .trim();
+  const safeHost = /^[a-zA-Z0-9.-]+(:\d{1,5})?$/.test(rawHost) ? rawHost : `localhost:${PORT}`;
+  return `${proto}://${safeHost}`;
+}
+
+function injectLinkPreviewMeta(html: string, req: Request): string {
+  const origin = resolvePublicOrigin(req);
+  const defaultTitle = 'Lumina — Rede Social Visual';
+  const defaultDescription =
+    'Rede social visual com feed em tempo real, stories interativos, reels em vídeo, estúdio de filtros e mensagens diretas na Lumina.';
+  const defaultImage = `${origin}/og-preview.jpg`;
+
+  let title = defaultTitle;
+  let description = defaultDescription;
+  let imageUrl = defaultImage;
+  let canonicalUrl = `${origin}/`;
+
+  const postParam = typeof req.query.post === 'string' ? req.query.post.trim() : '';
+  const inviteParam = typeof req.query.invite === 'string' ? req.query.invite.trim().toUpperCase() : '';
+
+  if (postParam && /^[a-zA-Z0-9_-]{1,128}$/.test(postParam)) {
+    canonicalUrl = `${origin}/?post=${encodeURIComponent(postParam)}`;
+    const sharedState = readSharedSocialState();
+    const matchedPost = sharedState?.posts.find((p) => p.id === postParam) as
+      | {
+          authorId?: string;
+          caption?: string;
+          isReel?: boolean;
+          media?: { url?: string; mediaType?: string }[];
+        }
+      | undefined;
+
+    if (matchedPost) {
+      const matchedAuthor = sharedState?.users.find((u) => u.id === matchedPost.authorId) as
+        | { username?: string; displayName?: string }
+        | undefined;
+      const authorLabel = matchedAuthor?.username
+        ? `@${matchedAuthor.username}`
+        : matchedAuthor?.displayName || 'Lumina';
+      title = matchedPost.isReel
+        ? `Reel de ${authorLabel} na Lumina`
+        : `Publicação de ${authorLabel} na Lumina`;
+      if (typeof matchedPost.caption === 'string' && matchedPost.caption.trim()) {
+        description = matchedPost.caption.trim().slice(0, 155);
+      }
+      const firstImg = matchedPost.media?.find(
+        (m) => m.mediaType !== 'video' && typeof m.url === 'string' && /^https?:\/\//i.test(m.url)
+      )?.url;
+      if (firstImg) {
+        imageUrl = firstImg;
+      }
+    } else {
+      title = 'Publicação na Lumina — Rede Social Visual';
+    }
+  } else if (inviteParam && /^[A-Z0-9_-]{4,32}$/.test(inviteParam)) {
+    canonicalUrl = `${origin}/?invite=${encodeURIComponent(inviteParam)}`;
+    title = 'Convite exclusivo para entrar na Lumina';
+    description =
+      'Você recebeu um convite para criar sua conta e compartilhar fotos, stories e reels na Lumina.';
+  }
+
+  const safeTitle = escapeHtmlAttr(title);
+  const safeDesc = escapeHtmlAttr(description);
+  const safeUrl = escapeHtmlAttr(canonicalUrl);
+  const safeImage = escapeHtmlAttr(imageUrl);
+
+  return html
+    .replace(/<title>[\s\S]*?<\/title>/i, `<title>${safeTitle}</title>`)
+    .replace(
+      /<meta\s+name="description"[^>]*>/i,
+      `<meta name="description" content="${safeDesc}" />`
+    )
+    .replace(
+      /<link\s+rel="canonical"[^>]*>/i,
+      `<link rel="canonical" href="${safeUrl}" />`
+    )
+    .replace(
+      /<meta\s+property="og:url"[^>]*>/i,
+      `<meta property="og:url" content="${safeUrl}" />`
+    )
+    .replace(
+      /<meta\s+property="og:title"[^>]*>/i,
+      `<meta property="og:title" content="${safeTitle}" />`
+    )
+    .replace(
+      /<meta\s+property="og:description"[^>]*>/i,
+      `<meta property="og:description" content="${safeDesc}" />`
+    )
+    .replace(
+      /<meta\s+property="og:image"\s+content="[^"]*"[^>]*>/i,
+      `<meta property="og:image" content="${safeImage}" />`
+    )
+    .replace(
+      /<meta\s+property="og:image:secure_url"[^>]*>/i,
+      `<meta property="og:image:secure_url" content="${safeImage}" />`
+    )
+    .replace(
+      /<meta\s+name="twitter:title"[^>]*>/i,
+      `<meta name="twitter:title" content="${safeTitle}" />`
+    )
+    .replace(
+      /<meta\s+name="twitter:description"[^>]*>/i,
+      `<meta name="twitter:description" content="${safeDesc}" />`
+    )
+    .replace(
+      /<meta\s+name="twitter:image"\s+content="[^"]*"[^>]*>/i,
+      `<meta name="twitter:image" content="${safeImage}" />`
+    );
 }
 
 async function startServer() {
@@ -1527,12 +1666,19 @@ Este pacote dá controle total da infraestrutura ao administrador:
     res.send(zipBuffer);
   });
 
-  // Development vs Production static serving
+  // Development vs Production static serving with dynamic OpenGraph preview tags
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.join(ROOT_DIR, 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+    const distIndexPath = path.join(distDir, 'index.html');
+    app.use(express.static(distDir, { index: false }));
+    app.get('*', (req, res) => {
+      try {
+        const rawHtml = fs.readFileSync(distIndexPath, 'utf8');
+        const html = injectLinkPreviewMeta(rawHtml, req);
+        res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8').send(html);
+      } catch {
+        res.sendFile(distIndexPath);
+      }
     });
   } else {
     const { createServer: createViteServer } = await import('vite');
@@ -1540,6 +1686,31 @@ Este pacote dá controle total da infraestrutura ao administrador:
       server: { middlewareMode: true },
       appType: 'spa',
     });
+
+    app.get('*', async (req, res, next) => {
+      const accept = req.headers.accept || '';
+      if (
+        req.path.startsWith('/api/') ||
+        req.path.startsWith('/@') ||
+        req.path.startsWith('/src/') ||
+        req.path.startsWith('/node_modules/') ||
+        path.extname(req.path) !== '' ||
+        !accept.includes('text/html')
+      ) {
+        next();
+        return;
+      }
+      try {
+        const rawHtml = fs.readFileSync(path.join(ROOT_DIR, 'index.html'), 'utf8');
+        const transformed = await vite.transformIndexHtml(req.originalUrl, rawHtml);
+        const html = injectLinkPreviewMeta(transformed, req);
+        res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8').send(html);
+      } catch (err) {
+        vite.ssrFixStacktrace(err as Error);
+        next(err);
+      }
+    });
+
     app.use(vite.middlewares);
   }
 
