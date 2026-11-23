@@ -1422,7 +1422,39 @@ export function AdminPanelView() {
     const ensureSchemaSql =
       schema !== 'public' ? `create schema if not exists ${schema};\n\n` : '';
     return `-- Schema Supabase para Lumina Social (${overview?.state.supabase.projectUrl || 'https://jpllpvfunpsqexnvjgdt.supabase.co'})
-${ensureSchemaSql}create table if not exists ${schema}.lumina_users (
+${ensureSchemaSql}do $$
+declare
+  tbl_exists boolean;
+  id_type text;
+  has_username boolean;
+  row_count bigint := 0;
+begin
+  select exists (
+    select 1 from information_schema.tables
+    where table_schema = '${schema}' and table_name = 'lumina_users'
+  ) into tbl_exists;
+
+  if tbl_exists then
+    select data_type into id_type
+    from information_schema.columns
+    where table_schema = '${schema}' and table_name = 'lumina_users' and column_name = 'id';
+
+    select exists (
+      select 1 from information_schema.columns
+      where table_schema = '${schema}' and table_name = 'lumina_users' and column_name = 'username'
+    ) into has_username;
+
+    execute format('select count(*) from %I.lumina_users', '${schema}') into row_count;
+
+    -- Se a tabela foi criada vazia sem as colunas da Lumina (ex.: tabela padrão do Table Editor), recria limpa
+    if row_count = 0 and (id_type is distinct from 'text' or not has_username) then
+      execute format('drop table if exists %I.lumina_posts cascade', '${schema}');
+      execute format('drop table if exists %I.lumina_users cascade', '${schema}');
+    end if;
+  end if;
+end $$;
+
+create table if not exists ${schema}.lumina_users (
   id text primary key,
   auth_uid uuid unique,
   username text unique not null,
@@ -1440,6 +1472,22 @@ ${ensureSchemaSql}create table if not exists ${schema}.lumina_users (
   updated_at timestamptz default now()
 );
 
+-- Garante que todas as colunas existam caso lumina_users já existisse com dados
+alter table ${schema}.lumina_users add column if not exists auth_uid uuid;
+alter table ${schema}.lumina_users add column if not exists username text;
+alter table ${schema}.lumina_users add column if not exists display_name text default '';
+alter table ${schema}.lumina_users add column if not exists email text;
+alter table ${schema}.lumina_users add column if not exists avatar_url text;
+alter table ${schema}.lumina_users add column if not exists cover_url text;
+alter table ${schema}.lumina_users add column if not exists bio text default '';
+alter table ${schema}.lumina_users add column if not exists verified boolean default false;
+alter table ${schema}.lumina_users add column if not exists boosted boolean default false;
+alter table ${schema}.lumina_users add column if not exists restricted boolean default false;
+alter table ${schema}.lumina_users add column if not exists is_real_user boolean default true;
+alter table ${schema}.lumina_users add column if not exists auth_source text default 'register';
+alter table ${schema}.lumina_users add column if not exists created_at timestamptz default now();
+alter table ${schema}.lumina_users add column if not exists updated_at timestamptz default now();
+
 create index if not exists idx_lumina_users_username on ${schema}.lumina_users (lower(username));
 create index if not exists idx_lumina_users_auth_uid on ${schema}.lumina_users (auth_uid);
 
@@ -1448,12 +1496,21 @@ create table if not exists ${schema}.lumina_posts (
   author_id text references ${schema}.lumina_users(id) on delete cascade,
   caption text default '',
   location text,
-  category text not null,
+  category text not null default 'Fotografia',
   aspect_ratio text default '4:5',
   is_reel boolean default false,
   media_urls jsonb not null default '[]'::jsonb,
   created_at timestamptz default now()
 );
+
+alter table ${schema}.lumina_posts add column if not exists author_id text;
+alter table ${schema}.lumina_posts add column if not exists caption text default '';
+alter table ${schema}.lumina_posts add column if not exists location text;
+alter table ${schema}.lumina_posts add column if not exists category text default 'Fotografia';
+alter table ${schema}.lumina_posts add column if not exists aspect_ratio text default '4:5';
+alter table ${schema}.lumina_posts add column if not exists is_reel boolean default false;
+alter table ${schema}.lumina_posts add column if not exists media_urls jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_posts add column if not exists created_at timestamptz default now();
 
 alter table ${schema}.lumina_users enable row level security;
 alter table ${schema}.lumina_posts enable row level security;
