@@ -6,9 +6,30 @@ export const DEFAULT_SUPABASE_URL = 'https://jpllpvfunpsqexnvjgdt.supabase.co';
 export interface SupabaseRuntimeConfig {
   projectUrl: string;
   schemaName: string;
+  anonKey?: string;
   autoSyncUsers: boolean;
   autoSyncPosts: boolean;
   rlsEnforced: boolean;
+}
+
+export function isSecretSupabaseKey(rawKey?: string): boolean {
+  const key = (rawKey || '').trim();
+  if (!key) return false;
+  if (/^sb_secret_/i.test(key)) return true;
+  const parts = key.split('.');
+  if (parts.length === 3) {
+    try {
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as {
+        role?: string;
+      };
+      if (payload?.role && payload.role.toLowerCase() === 'service_role') {
+        return true;
+      }
+    } catch {
+      // Ignore malformed JWT inspection
+    }
+  }
+  return false;
 }
 
 export interface SupabaseUserSyncPayload {
@@ -116,9 +137,14 @@ export async function resolveValidatedSupabaseOrigin(rawUrl?: string): Promise<s
   return parsed.origin;
 }
 
-function getSupabaseKeys() {
+function getSupabaseKeys(fallbackPublicAnonKey?: string) {
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() || '';
-  const anonKey = process.env.SUPABASE_ANON_KEY?.trim() || '';
+  const envAnonKey = process.env.SUPABASE_ANON_KEY?.trim() || '';
+  const safeFallbackAnon =
+    fallbackPublicAnonKey && !isSecretSupabaseKey(fallbackPublicAnonKey)
+      ? fallbackPublicAnonKey.trim()
+      : '';
+  const anonKey = envAnonKey || safeFallbackAnon;
   const activeKey = serviceRoleKey || anonKey;
   return {
     serviceRoleKey,
@@ -129,9 +155,43 @@ function getSupabaseKeys() {
   };
 }
 
+function isJwtLike(token?: string): boolean {
+  const parts = (token || '').trim().split('.');
+  return parts.length === 3 && parts.every((p) => p.length > 0);
+}
+
+function buildSupabaseHeaders(
+  apiKey?: string,
+  bearerOverride?: string
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const cleanKey = (apiKey || '').trim();
+  if (cleanKey) {
+    headers.apikey = cleanKey;
+    const effectiveBearer =
+      (bearerOverride || '').trim() || (isJwtLike(cleanKey) ? cleanKey : '');
+    if (effectiveBearer) {
+      headers.Authorization = `Bearer ${effectiveBearer}`;
+    }
+  }
+  return headers;
+}
+
 function sanitizeSchemaName(raw?: string): string {
-  const cleaned = (raw || 'public').replace(/[^a-zA-Z0-9_]/g, '').slice(0, 48);
-  return cleaned || 'public';
+  const trimmed = (raw || '').trim();
+  if (
+    !trimmed ||
+    /^sb_(publishable|secret)_/i.test(trimmed) ||
+    /^eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/.test(trimmed) ||
+    trimmed.length > 32
+  ) {
+    return 'public';
+  }
+  const cleaned = trimmed.replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+  if (!cleaned || !/^[a-z_][a-z0-9_]*$/.test(cleaned)) {
+    return 'public';
+  }
+  return cleaned;
 }
 
 function compactAssetForDb(url?: string): string | null {
@@ -146,7 +206,8 @@ function compactAssetForDb(url?: string): string | null {
 
 export async function testSupabaseConnection(
   rawProjectUrl?: string,
-  rawSchemaName?: string
+  rawSchemaName?: string,
+  fallbackPublicAnonKey?: string
 ): Promise<{
   reachable: boolean;
   httpStatus: number;
@@ -158,13 +219,9 @@ export async function testSupabaseConnection(
 }> {
   const origin = await resolveValidatedSupabaseOrigin(rawProjectUrl);
   const schema = sanitizeSchemaName(rawSchemaName);
-  const keys = getSupabaseKeys();
+  const keys = getSupabaseKeys(fallbackPublicAnonKey);
 
-  const headers: Record<string, string> = {};
-  if (keys.activeKey) {
-    headers.apikey = keys.activeKey;
-    headers.Authorization = `Bearer ${keys.activeKey}`;
-  }
+  const headers = buildSupabaseHeaders(keys.activeKey);
 
   const rootRes = await fetch(new URL('/rest/v1/', origin).toString(), {
     method: 'GET',
@@ -180,7 +237,7 @@ export async function testSupabaseConnection(
       hasKeys: false,
       hasServiceRole: false,
       origin,
-      statusLabel: `Supabase alcançado em ${new URL(origin).hostname} (HTTP ${rootRes.status}). Adicione SUPABASE_SERVICE_ROLE_KEY (ou SUPABASE_ANON_KEY) nos Segredos do servidor para gravar usuários reais.`,
+      statusLabel: `Supabase alcançado em ${new URL(origin).hostname} (HTTP ${rootRes.status}). Cole sua Chave Pública (anon / publishable) ou configure SUPABASE_SERVICE_ROLE_KEY para gravar usuários reais.`,
     };
   }
 
@@ -223,7 +280,7 @@ export async function registerOrSyncUserToSupabase(
   config: SupabaseRuntimeConfig,
   user: SupabaseUserSyncPayload
 ): Promise<SupabaseSyncResult> {
-  const keys = getSupabaseKeys();
+  const keys = getSupabaseKeys(config.anonKey);
   if (!keys.hasKeys) {
     return {
       synced: false,
@@ -246,7 +303,7 @@ export async function registerOrSyncUserToSupabase(
   const schema = sanitizeSchemaName(config.schemaName);
   let resolvedAuthUid = user.authUid || null;
   let authCreated = false;
-  let authTokenForPostgrest = keys.activeKey;
+  let authJwtForPostgrest = isJwtLike(keys.activeKey) ? keys.activeKey : '';
 
   // 1. Create / register credential in Supabase Auth when email + password are present
   if (user.email && user.password) {
@@ -256,8 +313,7 @@ export async function registerOrSyncUserToSupabase(
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            apikey: keys.serviceRoleKey,
-            Authorization: `Bearer ${keys.serviceRoleKey}`,
+            ...buildSupabaseHeaders(keys.serviceRoleKey),
           },
           body: JSON.stringify({
             email: user.email,
@@ -302,7 +358,7 @@ export async function registerOrSyncUserToSupabase(
           };
           resolvedAuthUid = signupData.user?.id || signupData.id || resolvedAuthUid;
           if (signupData.access_token) {
-            authTokenForPostgrest = signupData.access_token;
+            authJwtForPostgrest = signupData.access_token;
           }
           authCreated = true;
         }
@@ -337,8 +393,7 @@ export async function registerOrSyncUserToSupabase(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          apikey: keys.activeKey,
-          Authorization: `Bearer ${authTokenForPostgrest}`,
+          ...buildSupabaseHeaders(keys.activeKey, authJwtForPostgrest),
           'Content-Profile': schema,
           Prefer: 'resolution=merge-duplicates,return=representation',
         },
@@ -382,9 +437,10 @@ export async function registerOrSyncUserToSupabase(
 export async function verifySupabasePasswordLogin(
   rawProjectUrl: string,
   email: string,
-  password: string
+  password: string,
+  fallbackPublicAnonKey?: string
 ): Promise<{ ok: boolean; authUid?: string; username?: string; displayName?: string }> {
-  const keys = getSupabaseKeys();
+  const keys = getSupabaseKeys(fallbackPublicAnonKey);
   const apiKey = keys.anonKey || keys.serviceRoleKey;
   if (!apiKey || !email.includes('@')) return { ok: false };
 
@@ -427,7 +483,7 @@ export async function upsertPostToSupabase(
   config: SupabaseRuntimeConfig,
   post: SupabasePostSyncPayload
 ): Promise<SupabaseSyncResult> {
-  const keys = getSupabaseKeys();
+  const keys = getSupabaseKeys(config.anonKey);
   if (!keys.hasKeys) {
     return {
       synced: false,
@@ -466,8 +522,7 @@ export async function upsertPostToSupabase(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          apikey: keys.activeKey,
-          Authorization: `Bearer ${keys.activeKey}`,
+          ...buildSupabaseHeaders(keys.activeKey),
           'Content-Profile': schema,
           Prefer: 'resolution=merge-duplicates,return=minimal',
         },
@@ -499,7 +554,7 @@ export async function upsertPostToSupabase(
 export async function fetchPublicRealUsersFromSupabase(
   config: SupabaseRuntimeConfig
 ): Promise<Array<Record<string, unknown>>> {
-  const keys = getSupabaseKeys();
+  const keys = getSupabaseKeys(config.anonKey);
   if (!keys.hasKeys) return [];
 
   try {
@@ -513,8 +568,7 @@ export async function fetchPublicRealUsersFromSupabase(
       {
         method: 'GET',
         headers: {
-          apikey: keys.activeKey,
-          Authorization: `Bearer ${keys.activeKey}`,
+          ...buildSupabaseHeaders(keys.activeKey),
           'Accept-Profile': schema,
         },
         signal: AbortSignal.timeout(5000),

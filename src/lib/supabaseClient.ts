@@ -47,6 +47,49 @@ export function normalizeSupabaseOrigin(rawUrl?: string): string {
   return parsed.origin;
 }
 
+export function isJwtLike(token?: string): boolean {
+  const parts = (token || '').trim().split('.');
+  return parts.length === 3 && parts.every((p) => p.length > 0);
+}
+
+export function isSupabaseApiKeyLike(raw?: string): boolean {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return false;
+  return (
+    /^sb_(publishable|secret)_/i.test(trimmed) ||
+    /^eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/.test(trimmed)
+  );
+}
+
+export function sanitizeSupabaseSchemaName(raw?: string): string {
+  const trimmed = (raw || '').trim();
+  if (!trimmed || isSupabaseApiKeyLike(trimmed) || trimmed.length > 32) {
+    return 'public';
+  }
+  const cleaned = trimmed.replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+  if (!cleaned || !/^[a-z_][a-z0-9_]*$/.test(cleaned)) {
+    return 'public';
+  }
+  return cleaned;
+}
+
+function buildBrowserSupabaseHeaders(
+  anonKey: string,
+  bearerOverride?: string
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const cleanKey = anonKey.trim();
+  if (cleanKey) {
+    headers.apikey = cleanKey;
+    const effectiveBearer =
+      (bearerOverride || '').trim() || (isJwtLike(cleanKey) ? cleanKey : '');
+    if (effectiveBearer) {
+      headers.Authorization = `Bearer ${effectiveBearer}`;
+    }
+  }
+  return headers;
+}
+
 export function getBrowserSupabaseConfig(): BrowserSupabaseConfig {
   const envUrl =
     typeof import.meta !== 'undefined' && import.meta.env?.VITE_SUPABASE_URL
@@ -75,10 +118,17 @@ export function getBrowserSupabaseConfig(): BrowserSupabaseConfig {
       };
       if (parsed.supabase) {
         storedUrl = (parsed.supabase.projectUrl || '').trim();
-        storedSchema = (parsed.supabase.schemaName || 'public').replace(/[^a-zA-Z0-9_]/g, '') || 'public';
+        const rawSchema = (parsed.supabase.schemaName || '').trim();
+        storedSchema = sanitizeSupabaseSchemaName(rawSchema);
         const candidateKey = (parsed.supabase.anonKey || '').trim();
         if (candidateKey && !isServiceRoleOrSecretKey(candidateKey)) {
           storedAnonKey = candidateKey;
+        } else if (
+          isSupabaseApiKeyLike(rawSchema) &&
+          !isServiceRoleOrSecretKey(rawSchema)
+        ) {
+          // Auto-heal if the user accidentally pasted their publishable/anon key into Schema PostgreSQL
+          storedAnonKey = rawSchema;
         }
         if (typeof parsed.supabase.autoSyncUsers === 'boolean') {
           autoSyncUsers = parsed.supabase.autoSyncUsers;
@@ -112,7 +162,7 @@ export async function testSupabaseFromBrowser(params: {
   statusLabel: string;
 }> {
   const origin = normalizeSupabaseOrigin(params.projectUrl);
-  const schema = (params.schemaName || 'public').replace(/[^a-zA-Z0-9_]/g, '') || 'public';
+  const schema = sanitizeSupabaseSchemaName(params.schemaName);
   const anonKey = (params.anonKey || '').trim();
 
   if (anonKey && isServiceRoleOrSecretKey(anonKey)) {
@@ -142,8 +192,7 @@ export async function testSupabaseFromBrowser(params: {
   const tableRes = await fetch(`${origin}/rest/v1/lumina_users?select=id&limit=1`, {
     method: 'GET',
     headers: {
-      apikey: anonKey,
-      Authorization: `Bearer ${anonKey}`,
+      ...buildBrowserSupabaseHeaders(anonKey),
       'Accept-Profile': schema,
     },
     signal: AbortSignal.timeout(6000),
@@ -260,7 +309,7 @@ export async function signupRealUserInSupabaseFromBrowser(
 
   if (signupData.access_token && authUid) {
     try {
-      const schema = config.schemaName.replace(/[^a-zA-Z0-9_]/g, '') || 'public';
+      const schema = sanitizeSupabaseSchemaName(config.schemaName);
       const safeAvatar =
         payload.avatarUrl && /^https?:\/\//i.test(payload.avatarUrl) ? payload.avatarUrl : null;
       const safeCover =
@@ -270,8 +319,7 @@ export async function signupRealUserInSupabaseFromBrowser(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          apikey: config.anonKey,
-          Authorization: `Bearer ${signupData.access_token}`,
+          ...buildBrowserSupabaseHeaders(config.anonKey, signupData.access_token),
           'Content-Profile': schema,
           Prefer: 'resolution=merge-duplicates,return=minimal',
         },
@@ -352,14 +400,13 @@ export async function fetchPublicUsersFromSupabaseBrowser(
   if (!config.anonKey || isServiceRoleOrSecretKey(config.anonKey)) return [];
   try {
     const origin = normalizeSupabaseOrigin(config.projectUrl);
-    const schema = config.schemaName.replace(/[^a-zA-Z0-9_]/g, '') || 'public';
+    const schema = sanitizeSupabaseSchemaName(config.schemaName);
     const res = await fetch(
       `${origin}/rest/v1/lumina_users?select=id,username,display_name,bio,avatar_url,cover_url,verified,boosted,restricted,created_at&is_real_user=eq.true&order=created_at.desc&limit=200`,
       {
         method: 'GET',
         headers: {
-          apikey: config.anonKey,
-          Authorization: `Bearer ${config.anonKey}`,
+          ...buildBrowserSupabaseHeaders(config.anonKey),
           'Accept-Profile': schema,
         },
         signal: AbortSignal.timeout(6000),

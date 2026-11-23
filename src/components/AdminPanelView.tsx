@@ -8,6 +8,7 @@ import {
   Copy,
   Database,
   Download,
+  ExternalLink,
   Eye,
   EyeOff,
   FileCode2,
@@ -35,7 +36,10 @@ import { ADMIN_EMAIL, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/f
 import {
   DEFAULT_SUPABASE_URL,
   fetchPublicUsersFromSupabaseBrowser,
+  getBrowserSupabaseConfig,
   isServiceRoleOrSecretKey,
+  isSupabaseApiKeyLike,
+  sanitizeSupabaseSchemaName,
   testSupabaseFromBrowser,
 } from '../lib/supabaseClient';
 import { InviteRecord, VideoRulesConfig } from '../types';
@@ -210,23 +214,32 @@ const DEFAULT_LOCAL_STATE: ServerOverview['state'] = {
 };
 
 function loadLocalAdminState(): ServerOverview['state'] {
+  const browserCfg = getBrowserSupabaseConfig();
   try {
     const raw = localStorage.getItem(LOCAL_STATE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<ServerOverview['state']>;
       return {
         aws: { ...DEFAULT_LOCAL_STATE.aws, ...(parsed.aws || {}) },
-        supabase: {
-          ...DEFAULT_LOCAL_STATE.supabase,
-          ...(parsed.supabase || {}),
-          projectUrl:
-            (parsed.supabase?.projectUrl || '').trim() ||
-            DEFAULT_LOCAL_STATE.supabase.projectUrl,
-          anonKey:
+        supabase: (() => {
+          const rawSchema = (parsed.supabase?.schemaName || '').trim();
+          const cleanSchema = sanitizeSupabaseSchemaName(rawSchema);
+          const candidateAnon =
             parsed.supabase?.anonKey && !isServiceRoleOrSecretKey(parsed.supabase.anonKey)
               ? parsed.supabase.anonKey.trim()
-              : '',
-        },
+              : isSupabaseApiKeyLike(rawSchema) && !isServiceRoleOrSecretKey(rawSchema)
+              ? rawSchema
+              : browserCfg.anonKey;
+          return {
+            ...DEFAULT_LOCAL_STATE.supabase,
+            ...(parsed.supabase || {}),
+            projectUrl:
+              (parsed.supabase?.projectUrl || '').trim() ||
+              DEFAULT_LOCAL_STATE.supabase.projectUrl,
+            schemaName: cleanSchema,
+            anonKey: candidateAnon,
+          };
+        })(),
         wordpress: { ...DEFAULT_LOCAL_STATE.wordpress, ...(parsed.wordpress || {}) },
         site: {
           ...DEFAULT_LOCAL_STATE.site,
@@ -242,7 +255,9 @@ function loadLocalAdminState(): ServerOverview['state'] {
   } catch {
     // Ignore invalid local storage
   }
-  return structuredClone(DEFAULT_LOCAL_STATE);
+  const fallback = structuredClone(DEFAULT_LOCAL_STATE);
+  fallback.supabase.anonKey = browserCfg.anonKey;
+  return fallback;
 }
 
 function saveLocalAdminState(state: ServerOverview['state']) {
@@ -417,7 +432,7 @@ export function AdminPanelView() {
         awsCredentialsConfigured: false,
         awsRegionEnv: false,
         supabaseUrlEnv: false,
-        supabaseKeysEnv: false,
+        supabaseKeysEnv: Boolean(localState.supabase.anonKey?.trim()),
         wordpressEnv: false,
       },
     });
@@ -438,7 +453,25 @@ export function AdminPanelView() {
       });
       if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
         const data = (await res.json()) as ServerOverview;
-        setOverview(data);
+        const localFallback = loadLocalAdminState();
+        const mergedAnonKey =
+          (data.state.supabase.anonKey || '').trim() || localFallback.supabase.anonKey || '';
+        const mergedState: ServerOverview['state'] = {
+          ...data.state,
+          supabase: {
+            ...data.state.supabase,
+            anonKey: mergedAnonKey,
+          },
+        };
+        saveLocalAdminState(mergedState);
+        setOverview({
+          ...data,
+          state: mergedState,
+          envStatus: {
+            ...data.envStatus,
+            supabaseKeysEnv: Boolean(data.envStatus.supabaseKeysEnv || mergedAnonKey),
+          },
+        });
         if (Array.isArray(data.state.invites)) {
           setInvites(data.state.invites);
         }
@@ -826,21 +859,43 @@ export function AdminPanelView() {
   const saveIntegrations = async (
     patch: Partial<Pick<ServerOverview['state'], 'aws' | 'supabase' | 'wordpress'>>
   ) => {
-    if (patch.supabase?.anonKey && isServiceRoleOrSecretKey(patch.supabase.anonKey)) {
-      const warn =
-        'Por segurança, nunca cole a chave secreta (service_role / sb_secret) aqui. Use apenas a chave pública (anon / publishable).';
-      setSupabaseTestStatus(warn);
-      showToast(warn);
-      return;
+    let normalizedPatch = patch;
+    if (patch.supabase) {
+      const rawSchema = (patch.supabase.schemaName || '').trim();
+      if (isSupabaseApiKeyLike(rawSchema) && isServiceRoleOrSecretKey(rawSchema)) {
+        const warn =
+          'Por segurança, nunca cole a chave secreta (service_role / sb_secret) aqui. Use apenas a chave pública (anon / publishable).';
+        setSupabaseTestStatus(warn);
+        showToast(warn);
+        return;
+      }
+      if (patch.supabase.anonKey && isServiceRoleOrSecretKey(patch.supabase.anonKey)) {
+        const warn =
+          'Por segurança, nunca cole a chave secreta (service_role / sb_secret) aqui. Use apenas a chave pública (anon / publishable).';
+        setSupabaseTestStatus(warn);
+        showToast(warn);
+        return;
+      }
+      const rescuedAnon =
+        (patch.supabase.anonKey || '').trim() ||
+        (isSupabaseApiKeyLike(rawSchema) && !isServiceRoleOrSecretKey(rawSchema) ? rawSchema : '');
+      normalizedPatch = {
+        ...patch,
+        supabase: {
+          ...patch.supabase,
+          schemaName: sanitizeSupabaseSchemaName(rawSchema),
+          anonKey: rescuedAnon,
+        },
+      };
     }
 
-    if (patch.supabase && overview?.state) {
+    if (normalizedPatch.supabase && overview?.state) {
       saveLocalAdminState({
         ...overview.state,
         supabase: {
           ...overview.state.supabase,
-          ...patch.supabase,
-          anonKey: (patch.supabase.anonKey || '').trim(),
+          ...normalizedPatch.supabase,
+          anonKey: (normalizedPatch.supabase.anonKey || '').trim(),
         },
       });
     }
@@ -848,41 +903,57 @@ export function AdminPanelView() {
     if (!authStatus.serverAvailable) {
       setOverview((prev) => {
         if (!prev) return prev;
+        const nextAnon = (
+          normalizedPatch.supabase?.anonKey ??
+          prev.state.supabase.anonKey ??
+          ''
+        ).trim();
         const nextState: ServerOverview['state'] = {
           ...prev.state,
-          aws: patch.aws ? { ...prev.state.aws, ...patch.aws } : prev.state.aws,
-          supabase: patch.supabase
+          aws: normalizedPatch.aws
+            ? { ...prev.state.aws, ...normalizedPatch.aws }
+            : prev.state.aws,
+          supabase: normalizedPatch.supabase
             ? {
                 ...prev.state.supabase,
-                ...patch.supabase,
-                anonKey: (patch.supabase.anonKey || '').trim(),
+                ...normalizedPatch.supabase,
+                anonKey: nextAnon,
               }
             : prev.state.supabase,
-          wordpress: patch.wordpress
-            ? { ...prev.state.wordpress, ...patch.wordpress }
+          wordpress: normalizedPatch.wordpress
+            ? { ...prev.state.wordpress, ...normalizedPatch.wordpress }
             : prev.state.wordpress,
         };
         saveLocalAdminState(nextState);
-        return { ...prev, state: nextState };
+        return {
+          ...prev,
+          state: nextState,
+          envStatus: {
+            ...prev.envStatus,
+            supabaseKeysEnv: Boolean(nextAnon),
+          },
+        };
       });
       showToast('Configurações do Supabase salvas neste domínio');
       return;
     }
 
-    const serverPatch = patch.supabase
+    const cleanAnonKey = (normalizedPatch.supabase?.anonKey || '').trim();
+    const serverPatch = normalizedPatch.supabase
       ? {
-          ...patch,
+          ...normalizedPatch,
           supabase: {
-            projectUrl: patch.supabase.projectUrl,
-            schemaName: patch.supabase.schemaName,
-            autoSyncUsers: patch.supabase.autoSyncUsers,
-            autoSyncPosts: patch.supabase.autoSyncPosts,
-            rlsEnforced: patch.supabase.rlsEnforced,
-            lastVerifiedAt: patch.supabase.lastVerifiedAt,
-            lastStatus: patch.supabase.lastStatus,
+            projectUrl: normalizedPatch.supabase.projectUrl,
+            schemaName: normalizedPatch.supabase.schemaName,
+            anonKey: cleanAnonKey,
+            autoSyncUsers: normalizedPatch.supabase.autoSyncUsers,
+            autoSyncPosts: normalizedPatch.supabase.autoSyncPosts,
+            rlsEnforced: normalizedPatch.supabase.rlsEnforced,
+            lastVerifiedAt: normalizedPatch.supabase.lastVerifiedAt,
+            lastStatus: normalizedPatch.supabase.lastStatus,
           },
         }
-      : patch;
+      : normalizedPatch;
 
     const res = await authFetch('/api/admin/integrations', {
       method: 'PUT',
@@ -898,15 +969,24 @@ export function AdminPanelView() {
                 ...data.state,
                 supabase: {
                   ...data.state.supabase,
-                  anonKey: prev.state.supabase.anonKey || '',
+                  anonKey: (data.state.supabase.anonKey || prev.state.supabase.anonKey || '').trim(),
                 },
+              },
+              envStatus: {
+                ...prev.envStatus,
+                supabaseKeysEnv: Boolean(
+                  prev.envStatus.supabaseKeysEnv ||
+                    data.state.supabase.anonKey?.trim() ||
+                    cleanAnonKey
+                ),
               },
             }
           : prev
       );
       showToast('Configurações salvas no servidor');
     } else {
-      showToast('Não foi possível salvar as configurações');
+      const errData = (await res.json().catch(() => ({}))) as { error?: string };
+      showToast(errData.error || 'Não foi possível salvar as configurações');
     }
   };
 
@@ -916,12 +996,20 @@ export function AdminPanelView() {
   ) => {
     if (!authStatus.serverAvailable) {
       if (provider === 'supabase') {
+        const candidateAnon = (overview?.state.supabase.anonKey || '').trim();
+        if (candidateAnon && isServiceRoleOrSecretKey(candidateAnon)) {
+          const warn =
+            'Por segurança, nunca cole a chave secreta (service_role / sb_secret) no navegador. Use apenas a chave pública (anon / publishable).';
+          setSupabaseTestStatus(warn);
+          showToast(warn);
+          return;
+        }
         setTestingKey('supabase');
         try {
           const result = await testSupabaseFromBrowser({
             projectUrl: url || overview?.state.supabase.projectUrl,
             schemaName: overview?.state.supabase.schemaName,
-            anonKey: overview?.state.supabase.anonKey,
+            anonKey: candidateAnon,
           });
           setSupabaseTestStatus(result.statusLabel);
           setOverview((prev) => {
@@ -931,22 +1019,33 @@ export function AdminPanelView() {
               supabase: {
                 ...prev.state.supabase,
                 projectUrl: result.origin,
+                schemaName: sanitizeSupabaseSchemaName(prev.state.supabase.schemaName),
+                anonKey: candidateAnon,
                 lastVerifiedAt: Date.now(),
                 lastStatus: result.tablesReady
                   ? 'Conectado (Pronto)'
                   : result.hasKey
                   ? 'Chave OK · Falta SQL'
-                  : 'Online (Sem chave anon)',
+                  : 'Falta chave pública (anon)',
               },
             };
             saveLocalAdminState(nextState);
-            return { ...prev, state: nextState };
+            return {
+              ...prev,
+              state: nextState,
+              envStatus: {
+                ...prev.envStatus,
+                supabaseKeysEnv: Boolean(result.hasKey),
+              },
+            };
           });
           showToast(
             result.tablesReady
               ? 'Supabase conectado e tabela lumina_users pronta!'
+              : !result.hasKey
+              ? 'Supabase online! Cole a Chave Pública (anon) acima para ativar.'
               : result.reachable
-              ? 'Supabase online!'
+              ? 'Chave aceita! Agora execute o SQL no Supabase.'
               : 'Falha ao conectar ao Supabase'
           );
         } catch (err) {
@@ -972,9 +1071,19 @@ export function AdminPanelView() {
 
     setTestingKey(provider);
     try {
+      const candidateAnon =
+        provider === 'supabase' ? (overview?.state.supabase.anonKey || '').trim() : undefined;
+      if (candidateAnon && isServiceRoleOrSecretKey(candidateAnon)) {
+        const warn =
+          'Por segurança, nunca cole a chave secreta (service_role / sb_secret) aqui. Use apenas a chave pública (anon / publishable).';
+        setSupabaseTestStatus(warn);
+        showToast(warn);
+        return;
+      }
+
       const res = await authFetch('/api/admin/integrations/test', {
         method: 'POST',
-        body: JSON.stringify({ provider, url }),
+        body: JSON.stringify({ provider, url, anonKey: candidateAnon }),
       });
       const data = (await res.json()) as {
         ok?: boolean;
@@ -1309,10 +1418,11 @@ export function AdminPanelView() {
   };
 
   const buildSupabaseSql = () => {
-    const rawSchema = overview?.state.supabase.schemaName || 'public';
-    const schema = rawSchema.replace(/[^a-zA-Z0-9_]/g, '') || 'public';
+    const schema = sanitizeSupabaseSchemaName(overview?.state.supabase.schemaName);
+    const ensureSchemaSql =
+      schema !== 'public' ? `create schema if not exists ${schema};\n\n` : '';
     return `-- Schema Supabase para Lumina Social (${overview?.state.supabase.projectUrl || 'https://jpllpvfunpsqexnvjgdt.supabase.co'})
-create table if not exists ${schema}.lumina_users (
+${ensureSchemaSql}create table if not exists ${schema}.lumina_users (
   id text primary key,
   auth_uid uuid unique,
   username text unique not null,
@@ -1349,9 +1459,13 @@ alter table ${schema}.lumina_users enable row level security;
 alter table ${schema}.lumina_posts enable row level security;
 
 -- Protege e-mail privado contra leitura anônima via API pública
-revoke select (email) on ${schema}.lumina_users from anon;
+revoke all on table ${schema}.lumina_users from anon, authenticated;
 grant select (id, auth_uid, username, display_name, avatar_url, cover_url, bio, verified, boosted, restricted, is_real_user, auth_source, created_at, updated_at)
-  on ${schema}.lumina_users to anon, authenticated;
+  on table ${schema}.lumina_users to anon, authenticated;
+grant insert, update on table ${schema}.lumina_users to authenticated;
+
+grant select on table ${schema}.lumina_posts to anon, authenticated;
+grant insert, update, delete on table ${schema}.lumina_posts to authenticated;
 
 drop policy if exists "Perfis públicos visíveis" on ${schema}.lumina_users;
 create policy "Perfis públicos visíveis"
@@ -2575,230 +2689,336 @@ ${itemsXml}
           </section>
 
           {/* Supabase Card */}
-          <section className="space-y-4 rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
-            <div className="flex items-start justify-between gap-3 border-b border-zinc-100 pb-4 dark:border-zinc-900">
-              <div className="flex items-center gap-3">
-                <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-                  <Database className="h-5 w-5" />
-                </span>
-                <div>
-                  <h2 className="text-base font-bold text-zinc-950 dark:text-white">
-                    Banco de Dados Supabase
-                  </h2>
-                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                    PostgreSQL · Row Level Security · Sincronização REST
-                  </p>
+          {(() => {
+            const supabaseRef =
+              state.supabase.projectUrl.match(/^https:\/\/([a-z0-9-]+)\.supabase\.co/i)?.[1] ||
+              'jpllpvfunpsqexnvjgdt';
+            const hasAnonOrEnv = Boolean(
+              overview?.envStatus.supabaseKeysEnv || state.supabase.anonKey?.trim()
+            );
+            const isMissingKeyState = !hasAnonOrEnv;
+            const statusText =
+              state.supabase.lastStatus === 'Online (Sem chave anon)'
+                ? 'Falta chave pública (anon)'
+                : state.supabase.lastStatus ||
+                  (hasAnonOrEnv ? 'Chave configurada' : 'Falta chave pública (anon)');
+            return (
+              <section className="space-y-4 rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
+                <div className="flex items-start justify-between gap-3 border-b border-zinc-100 pb-4 dark:border-zinc-900">
+                  <div className="flex items-center gap-3">
+                    <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                      <Database className="h-5 w-5" />
+                    </span>
+                    <div>
+                      <h2 className="text-base font-bold text-zinc-950 dark:text-white">
+                        Banco de Dados Supabase
+                      </h2>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                        PostgreSQL · Row Level Security · Sincronização REST
+                      </p>
+                    </div>
+                  </div>
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                      state.supabase.lastStatus === 'Conectado (Pronto)'
+                        ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                        : isMissingKeyState
+                        ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                        : 'bg-zinc-100 text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300'
+                    }`}
+                  >
+                    {statusText}
+                  </span>
                 </div>
-              </div>
-              <span
-                className={`text-xs font-semibold ${
-                  overview?.envStatus.supabaseKeysEnv
-                    ? 'text-emerald-600 dark:text-emerald-400'
-                    : 'text-zinc-500 dark:text-zinc-400'
-                }`}
-              >
-                {state.supabase.lastStatus || 'Pronto para conectar'}
-              </span>
-            </div>
 
-            <div className="space-y-3">
-              <label className="block space-y-1">
-                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                  URL do Projeto Supabase
-                </span>
-                <input
-                  type="url"
-                  value={state.supabase.projectUrl}
-                  onChange={(e) =>
-                    setOverview((prev) =>
-                      prev
-                        ? {
-                            ...prev,
-                            state: {
-                              ...prev.state,
-                              supabase: {
-                                ...prev.state.supabase,
-                                projectUrl: e.target.value,
-                              },
-                            },
-                          }
-                        : prev
-                    )
-                  }
-                  placeholder="https://seu-projeto.supabase.co"
-                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
-                />
-              </label>
-
-              <label className="block space-y-1">
-                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                  Schema PostgreSQL
-                </span>
-                <input
-                  type="text"
-                  value={state.supabase.schemaName}
-                  onChange={(e) =>
-                    setOverview((prev) =>
-                      prev
-                        ? {
-                            ...prev,
-                            state: {
-                              ...prev.state,
-                              supabase: {
-                                ...prev.state.supabase,
-                                schemaName: e.target.value,
-                              },
-                            },
-                          }
-                        : prev
-                    )
-                  }
-                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
-                />
-              </label>
-
-              <label className="block space-y-1">
-                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                  Chave Pública Supabase (anon / publishable)
-                </span>
-                <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
-                  <KeyRound className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
-                  <input
-                    type={showSupabaseAnonKey ? 'text' : 'password'}
-                    value={state.supabase.anonKey || ''}
-                    onChange={(e) =>
-                      setOverview((prev) =>
-                        prev
-                          ? {
-                              ...prev,
-                              state: {
-                                ...prev.state,
-                                supabase: {
-                                  ...prev.state.supabase,
-                                  anonKey: e.target.value,
+                <div className="space-y-3">
+                  <label className="block space-y-1">
+                    <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                      URL do Projeto Supabase
+                    </span>
+                    <input
+                      type="url"
+                      value={state.supabase.projectUrl}
+                      onChange={(e) =>
+                        setOverview((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                state: {
+                                  ...prev.state,
+                                  supabase: {
+                                    ...prev.state.supabase,
+                                    projectUrl: e.target.value,
+                                  },
                                 },
-                              },
-                            }
-                          : prev
-                      )
-                    }
-                    placeholder="eyJ... ou sb_publishable_... (somente chave pública anon)"
-                    className="h-10 w-full bg-transparent font-mono text-xs text-zinc-950 focus:outline-none dark:text-white"
-                  />
+                              }
+                            : prev
+                        )
+                      }
+                      placeholder="https://seu-projeto.supabase.co"
+                      className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                    />
+                  </label>
+
+                  <label className="block space-y-1">
+                    <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                      Chave Pública Supabase (anon / publishable)
+                    </span>
+                    <div
+                      className={`flex items-center gap-2 rounded-xl border px-3 ${
+                        isMissingKeyState
+                          ? 'border-amber-400/70 bg-amber-50/50 dark:border-amber-500/40 dark:bg-amber-950/20'
+                          : 'border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900'
+                      }`}
+                    >
+                      <KeyRound className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+                      <input
+                        type={showSupabaseAnonKey ? 'text' : 'password'}
+                        value={state.supabase.anonKey || ''}
+                        onChange={(e) =>
+                          setOverview((prev) =>
+                            prev
+                              ? {
+                                  ...prev,
+                                  state: {
+                                    ...prev.state,
+                                    supabase: {
+                                      ...prev.state.supabase,
+                                      anonKey: e.target.value,
+                                    },
+                                  },
+                                }
+                              : prev
+                          )
+                        }
+                        placeholder="Cole aqui sua chave sb_publishable_... ou eyJ..."
+                        className="h-10 w-full bg-transparent font-mono text-xs text-zinc-950 focus:outline-none dark:text-white"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowSupabaseAnonKey((v) => !v)}
+                        aria-label={showSupabaseAnonKey ? 'Ocultar chave' : 'Mostrar chave'}
+                        className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                      >
+                        {showSupabaseAnonKey ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
+                    <span className="block text-[11px] text-zinc-500 dark:text-zinc-400">
+                      Cole aqui a chave pública <strong>anon / publishable</strong> (nunca{' '}
+                      <code className="font-mono">service_role</code> ou{' '}
+                      <code className="font-mono">sb_secret_</code>). Para ativar para todos os
+                      visitantes em hospedagem estática, defina também{' '}
+                      <code className="font-mono">VITE_SUPABASE_ANON_KEY</code> no build do site.
+                    </span>
+                  </label>
+
+                  <label className="block space-y-1">
+                    <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                      Schema PostgreSQL <span className="font-normal text-zinc-400">(padrão: public)</span>
+                    </span>
+                    <input
+                      type="text"
+                      value={state.supabase.schemaName}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        const trimmed = val.trim();
+                        if (isSupabaseApiKeyLike(trimmed)) {
+                          if (isServiceRoleOrSecretKey(trimmed)) {
+                            const warn =
+                              'Você colou uma chave secreta (service_role/sb_secret) no campo Schema! Use apenas a chave pública no campo acima.';
+                            setSupabaseTestStatus(warn);
+                            showToast(warn);
+                            return;
+                          }
+                          setOverview((prev) =>
+                            prev
+                              ? {
+                                  ...prev,
+                                  state: {
+                                    ...prev.state,
+                                    supabase: {
+                                      ...prev.state.supabase,
+                                      schemaName: 'public',
+                                      anonKey: trimmed,
+                                    },
+                                  },
+                                }
+                              : prev
+                          );
+                          showToast(
+                            'Chave pública movida automaticamente para o campo "Chave Pública Supabase"!'
+                          );
+                          return;
+                        }
+                        setOverview((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                state: {
+                                  ...prev.state,
+                                  supabase: {
+                                    ...prev.state.supabase,
+                                    schemaName: val,
+                                  },
+                                },
+                              }
+                            : prev
+                        );
+                      }}
+                      placeholder="public"
+                      className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                    />
+                    <span className="block text-[11px] text-zinc-500 dark:text-zinc-400">
+                      Deixe como <code className="font-mono">public</code> — não cole chaves de API aqui.
+                    </span>
+                  </label>
+                </div>
+
+                {isMissingKeyState && (
+                  <div className="space-y-2.5 rounded-xl border border-amber-300/70 bg-amber-50/70 p-3.5 text-xs text-amber-950 dark:border-amber-500/30 dark:bg-amber-950/30 dark:text-amber-100">
+                    <p className="font-semibold">
+                      Seu Supabase está online! Faltam 2 passos rápidos para gravar usuários reais:
+                    </p>
+                    <ol className="list-inside list-decimal space-y-1 text-[11px] text-amber-900 dark:text-amber-200">
+                      <li>
+                        Abra as chaves do projeto <code className="font-mono">{supabaseRef}</code>,
+                        copie a chave <strong>anon / public</strong> (ou <strong>Publishable</strong>)
+                        e cole no campo acima.
+                      </li>
+                      <li>
+                        Clique em <strong>Salvar Supabase</strong> → <strong>Copiar SQL</strong> e
+                        execute no <strong>SQL Editor</strong> do Supabase.
+                      </li>
+                    </ol>
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      <a
+                        href={`https://supabase.com/dashboard/project/${supabaseRef}/settings/api`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-amber-900 px-3 text-[11px] font-semibold text-white hover:bg-amber-800 dark:bg-amber-400 dark:text-zinc-950 dark:hover:bg-amber-300"
+                      >
+                        <span>1. Pegar Chave anon no Supabase</span>
+                        <ExternalLink className="h-3 w-3" />
+                      </a>
+                      <a
+                        href={`https://supabase.com/dashboard/project/${supabaseRef}/sql/new`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-800/30 bg-white/80 px-3 text-[11px] font-semibold text-amber-950 hover:bg-white dark:border-amber-400/30 dark:bg-zinc-900/80 dark:text-amber-100"
+                      >
+                        <span>2. Abrir SQL Editor</span>
+                        <ExternalLink className="h-3 w-3" />
+                      </a>
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                  {[
+                    { key: 'autoSyncUsers' as const, label: 'Sincronizar usuários' },
+                    { key: 'autoSyncPosts' as const, label: 'Sincronizar posts' },
+                    { key: 'rlsEnforced' as const, label: 'Exigir RLS' },
+                  ].map((opt) => (
+                    <label
+                      key={opt.key}
+                      className="flex cursor-pointer items-center justify-between rounded-xl border border-zinc-200 px-3 py-2.5 text-xs font-medium text-zinc-800 dark:border-zinc-800 dark:text-zinc-200"
+                    >
+                      <span>{opt.label}</span>
+                      <input
+                        type="checkbox"
+                        checked={state.supabase[opt.key]}
+                        onChange={(e) =>
+                          setOverview((prev) =>
+                            prev
+                              ? {
+                                  ...prev,
+                                  state: {
+                                    ...prev.state,
+                                    supabase: {
+                                      ...prev.state.supabase,
+                                      [opt.key]: e.target.checked,
+                                    },
+                                  },
+                                }
+                              : prev
+                          )
+                        }
+                        className="h-4 w-4 accent-emerald-600"
+                      />
+                    </label>
+                  ))}
+                </div>
+
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                  {hasAnonOrEnv ? (
+                    <span className="font-medium text-emerald-600 dark:text-emerald-400">
+                      Chave Supabase configurada! Novos usuários reais são gravados em{' '}
+                      <code className="font-mono">{state.supabase.schemaName}.lumina_users</code>.
+                    </span>
+                  ) : (
+                    <>
+                      Aguardando sua <strong>Chave Pública (anon / publishable)</strong> acima para
+                      ativar o cadastro direto no projeto{' '}
+                      <code className="font-mono">{supabaseRef}</code>.
+                    </>
+                  )}
+                </p>
+
+                {supabaseTestStatus && (
+                  <p className="rounded-xl bg-zinc-100 px-3 py-2 text-xs text-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
+                    {supabaseTestStatus}
+                  </p>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
                   <button
                     type="button"
-                    onClick={() => setShowSupabaseAnonKey((v) => !v)}
-                    aria-label={showSupabaseAnonKey ? 'Ocultar chave' : 'Mostrar chave'}
-                    className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                    onClick={() => saveIntegrations({ supabase: state.supabase })}
+                    className="h-10 rounded-xl bg-zinc-950 px-4 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
                   >
-                    {showSupabaseAnonKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    Salvar Supabase
+                  </button>
+                  <button
+                    type="button"
+                    disabled={testingKey === 'supabase' || !state.supabase.projectUrl.trim()}
+                    onClick={() => testIntegration('supabase', state.supabase.projectUrl)}
+                    className="h-10 rounded-xl border border-zinc-200 px-4 text-xs font-semibold text-zinc-800 hover:bg-zinc-50 disabled:opacity-45 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                  >
+                    {testingKey === 'supabase' ? 'Testando...' : 'Testar conexão'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={syncingSupabase || !state.supabase.projectUrl.trim()}
+                    onClick={() => void syncSupabaseNow()}
+                    className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-emerald-600 px-3.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-45"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${syncingSupabase ? 'animate-spin' : ''}`} />
+                    <span>{syncingSupabase ? 'Sincronizando...' : 'Sincronizar usuários'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopySupabaseSql()}
+                    className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    <span>Copiar SQL</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDownloadSupabaseSql}
+                    className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>Baixar SQL + RLS</span>
                   </button>
                 </div>
-                <span className="block text-[11px] text-zinc-500 dark:text-zinc-400">
-                  Em hospedagem estática (como Appwrite Sites), use somente a chave pública <strong>anon / publishable</strong> — nunca cole a chave secreta <code className="font-mono">service_role</code> no navegador.
-                </span>
-              </label>
-            </div>
-
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-              {[
-                { key: 'autoSyncUsers' as const, label: 'Sincronizar usuários' },
-                { key: 'autoSyncPosts' as const, label: 'Sincronizar posts' },
-                { key: 'rlsEnforced' as const, label: 'Exigir RLS' },
-              ].map((opt) => (
-                <label
-                  key={opt.key}
-                  className="flex cursor-pointer items-center justify-between rounded-xl border border-zinc-200 px-3 py-2.5 text-xs font-medium text-zinc-800 dark:border-zinc-800 dark:text-zinc-200"
-                >
-                  <span>{opt.label}</span>
-                  <input
-                    type="checkbox"
-                    checked={state.supabase[opt.key]}
-                    onChange={(e) =>
-                      setOverview((prev) =>
-                        prev
-                          ? {
-                              ...prev,
-                              state: {
-                                ...prev.state,
-                                supabase: {
-                                  ...prev.state.supabase,
-                                  [opt.key]: e.target.checked,
-                                },
-                              },
-                            }
-                          : prev
-                      )
-                    }
-                    className="h-4 w-4 accent-emerald-600"
-                  />
-                </label>
-              ))}
-            </div>
-
-            <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              {overview?.envStatus.supabaseKeysEnv || state.supabase.anonKey?.trim() ? (
-                <span className="font-medium text-emerald-600 dark:text-emerald-400">
-                  Chave Supabase configurada! Novos usuários reais são gravados em{' '}
-                  <code className="font-mono">{state.supabase.schemaName}.lumina_users</code>.
-                </span>
-              ) : (
-                <>
-                  Cole a <strong>Chave Pública (anon / publishable)</strong> acima (ou configure <code className="font-mono">SUPABASE_SERVICE_ROLE_KEY</code> no servidor Node) e execute o SQL no SQL Editor do projeto{' '}
-                  <code className="font-mono">jpllpvfunpsqexnvjgdt</code>.
-                </>
-              )}
-            </p>
-
-            {supabaseTestStatus && (
-              <p className="rounded-xl bg-zinc-100 px-3 py-2 text-xs text-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
-                {supabaseTestStatus}
-              </p>
-            )}
-
-            <div className="flex flex-wrap items-center gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => saveIntegrations({ supabase: state.supabase })}
-                className="h-10 rounded-xl bg-zinc-950 px-4 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
-              >
-                Salvar Supabase
-              </button>
-              <button
-                type="button"
-                disabled={testingKey === 'supabase' || !state.supabase.projectUrl.trim()}
-                onClick={() => testIntegration('supabase', state.supabase.projectUrl)}
-                className="h-10 rounded-xl border border-zinc-200 px-4 text-xs font-semibold text-zinc-800 hover:bg-zinc-50 disabled:opacity-45 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
-              >
-                {testingKey === 'supabase' ? 'Testando...' : 'Testar conexão'}
-              </button>
-              <button
-                type="button"
-                disabled={syncingSupabase || !state.supabase.projectUrl.trim()}
-                onClick={() => void syncSupabaseNow()}
-                className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-emerald-600 px-3.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-45"
-              >
-                <RefreshCw className={`h-3.5 w-3.5 ${syncingSupabase ? 'animate-spin' : ''}`} />
-                <span>{syncingSupabase ? 'Sincronizando...' : 'Sincronizar usuários'}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleCopySupabaseSql()}
-                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
-              >
-                <Copy className="h-3.5 w-3.5" />
-                <span>Copiar SQL</span>
-              </button>
-              <button
-                type="button"
-                onClick={handleDownloadSupabaseSql}
-                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
-              >
-                <Download className="h-3.5 w-3.5" />
-                <span>Baixar SQL + RLS</span>
-              </button>
-            </div>
-          </section>
+              </section>
+            );
+          })()}
         </div>
       )}
 

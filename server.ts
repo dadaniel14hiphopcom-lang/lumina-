@@ -24,6 +24,7 @@ import { normalizeVideoFileForWeb } from './server/videoTranscoder.ts';
 import {
   DEFAULT_SUPABASE_URL,
   fetchPublicRealUsersFromSupabase,
+  isSecretSupabaseKey,
   registerOrSyncUserToSupabase,
   testSupabaseConnection,
   upsertPostToSupabase,
@@ -210,6 +211,7 @@ interface IntegrationState {
   supabase: {
     projectUrl: string;
     schemaName: string;
+    anonKey?: string;
     autoSyncUsers: boolean;
     autoSyncPosts: boolean;
     rlsEnforced: boolean;
@@ -277,6 +279,7 @@ const DEFAULT_ADMIN_STATE: IntegrationState = {
   supabase: {
     projectUrl: process.env.SUPABASE_URL?.trim() || DEFAULT_SUPABASE_URL,
     schemaName: 'public',
+    anonKey: '',
     autoSyncUsers: true,
     autoSyncPosts: true,
     rlsEnforced: true,
@@ -335,13 +338,31 @@ function readAdminState(): IntegrationState {
       const parsed = JSON.parse(raw) as Partial<IntegrationState>;
       return {
         aws: { ...DEFAULT_ADMIN_STATE.aws, ...(parsed.aws || {}) },
-        supabase: {
-          ...DEFAULT_ADMIN_STATE.supabase,
-          ...(parsed.supabase || {}),
-          projectUrl:
-            (parsed.supabase?.projectUrl || '').trim() ||
-            DEFAULT_ADMIN_STATE.supabase.projectUrl,
-        },
+        supabase: (() => {
+          const rawSchema = String(parsed.supabase?.schemaName || '').trim();
+          const schemaLooksLikeKey =
+            /^sb_(publishable|secret)_/i.test(rawSchema) ||
+            /^eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/.test(rawSchema) ||
+            rawSchema.length > 32;
+          const cleanSchema = schemaLooksLikeKey
+            ? 'public'
+            : rawSchema.replace(/[^a-zA-Z0-9_]/g, '').toLowerCase() || 'public';
+          const candidateAnon =
+            parsed.supabase?.anonKey && !isSecretSupabaseKey(parsed.supabase.anonKey)
+              ? String(parsed.supabase.anonKey).trim().slice(0, 600)
+              : schemaLooksLikeKey && !isSecretSupabaseKey(rawSchema)
+              ? rawSchema.slice(0, 600)
+              : '';
+          return {
+            ...DEFAULT_ADMIN_STATE.supabase,
+            ...(parsed.supabase || {}),
+            projectUrl:
+              (parsed.supabase?.projectUrl || '').trim() ||
+              DEFAULT_ADMIN_STATE.supabase.projectUrl,
+            schemaName: /^[a-z_][a-z0-9_]*$/.test(cleanSchema) ? cleanSchema : 'public',
+            anonKey: candidateAnon,
+          };
+        })(),
         wordpress: { ...DEFAULT_ADMIN_STATE.wordpress, ...(parsed.wordpress || {}) },
         site: {
           ...DEFAULT_ADMIN_STATE.site,
@@ -1757,7 +1778,9 @@ async function startServer() {
         awsRegionEnv: Boolean(process.env.AWS_REGION),
         supabaseUrlEnv: Boolean(process.env.SUPABASE_URL),
         supabaseKeysEnv: Boolean(
-          process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
+          process.env.SUPABASE_ANON_KEY ||
+            process.env.SUPABASE_SERVICE_ROLE_KEY ||
+            (state.supabase.anonKey && !isSecretSupabaseKey(state.supabase.anonKey))
         ),
         wordpressEnv: Boolean(process.env.WORDPRESS_SITE_URL),
       },
@@ -1804,14 +1827,43 @@ async function startServer() {
           return;
         }
       }
+      let nextAnonKey = current.supabase.anonKey || '';
+      if (typeof body.supabase.anonKey === 'string') {
+        const trimmedAnonKey = body.supabase.anonKey.trim();
+        if (trimmedAnonKey && isSecretSupabaseKey(trimmedAnonKey)) {
+          res.status(400).json({
+            error:
+              'Por segurança, nunca envie a chave secreta (service_role / sb_secret) para o navegador. Use apenas a chave pública (anon / publishable).',
+          });
+          return;
+        }
+        nextAnonKey = trimmedAnonKey.slice(0, 600);
+      }
+
+      const rawSchemaInput = String(body.supabase.schemaName || '').trim();
+      const schemaLooksLikeKey =
+        /^sb_(publishable|secret)_/i.test(rawSchemaInput) ||
+        /^eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/.test(rawSchemaInput) ||
+        rawSchemaInput.length > 32;
+      if (schemaLooksLikeKey && isSecretSupabaseKey(rawSchemaInput)) {
+        res.status(400).json({
+          error:
+            'Por segurança, nunca envie a chave secreta (service_role / sb_secret) no navegador. Use apenas a chave pública (anon / publishable).',
+        });
+        return;
+      }
+      if (!nextAnonKey && schemaLooksLikeKey && !isSecretSupabaseKey(rawSchemaInput)) {
+        nextAnonKey = rawSchemaInput.slice(0, 600);
+      }
+      const cleanedSchema = schemaLooksLikeKey
+        ? 'public'
+        : sanitizeIdentifier(rawSchemaInput, 'public', /[^a-zA-Z0-9_]/g).toLowerCase();
+
       current.supabase = {
         ...current.supabase,
         projectUrl: cleanUrl.slice(0, 200),
-        schemaName: sanitizeIdentifier(
-          String(body.supabase.schemaName || ''),
-          'public',
-          /[^a-zA-Z0-9_]/g
-        ),
+        schemaName: /^[a-z_][a-z0-9_]*$/.test(cleanedSchema) ? cleanedSchema : 'public',
+        anonKey: nextAnonKey,
         autoSyncUsers: Boolean(body.supabase.autoSyncUsers),
         autoSyncPosts: Boolean(body.supabase.autoSyncPosts),
         rlsEnforced: Boolean(body.supabase.rlsEnforced),
@@ -1892,15 +1944,35 @@ async function startServer() {
 
     try {
       if (provider === 'supabase') {
+        const requestedAnonKey =
+          typeof req.body?.anonKey === 'string' ? req.body.anonKey.trim() : '';
+        if (requestedAnonKey && isSecretSupabaseKey(requestedAnonKey)) {
+          res.status(400).json({
+            ok: false,
+            error:
+              'Por segurança, nunca envie a chave secreta (service_role / sb_secret) no navegador. Cole apenas a chave pública (anon / publishable).',
+          });
+          return;
+        }
+        const effectiveAnonKey = requestedAnonKey
+          ? requestedAnonKey.slice(0, 600)
+          : state.supabase.anonKey;
+        if (requestedAnonKey) {
+          state.supabase.anonKey = effectiveAnonKey;
+        }
+
         const result = await testSupabaseConnection(
           rawUrl || state.supabase.projectUrl,
-          state.supabase.schemaName
+          state.supabase.schemaName,
+          effectiveAnonKey
         );
         state.supabase.projectUrl = result.origin;
         state.supabase.lastVerifiedAt = Date.now();
         state.supabase.lastStatus = result.tablesReady
-          ? 'Conectado (Tabelas prontas)'
-          : `HTTP ${result.httpStatus}`;
+          ? 'Conectado (Pronto)'
+          : result.hasKeys
+          ? 'Chave OK · Falta SQL'
+          : 'Falta chave pública (anon)';
         writeAdminState(state);
         res.json({
           ok: true,
@@ -2685,7 +2757,8 @@ async function startServer() {
       const sbLogin = await verifySupabasePasswordLogin(
         adminState.supabase.projectUrl,
         identifierRaw,
-        password
+        password,
+        adminState.supabase.anonKey
       );
       if (sbLogin.ok) {
         res.json({
