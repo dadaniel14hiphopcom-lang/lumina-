@@ -16,6 +16,12 @@ import {
 } from '../lib/firebase';
 import { verifyStaticAdminPasscode } from '../utils/staticAdminAuth';
 import {
+  fetchPublicUsersFromSupabaseBrowser,
+  getBrowserSupabaseConfig,
+  loginSupabaseFromBrowser,
+  signupRealUserInSupabaseFromBrowser,
+} from '../lib/supabaseClient';
+import {
   adminUpdateProfileFlagsInCloud,
   createInviteInCloud,
   createPostInCloud,
@@ -870,7 +876,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       try {
         const res = await fetch('/api/social/state');
         const ct = res.headers.get('content-type') || '';
-        if (!res.ok || !ct.includes('application/json')) return;
+        if (!res.ok || !ct.includes('application/json')) {
+          throw new Error('Static hosting fallback');
+        }
         const data = (await res.json()) as {
           ok?: boolean;
           state?: {
@@ -905,7 +913,19 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             : prev.notifications,
         }));
       } catch {
-        // Static hosting without Node /api/social/state
+        // Static hosting without Node /api/social/state — try direct Supabase public profile fetch
+        const sbConfig = getBrowserSupabaseConfig();
+        if (sbConfig.autoSyncUsers && sbConfig.anonKey) {
+          const sbUsers = await fetchPublicUsersFromSupabaseBrowser(sbConfig);
+          if (active && sbUsers.length > 0) {
+            skipNextServerPushRef.current = true;
+            skipNextStateBroadcastRef.current = true;
+            setState((prev) => ({
+              ...prev,
+              users: mergeRecordsById(prev.users, sbUsers as unknown as UserProfile[]),
+            }));
+          }
+        }
       }
     };
     void pullServerState();
@@ -1658,8 +1678,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     }
 
     let resolvedId = `user_${Date.now()}`;
+    let resolvedUid = auth.currentUser?.uid;
     let resolvedVerified = false;
     let supabaseSynced = false;
+    let usedBackendApi = false;
 
     try {
       const res = await fetch('/api/auth/register', {
@@ -1677,6 +1699,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       });
       const ct = res.headers.get('content-type') || '';
       if (ct.includes('application/json')) {
+        usedBackendApi = true;
         const data = (await res.json()) as {
           ok?: boolean;
           error?: string;
@@ -1692,7 +1715,28 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         supabaseSynced = Boolean(data.supabaseSynced);
       }
     } catch {
-      // Static hosting without Node backend — continue with local + Firebase persistence
+      // Static hosting without Node backend
+    }
+
+    if (!usedBackendApi) {
+      const sbConfig = getBrowserSupabaseConfig();
+      if (sbConfig.autoSyncUsers && sbConfig.anonKey) {
+        const sbRes = await signupRealUserInSupabaseFromBrowser(sbConfig, {
+          id: resolvedId,
+          username: cleanHandle,
+          displayName: payload.displayName.trim() || cleanHandle,
+          email: cleanEmail,
+          password,
+          bio: payload.bio.trim(),
+          avatarUrl: payload.avatarUrl,
+          coverUrl: payload.coverUrl,
+        });
+        if (!sbRes.ok) {
+          return { ok: false, error: sbRes.error || 'Não foi possível gravar usuário no Supabase.' };
+        }
+        if (sbRes.authUid) resolvedUid = sbRes.authUid;
+        supabaseSynced = true;
+      }
     }
 
     const salt = generateSaltHex();
@@ -1713,7 +1757,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
     const newUser: UserProfile = {
       id: resolvedId,
-      uid: auth.currentUser?.uid,
+      uid: resolvedUid,
       username: cleanHandle,
       displayName: payload.displayName.trim() || cleanHandle,
       avatarUrl: payload.avatarUrl || SEED_USERS[0].avatarUrl,
@@ -1857,6 +1901,46 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       }
     } catch {
       // Static hosting without backend auth endpoint
+    }
+
+    // Direct Supabase Auth fallback for static hosting (login across browsers/devices)
+    if (rawId.includes('@')) {
+      const sbConfig = getBrowserSupabaseConfig();
+      if (sbConfig.anonKey) {
+        const sbLogin = await loginSupabaseFromBrowser(sbConfig, rawId, password);
+        if (sbLogin.ok && sbLogin.userId && sbLogin.username) {
+          const existingSbUser =
+            state.users.find((u) => u.id === sbLogin.userId) ||
+            state.users.find((u) => u.username.toLowerCase() === sbLogin.username!.toLowerCase());
+          const resolvedProfile: UserProfile = existingSbUser || {
+            id: sbLogin.userId,
+            username: sbLogin.username,
+            displayName: sbLogin.displayName || sbLogin.username,
+            avatarUrl: SEED_USERS[0].avatarUrl,
+            coverUrl: SEED_USERS[0].coverUrl,
+            bio: 'Usuário conectado via Supabase Auth.',
+            email: sbLogin.email || rawId,
+            verified: false,
+            isOnline: true,
+            isDemoSeed: false,
+            followers: [],
+            following: [],
+          };
+          setState((prev) => ({
+            ...prev,
+            users: existingSbUser
+              ? prev.users
+              : [resolvedProfile, ...prev.users.filter((u) => u.id !== resolvedProfile.id)],
+            currentUserId: resolvedProfile.id,
+            isAuthenticated: true,
+          }));
+          setGuestBrowsing(false);
+          setViewingProfileId(null);
+          setIsInviteModalOpen(false);
+          showToast(`Conectado como @${resolvedProfile.username}`);
+          return { ok: true };
+        }
+      }
     }
 
     // Static hosting fallback for exclusive admin passcode (PBKDF2 in browser storage)

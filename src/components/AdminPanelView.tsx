@@ -32,6 +32,12 @@ import {
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_VIDEO_RULES, encodeInviteMeta, useSocial } from '../context/SocialContext';
 import { ADMIN_EMAIL, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
+import {
+  DEFAULT_SUPABASE_URL,
+  fetchPublicUsersFromSupabaseBrowser,
+  isServiceRoleOrSecretKey,
+  testSupabaseFromBrowser,
+} from '../lib/supabaseClient';
 import { InviteRecord, VideoRulesConfig } from '../types';
 import {
   claimOrUpdateStaticAdminPasscode,
@@ -60,6 +66,7 @@ interface ServerOverview {
     supabase: {
       projectUrl: string;
       schemaName: string;
+      anonKey?: string;
       autoSyncUsers: boolean;
       autoSyncPosts: boolean;
       rlsEnforced: boolean;
@@ -156,8 +163,9 @@ const DEFAULT_LOCAL_STATE: ServerOverview['state'] = {
     lastVerifiedAt: null,
   },
   supabase: {
-    projectUrl: 'https://jpllpvfunpsqexnvjgdt.supabase.co',
+    projectUrl: DEFAULT_SUPABASE_URL,
     schemaName: 'public',
+    anonKey: '',
     autoSyncUsers: true,
     autoSyncPosts: true,
     rlsEnforced: true,
@@ -214,6 +222,10 @@ function loadLocalAdminState(): ServerOverview['state'] {
           projectUrl:
             (parsed.supabase?.projectUrl || '').trim() ||
             DEFAULT_LOCAL_STATE.supabase.projectUrl,
+          anonKey:
+            parsed.supabase?.anonKey && !isServiceRoleOrSecretKey(parsed.supabase.anonKey)
+              ? parsed.supabase.anonKey.trim()
+              : '',
         },
         wordpress: { ...DEFAULT_LOCAL_STATE.wordpress, ...(parsed.wordpress || {}) },
         site: {
@@ -319,6 +331,7 @@ export function AdminPanelView() {
   // Integrations test feedback
   const [awsTestStatus, setAwsTestStatus] = useState<string | null>(null);
   const [supabaseTestStatus, setSupabaseTestStatus] = useState<string | null>(null);
+  const [showSupabaseAnonKey, setShowSupabaseAnonKey] = useState(false);
   const [syncingSupabase, setSyncingSupabase] = useState(false);
   const [wpTestStatus, setWpTestStatus] = useState<string | null>(null);
   const [wpSyncedPosts, setWpSyncedPosts] = useState<WordPressPostPreview[]>([]);
@@ -813,6 +826,25 @@ export function AdminPanelView() {
   const saveIntegrations = async (
     patch: Partial<Pick<ServerOverview['state'], 'aws' | 'supabase' | 'wordpress'>>
   ) => {
+    if (patch.supabase?.anonKey && isServiceRoleOrSecretKey(patch.supabase.anonKey)) {
+      const warn =
+        'Por segurança, nunca cole a chave secreta (service_role / sb_secret) aqui. Use apenas a chave pública (anon / publishable).';
+      setSupabaseTestStatus(warn);
+      showToast(warn);
+      return;
+    }
+
+    if (patch.supabase && overview?.state) {
+      saveLocalAdminState({
+        ...overview.state,
+        supabase: {
+          ...overview.state.supabase,
+          ...patch.supabase,
+          anonKey: (patch.supabase.anonKey || '').trim(),
+        },
+      });
+    }
+
     if (!authStatus.serverAvailable) {
       setOverview((prev) => {
         if (!prev) return prev;
@@ -820,7 +852,11 @@ export function AdminPanelView() {
           ...prev.state,
           aws: patch.aws ? { ...prev.state.aws, ...patch.aws } : prev.state.aws,
           supabase: patch.supabase
-            ? { ...prev.state.supabase, ...patch.supabase }
+            ? {
+                ...prev.state.supabase,
+                ...patch.supabase,
+                anonKey: (patch.supabase.anonKey || '').trim(),
+              }
             : prev.state.supabase,
           wordpress: patch.wordpress
             ? { ...prev.state.wordpress, ...patch.wordpress }
@@ -829,17 +865,45 @@ export function AdminPanelView() {
         saveLocalAdminState(nextState);
         return { ...prev, state: nextState };
       });
-      showToast('Configurações salvas localmente');
+      showToast('Configurações do Supabase salvas neste domínio');
       return;
     }
 
+    const serverPatch = patch.supabase
+      ? {
+          ...patch,
+          supabase: {
+            projectUrl: patch.supabase.projectUrl,
+            schemaName: patch.supabase.schemaName,
+            autoSyncUsers: patch.supabase.autoSyncUsers,
+            autoSyncPosts: patch.supabase.autoSyncPosts,
+            rlsEnforced: patch.supabase.rlsEnforced,
+            lastVerifiedAt: patch.supabase.lastVerifiedAt,
+            lastStatus: patch.supabase.lastStatus,
+          },
+        }
+      : patch;
+
     const res = await authFetch('/api/admin/integrations', {
       method: 'PUT',
-      body: JSON.stringify(patch),
+      body: JSON.stringify(serverPatch),
     });
     if (res.ok) {
       const data = (await res.json()) as { state: ServerOverview['state'] };
-      setOverview((prev) => (prev ? { ...prev, state: data.state } : prev));
+      setOverview((prev) =>
+        prev
+          ? {
+              ...prev,
+              state: {
+                ...data.state,
+                supabase: {
+                  ...data.state.supabase,
+                  anonKey: prev.state.supabase.anonKey || '',
+                },
+              },
+            }
+          : prev
+      );
       showToast('Configurações salvas no servidor');
     } else {
       showToast('Não foi possível salvar as configurações');
@@ -851,10 +915,56 @@ export function AdminPanelView() {
     url?: string
   ) => {
     if (!authStatus.serverAvailable) {
+      if (provider === 'supabase') {
+        setTestingKey('supabase');
+        try {
+          const result = await testSupabaseFromBrowser({
+            projectUrl: url || overview?.state.supabase.projectUrl,
+            schemaName: overview?.state.supabase.schemaName,
+            anonKey: overview?.state.supabase.anonKey,
+          });
+          setSupabaseTestStatus(result.statusLabel);
+          setOverview((prev) => {
+            if (!prev) return prev;
+            const nextState: ServerOverview['state'] = {
+              ...prev.state,
+              supabase: {
+                ...prev.state.supabase,
+                projectUrl: result.origin,
+                lastVerifiedAt: Date.now(),
+                lastStatus: result.tablesReady
+                  ? 'Conectado (Pronto)'
+                  : result.hasKey
+                  ? 'Chave OK · Falta SQL'
+                  : 'Online (Sem chave anon)',
+              },
+            };
+            saveLocalAdminState(nextState);
+            return { ...prev, state: nextState };
+          });
+          showToast(
+            result.tablesReady
+              ? 'Supabase conectado e tabela lumina_users pronta!'
+              : result.reachable
+              ? 'Supabase online!'
+              : 'Falha ao conectar ao Supabase'
+          );
+        } catch (err) {
+          const msg =
+            err instanceof Error
+              ? err.message
+              : 'Não foi possível alcançar o projeto Supabase pelo navegador.';
+          setSupabaseTestStatus(msg);
+          showToast(msg);
+        } finally {
+          setTestingKey(null);
+        }
+        return;
+      }
+
       const msg =
         'Teste de rede via proxy exige o servidor Node.js ativo (npm start). Em hospedagem estática, exporte os arquivos SQL/IAM/Kit WP normalmente.';
       if (provider === 'aws') setAwsTestStatus(msg);
-      if (provider === 'supabase') setSupabaseTestStatus(msg);
       if (provider === 'wordpress') setWpTestStatus(msg);
       showToast('Modo estático: use os exportadores locais');
       return;
@@ -893,9 +1003,44 @@ export function AdminPanelView() {
 
   const syncSupabaseNow = async () => {
     if (!authStatus.serverAvailable) {
-      setSupabaseTestStatus(
-        'Sincronização server-side exige o servidor Node.js ativo (npm start) com SUPABASE_SERVICE_ROLE_KEY ou SUPABASE_ANON_KEY.'
-      );
+      setSyncingSupabase(true);
+      try {
+        const cfg = {
+          projectUrl: overview?.state.supabase.projectUrl || DEFAULT_SUPABASE_URL,
+          schemaName: overview?.state.supabase.schemaName || 'public',
+          anonKey: (overview?.state.supabase.anonKey || '').trim(),
+          autoSyncUsers: Boolean(overview?.state.supabase.autoSyncUsers ?? true),
+        };
+        const check = await testSupabaseFromBrowser(cfg);
+        if (!check.hasKey || !check.tablesReady) {
+          setSupabaseTestStatus(check.statusLabel);
+          showToast(check.hasKey ? 'Execute o SQL no Supabase antes de sincronizar' : 'Cole a Chave Pública (anon) do Supabase');
+          return;
+        }
+        const remoteUsers = await fetchPublicUsersFromSupabaseBrowser(cfg);
+        const msg = `Banco conectado direto pelo navegador! ${remoteUsers.length} usuário(s) real(is) encontrado(s) em ${cfg.schemaName}.lumina_users. Novos cadastros feitos no site gravam automaticamente neste banco.`;
+        setSupabaseTestStatus(msg);
+        setOverview((prev) => {
+          if (!prev) return prev;
+          const nextState: ServerOverview['state'] = {
+            ...prev.state,
+            supabase: {
+              ...prev.state.supabase,
+              lastVerifiedAt: Date.now(),
+              lastStatus: `${remoteUsers.length} usuário(s) no banco`,
+            },
+          };
+          saveLocalAdminState(nextState);
+          return { ...prev, state: nextState };
+        });
+        showToast('Conexão e leitura do Supabase confirmadas!');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Falha ao consultar Supabase.';
+        setSupabaseTestStatus(msg);
+        showToast(msg);
+      } finally {
+        setSyncingSupabase(false);
+      }
       return;
     }
     setSyncingSupabase(true);
@@ -1230,6 +1375,55 @@ drop policy if exists "Publicações de contas ativas" on ${schema}.lumina_posts
 create policy "Publicações de contas ativas"
   on ${schema}.lumina_posts for select
   using (true);
+
+-- Sincronização automática: todo usuário criado no Supabase Auth entra em lumina_users
+create or replace function ${schema}.handle_new_lumina_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ${schema}, public
+as $$
+declare
+  raw_handle text;
+  clean_handle text;
+  resolved_id text;
+begin
+  resolved_id := coalesce(nullif(new.raw_user_meta_data->>'lumina_id', ''), new.id::text);
+  raw_handle := lower(coalesce(new.raw_user_meta_data->>'username', split_part(new.email, '@', 1), 'user'));
+  clean_handle := regexp_replace(raw_handle, '[^a-z0-9._]', '', 'g');
+  if length(clean_handle) < 3 then
+    clean_handle := 'user.' || substr(replace(new.id::text, '-', ''), 1, 6);
+  end if;
+  if exists (select 1 from ${schema}.lumina_users where lower(username) = clean_handle and id <> resolved_id) then
+    clean_handle := left(clean_handle, 24) || '.' || substr(replace(new.id::text, '-', ''), 1, 4);
+  end if;
+
+  insert into ${schema}.lumina_users (
+    id, auth_uid, username, display_name, email, bio, is_real_user, auth_source, updated_at
+  ) values (
+    resolved_id,
+    new.id,
+    clean_handle,
+    coalesce(nullif(new.raw_user_meta_data->>'display_name', ''), clean_handle),
+    new.email,
+    coalesce(new.raw_user_meta_data->>'bio', 'Novo usuário real na Lumina.'),
+    true,
+    'register',
+    now()
+  )
+  on conflict (id) do update set
+    auth_uid = excluded.auth_uid,
+    display_name = excluded.display_name,
+    email = coalesce(excluded.email, ${schema}.lumina_users.email),
+    updated_at = now();
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created_lumina on auth.users;
+create trigger on_auth_user_created_lumina
+  after insert on auth.users
+  for each row execute function ${schema}.handle_new_lumina_user();
 `;
   };
 
@@ -2462,6 +2656,48 @@ ${itemsXml}
                   className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
                 />
               </label>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Chave Pública Supabase (anon / publishable)
+                </span>
+                <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                  <KeyRound className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+                  <input
+                    type={showSupabaseAnonKey ? 'text' : 'password'}
+                    value={state.supabase.anonKey || ''}
+                    onChange={(e) =>
+                      setOverview((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              state: {
+                                ...prev.state,
+                                supabase: {
+                                  ...prev.state.supabase,
+                                  anonKey: e.target.value,
+                                },
+                              },
+                            }
+                          : prev
+                      )
+                    }
+                    placeholder="eyJ... ou sb_publishable_... (somente chave pública anon)"
+                    className="h-10 w-full bg-transparent font-mono text-xs text-zinc-950 focus:outline-none dark:text-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowSupabaseAnonKey((v) => !v)}
+                    aria-label={showSupabaseAnonKey ? 'Ocultar chave' : 'Mostrar chave'}
+                    className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+                  >
+                    {showSupabaseAnonKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
+                <span className="block text-[11px] text-zinc-500 dark:text-zinc-400">
+                  Em hospedagem estática (como Appwrite Sites), use somente a chave pública <strong>anon / publishable</strong> — nunca cole a chave secreta <code className="font-mono">service_role</code> no navegador.
+                </span>
+              </label>
             </div>
 
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
@@ -2501,15 +2737,14 @@ ${itemsXml}
             </div>
 
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              {overview?.envStatus.supabaseKeysEnv ? (
+              {overview?.envStatus.supabaseKeysEnv || state.supabase.anonKey?.trim() ? (
                 <span className="font-medium text-emerald-600 dark:text-emerald-400">
-                  Chave Supabase detectada nos Segredos do servidor. Novos usuários reais são gravados automaticamente em{' '}
+                  Chave Supabase configurada! Novos usuários reais são gravados em{' '}
                   <code className="font-mono">{state.supabase.schemaName}.lumina_users</code>.
                 </span>
               ) : (
                 <>
-                  Adicione <code className="font-mono">SUPABASE_SERVICE_ROLE_KEY</code> (ou{' '}
-                  <code className="font-mono">SUPABASE_ANON_KEY</code>) nos Segredos do servidor e execute o SQL abaixo no SQL Editor do projeto{' '}
+                  Cole a <strong>Chave Pública (anon / publishable)</strong> acima (ou configure <code className="font-mono">SUPABASE_SERVICE_ROLE_KEY</code> no servidor Node) e execute o SQL no SQL Editor do projeto{' '}
                   <code className="font-mono">jpllpvfunpsqexnvjgdt</code>.
                 </>
               )}
