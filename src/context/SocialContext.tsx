@@ -341,6 +341,16 @@ interface SocialContextValue {
     avatarUrl?: string;
     coverUrl?: string;
   }) => Promise<{ ok: boolean; error?: string }>;
+  registerRealUser: (payload: {
+    username: string;
+    displayName: string;
+    email: string;
+    password: string;
+    bio: string;
+    inviteCode?: string;
+    avatarUrl?: string;
+    coverUrl?: string;
+  }) => Promise<{ ok: boolean; error?: string }>;
   loginWithCredentials: (
     identifier: string,
     password: string
@@ -714,6 +724,25 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       await upsertOwnProfileInCloud(activeProfile, fbUser).catch(() => {});
       if (isExclusiveAdmin) {
         await adminUpdateProfileFlagsInCloud(activeProfile, fbUser).catch(() => {});
+      }
+      try {
+        const idToken = await fbUser.getIdToken();
+        await fetch('/api/supabase/sync-user', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({
+            username: activeProfile.username,
+            displayName: activeProfile.displayName,
+            bio: activeProfile.bio,
+            avatarUrl: activeProfile.avatarUrl,
+            coverUrl: activeProfile.coverUrl,
+          }),
+        });
+      } catch {
+        // Ignore if running on static hosting without Node backend
       }
     })();
 
@@ -1462,6 +1491,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             code: cleanCode,
             userId: newId,
             username: cleanHandle,
+            displayName: payload.displayName.trim() || cleanHandle,
+            bio: payload.bio.trim() || undefined,
+            avatarUrl: payload.avatarUrl,
+            coverUrl: payload.coverUrl,
             email: cleanEmail || undefined,
             password,
           }),
@@ -1494,6 +1527,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           code: cleanCode,
           userId: newId,
           username: cleanHandle,
+          displayName: payload.displayName.trim() || cleanHandle,
+          bio: payload.bio.trim() || undefined,
+          avatarUrl: payload.avatarUrl,
+          coverUrl: payload.coverUrl,
           email: cleanEmail || localMatch?.email || pendingInviteMeta?.email,
           password,
         }),
@@ -1573,6 +1610,148 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     return { ok: true };
   };
 
+  const registerRealUser = async (payload: {
+    username: string;
+    displayName: string;
+    email: string;
+    password: string;
+    bio: string;
+    inviteCode?: string;
+    avatarUrl?: string;
+    coverUrl?: string;
+  }): Promise<{ ok: boolean; error?: string }> => {
+    const cleanCode = (payload.inviteCode || '').trim().toUpperCase();
+    if (cleanCode) {
+      return registerWithInvite({
+        code: cleanCode,
+        username: payload.username,
+        displayName: payload.displayName,
+        email: payload.email,
+        password: payload.password,
+        bio: payload.bio,
+        avatarUrl: payload.avatarUrl,
+        coverUrl: payload.coverUrl,
+      });
+    }
+
+    const rawHandle = payload.username.trim().toLowerCase().replace(/^@/, '');
+    const cleanHandle = rawHandle.replace(/[^a-z0-9._]/g, '');
+    if (cleanHandle.length < 3 || cleanHandle !== rawHandle) {
+      return {
+        ok: false,
+        error: 'Escolha um @usuario válido com pelo menos 3 caracteres (letras, números, ponto e _).',
+      };
+    }
+
+    const cleanEmail = payload.email.trim().toLowerCase();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return { ok: false, error: 'Informe um e-mail real válido para criar a conta.' };
+    }
+
+    const password = payload.password || '';
+    if (password.length < 6) {
+      return { ok: false, error: 'Crie uma senha de acesso com pelo menos 6 caracteres.' };
+    }
+
+    if (state.users.some((u) => !u.isDemoSeed && u.username.toLowerCase() === cleanHandle)) {
+      return { ok: false, error: `O nome @${cleanHandle} já está em uso.` };
+    }
+
+    let resolvedId = `user_${Date.now()}`;
+    let resolvedVerified = false;
+    let supabaseSynced = false;
+
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: cleanHandle,
+          displayName: payload.displayName.trim() || cleanHandle,
+          email: cleanEmail,
+          password,
+          bio: payload.bio.trim(),
+          avatarUrl: payload.avatarUrl,
+          coverUrl: payload.coverUrl,
+        }),
+      });
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('application/json')) {
+        const data = (await res.json()) as {
+          ok?: boolean;
+          error?: string;
+          user?: UserProfile;
+          grantVerified?: boolean;
+          supabaseSynced?: boolean;
+        };
+        if (!res.ok || !data.ok) {
+          return { ok: false, error: data.error || 'Não foi possível concluir o cadastro.' };
+        }
+        if (data.user?.id) resolvedId = data.user.id;
+        resolvedVerified = Boolean(data.grantVerified ?? data.user?.verified);
+        supabaseSynced = Boolean(data.supabaseSynced);
+      }
+    } catch {
+      // Static hosting without Node backend — continue with local + Firebase persistence
+    }
+
+    const salt = generateSaltHex();
+    const hash = await derivePasswordHash(password, salt);
+    const existingCreds = loadLocalCredentials().filter(
+      (c) => c.userId !== resolvedId && c.username.toLowerCase() !== cleanHandle
+    );
+    existingCreds.unshift({
+      userId: resolvedId,
+      username: cleanHandle,
+      email: cleanEmail,
+      salt,
+      hash,
+      createdAt: Date.now(),
+    });
+    saveLocalCredentials(existingCreds);
+    setCredentialsVersion((v) => v + 1);
+
+    const newUser: UserProfile = {
+      id: resolvedId,
+      uid: auth.currentUser?.uid,
+      username: cleanHandle,
+      displayName: payload.displayName.trim() || cleanHandle,
+      avatarUrl: payload.avatarUrl || SEED_USERS[0].avatarUrl,
+      coverUrl: payload.coverUrl || SEED_USERS[0].coverUrl,
+      bio: payload.bio.trim() || 'Novo usuário real na Lumina.',
+      email: cleanEmail,
+      verified: resolvedVerified,
+      isOnline: true,
+      isDemoSeed: false,
+      followers: [],
+      following: [],
+    };
+
+    setState((prev) => ({
+      ...prev,
+      users: [newUser, ...prev.users.filter((u) => u.id !== resolvedId)],
+      currentUserId: resolvedId,
+      isAuthenticated: true,
+    }));
+    setGuestBrowsing(false);
+    setPendingInviteCode(null);
+    setPendingInviteMeta(null);
+    setIsInviteModalOpen(false);
+    setViewingProfileId(null);
+    setActiveNav('feed');
+
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void upsertOwnProfileInCloud(newUser, auth.currentUser).catch(() => {});
+    }
+
+    showToast(
+      supabaseSynced
+        ? `Conta @${cleanHandle} criada e gravada no Supabase!`
+        : `Bem-vindo(a), @${cleanHandle}! Conta real criada.`
+    );
+    return { ok: true };
+  };
+
   const loginWithCredentials = async (
     identifier: string,
     password: string
@@ -1621,6 +1800,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           ok?: boolean;
           userId?: string;
           username?: string;
+          displayName?: string;
+          email?: string;
           isAdmin?: boolean;
           adminToken?: string;
           error?: string;
@@ -1642,6 +1823,33 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             setViewingProfileId(null);
             setIsInviteModalOpen(false);
             showToast(`Conectado como @${targetUser.username}`);
+            return { ok: true };
+          }
+          if (data.userId && data.username) {
+            const hydratedUser: UserProfile = {
+              id: data.userId,
+              username: data.username,
+              displayName: data.displayName || data.username,
+              avatarUrl: SEED_USERS[0].avatarUrl,
+              coverUrl: SEED_USERS[0].coverUrl,
+              bio: 'Usuário conectado via Supabase Auth.',
+              email: data.email,
+              verified: false,
+              isOnline: true,
+              isDemoSeed: false,
+              followers: [],
+              following: [],
+            };
+            setState((prev) => ({
+              ...prev,
+              users: [hydratedUser, ...prev.users.filter((u) => u.id !== hydratedUser.id)],
+              currentUserId: hydratedUser.id,
+              isAuthenticated: true,
+            }));
+            setGuestBrowsing(false);
+            setViewingProfileId(null);
+            setIsInviteModalOpen(false);
+            showToast(`Conectado como @${hydratedUser.username}`);
             return { ok: true };
           }
         }
@@ -2415,6 +2623,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         createInvite,
         revokeInvite,
         registerWithInvite,
+        registerRealUser,
         loginWithCredentials,
         purgeDemoUsers,
         pendingChatUserId,

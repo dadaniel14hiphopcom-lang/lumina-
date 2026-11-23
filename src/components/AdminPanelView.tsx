@@ -156,7 +156,7 @@ const DEFAULT_LOCAL_STATE: ServerOverview['state'] = {
     lastVerifiedAt: null,
   },
   supabase: {
-    projectUrl: '',
+    projectUrl: 'https://jpllpvfunpsqexnvjgdt.supabase.co',
     schemaName: 'public',
     autoSyncUsers: true,
     autoSyncPosts: true,
@@ -208,7 +208,13 @@ function loadLocalAdminState(): ServerOverview['state'] {
       const parsed = JSON.parse(raw) as Partial<ServerOverview['state']>;
       return {
         aws: { ...DEFAULT_LOCAL_STATE.aws, ...(parsed.aws || {}) },
-        supabase: { ...DEFAULT_LOCAL_STATE.supabase, ...(parsed.supabase || {}) },
+        supabase: {
+          ...DEFAULT_LOCAL_STATE.supabase,
+          ...(parsed.supabase || {}),
+          projectUrl:
+            (parsed.supabase?.projectUrl || '').trim() ||
+            DEFAULT_LOCAL_STATE.supabase.projectUrl,
+        },
         wordpress: { ...DEFAULT_LOCAL_STATE.wordpress, ...(parsed.wordpress || {}) },
         site: {
           ...DEFAULT_LOCAL_STATE.site,
@@ -313,6 +319,7 @@ export function AdminPanelView() {
   // Integrations test feedback
   const [awsTestStatus, setAwsTestStatus] = useState<string | null>(null);
   const [supabaseTestStatus, setSupabaseTestStatus] = useState<string | null>(null);
+  const [syncingSupabase, setSyncingSupabase] = useState(false);
   const [wpTestStatus, setWpTestStatus] = useState<string | null>(null);
   const [wpSyncedPosts, setWpSyncedPosts] = useState<WordPressPostPreview[]>([]);
   const [testingKey, setTestingKey] = useState<string | null>(null);
@@ -884,6 +891,37 @@ export function AdminPanelView() {
     }
   };
 
+  const syncSupabaseNow = async () => {
+    if (!authStatus.serverAvailable) {
+      setSupabaseTestStatus(
+        'Sincronização server-side exige o servidor Node.js ativo (npm start) com SUPABASE_SERVICE_ROLE_KEY ou SUPABASE_ANON_KEY.'
+      );
+      return;
+    }
+    setSyncingSupabase(true);
+    try {
+      const realUsers = allUsers.filter((u) => !u.isDemoSeed);
+      const res = await authFetch('/api/admin/supabase/sync-now', {
+        method: 'POST',
+        body: JSON.stringify({
+          projectUrl: overview?.state.supabase.projectUrl,
+          users: realUsers,
+        }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        statusLabel?: string;
+        error?: string;
+      };
+      const msg = data.statusLabel || data.error || 'Sincronização finalizada.';
+      setSupabaseTestStatus(msg);
+      showToast(data.ok ? 'Usuários reais sincronizados no Supabase' : msg);
+      await loadOverview();
+    } finally {
+      setSyncingSupabase(false);
+    }
+  };
+
   const handleDownloadProtected = async (url: string, fallbackName: string) => {
     if (!authStatus.serverAvailable) {
       if (url === '/api/admin/wordpress/download-kit' && overview?.state) {
@@ -1125,24 +1163,34 @@ export function AdminPanelView() {
     }
   };
 
-  const handleDownloadSupabaseSql = () => {
-    const schema = overview?.state.supabase.schemaName || 'public';
-    const sql = `-- Schema Supabase para Lumina Social
-create table if not exists ${schema}.users (
+  const buildSupabaseSql = () => {
+    const rawSchema = overview?.state.supabase.schemaName || 'public';
+    const schema = rawSchema.replace(/[^a-zA-Z0-9_]/g, '') || 'public';
+    return `-- Schema Supabase para Lumina Social (${overview?.state.supabase.projectUrl || 'https://jpllpvfunpsqexnvjgdt.supabase.co'})
+create table if not exists ${schema}.lumina_users (
   id text primary key,
+  auth_uid uuid unique,
   username text unique not null,
   display_name text not null,
+  email text,
   avatar_url text,
+  cover_url text,
   bio text default '',
   verified boolean default false,
   boosted boolean default false,
   restricted boolean default false,
-  created_at timestamptz default now()
+  is_real_user boolean default true,
+  auth_source text default 'register',
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
 
-create table if not exists ${schema}.posts (
+create index if not exists idx_lumina_users_username on ${schema}.lumina_users (lower(username));
+create index if not exists idx_lumina_users_auth_uid on ${schema}.lumina_users (auth_uid);
+
+create table if not exists ${schema}.lumina_posts (
   id text primary key,
-  author_id text references ${schema}.users(id) on delete cascade,
+  author_id text references ${schema}.lumina_users(id) on delete cascade,
   caption text default '',
   location text,
   category text not null,
@@ -1152,19 +1200,51 @@ create table if not exists ${schema}.posts (
   created_at timestamptz default now()
 );
 
-alter table ${schema}.users enable row level security;
-alter table ${schema}.posts enable row level security;
+alter table ${schema}.lumina_users enable row level security;
+alter table ${schema}.lumina_posts enable row level security;
 
+-- Protege e-mail privado contra leitura anônima via API pública
+revoke select (email) on ${schema}.lumina_users from anon;
+grant select (id, auth_uid, username, display_name, avatar_url, cover_url, bio, verified, boosted, restricted, is_real_user, auth_source, created_at, updated_at)
+  on ${schema}.lumina_users to anon, authenticated;
+
+drop policy if exists "Perfis públicos visíveis" on ${schema}.lumina_users;
 create policy "Perfis públicos visíveis"
-  on ${schema}.users for select
+  on ${schema}.lumina_users for select
   using (not restricted);
 
+drop policy if exists "Usuário insere próprio perfil" on ${schema}.lumina_users;
+create policy "Usuário insere próprio perfil"
+  on ${schema}.lumina_users for insert
+  to authenticated
+  with check (auth.uid() = auth_uid);
+
+drop policy if exists "Usuário atualiza próprio perfil" on ${schema}.lumina_users;
+create policy "Usuário atualiza próprio perfil"
+  on ${schema}.lumina_users for update
+  to authenticated
+  using (auth.uid() = auth_uid)
+  with check (auth.uid() = auth_uid);
+
+drop policy if exists "Publicações de contas ativas" on ${schema}.lumina_posts;
 create policy "Publicações de contas ativas"
-  on ${schema}.posts for select
+  on ${schema}.lumina_posts for select
   using (true);
 `;
-    triggerBlobDownload(new Blob([sql], { type: 'text/sql' }), 'lumina-supabase-schema.sql');
+  };
+
+  const handleDownloadSupabaseSql = () => {
+    triggerBlobDownload(new Blob([buildSupabaseSql()], { type: 'text/sql' }), 'lumina-supabase-schema.sql');
     showToast('Schema SQL do Supabase baixado');
+  };
+
+  const handleCopySupabaseSql = async () => {
+    try {
+      await navigator.clipboard.writeText(buildSupabaseSql());
+      showToast('Script SQL copiado — cole no SQL Editor do Supabase');
+    } catch {
+      handleDownloadSupabaseSql();
+    }
   };
 
   const handleDownloadAwsPolicy = () => {
@@ -2421,9 +2501,18 @@ ${itemsXml}
             </div>
 
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Chaves <code className="font-mono">SUPABASE_ANON_KEY</code> e{' '}
-              <code className="font-mono">SUPABASE_SERVICE_ROLE_KEY</code> ficam protegidas
-              no servidor (<code className="font-mono">.env</code>).
+              {overview?.envStatus.supabaseKeysEnv ? (
+                <span className="font-medium text-emerald-600 dark:text-emerald-400">
+                  Chave Supabase detectada nos Segredos do servidor. Novos usuários reais são gravados automaticamente em{' '}
+                  <code className="font-mono">{state.supabase.schemaName}.lumina_users</code>.
+                </span>
+              ) : (
+                <>
+                  Adicione <code className="font-mono">SUPABASE_SERVICE_ROLE_KEY</code> (ou{' '}
+                  <code className="font-mono">SUPABASE_ANON_KEY</code>) nos Segredos do servidor e execute o SQL abaixo no SQL Editor do projeto{' '}
+                  <code className="font-mono">jpllpvfunpsqexnvjgdt</code>.
+                </>
+              )}
             </p>
 
             {supabaseTestStatus && (
@@ -2447,6 +2536,23 @@ ${itemsXml}
                 className="h-10 rounded-xl border border-zinc-200 px-4 text-xs font-semibold text-zinc-800 hover:bg-zinc-50 disabled:opacity-45 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
               >
                 {testingKey === 'supabase' ? 'Testando...' : 'Testar conexão'}
+              </button>
+              <button
+                type="button"
+                disabled={syncingSupabase || !state.supabase.projectUrl.trim()}
+                onClick={() => void syncSupabaseNow()}
+                className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-emerald-600 px-3.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-45"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${syncingSupabase ? 'animate-spin' : ''}`} />
+                <span>{syncingSupabase ? 'Sincronizando...' : 'Sincronizar usuários'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleCopySupabaseSql()}
+                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+              >
+                <Copy className="h-3.5 w-3.5" />
+                <span>Copiar SQL</span>
               </button>
               <button
                 type="button"

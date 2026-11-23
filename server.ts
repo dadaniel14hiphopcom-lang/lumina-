@@ -21,6 +21,14 @@ import {
   uploadReelToS3,
 } from './server/s3Service.ts';
 import { normalizeVideoFileForWeb } from './server/videoTranscoder.ts';
+import {
+  DEFAULT_SUPABASE_URL,
+  fetchPublicRealUsersFromSupabase,
+  registerOrSyncUserToSupabase,
+  testSupabaseConnection,
+  upsertPostToSupabase,
+  verifySupabasePasswordLogin,
+} from './server/supabaseService.ts';
 
 dotenv.config();
 
@@ -267,7 +275,7 @@ const DEFAULT_ADMIN_STATE: IntegrationState = {
     lastVerifiedAt: null,
   },
   supabase: {
-    projectUrl: process.env.SUPABASE_URL || '',
+    projectUrl: process.env.SUPABASE_URL?.trim() || DEFAULT_SUPABASE_URL,
     schemaName: 'public',
     autoSyncUsers: true,
     autoSyncPosts: true,
@@ -327,7 +335,13 @@ function readAdminState(): IntegrationState {
       const parsed = JSON.parse(raw) as Partial<IntegrationState>;
       return {
         aws: { ...DEFAULT_ADMIN_STATE.aws, ...(parsed.aws || {}) },
-        supabase: { ...DEFAULT_ADMIN_STATE.supabase, ...(parsed.supabase || {}) },
+        supabase: {
+          ...DEFAULT_ADMIN_STATE.supabase,
+          ...(parsed.supabase || {}),
+          projectUrl:
+            (parsed.supabase?.projectUrl || '').trim() ||
+            DEFAULT_ADMIN_STATE.supabase.projectUrl,
+        },
         wordpress: { ...DEFAULT_ADMIN_STATE.wordpress, ...(parsed.wordpress || {}) },
         site: {
           ...DEFAULT_ADMIN_STATE.site,
@@ -1751,7 +1765,7 @@ async function startServer() {
   });
 
   // Save Integration Configuration (Non-secret settings only)
-  app.put('/api/admin/integrations', requireAdminAuth, (req, res) => {
+  app.put('/api/admin/integrations', requireAdminAuth, async (req, res) => {
     const current = readAdminState();
     const body = req.body || {};
 
@@ -1773,9 +1787,26 @@ async function startServer() {
     }
 
     if (body.supabase && typeof body.supabase === 'object') {
+      const rawUrl = String(body.supabase.projectUrl || '').trim();
+      let cleanUrl = DEFAULT_SUPABASE_URL;
+      if (rawUrl) {
+        try {
+          const validated = await validateExternalUrl(rawUrl);
+          if (validated.protocol !== 'https:') {
+            res.status(400).json({ error: 'A URL do Supabase deve usar HTTPS.' });
+            return;
+          }
+          cleanUrl = validated.origin;
+        } catch (err) {
+          res.status(400).json({
+            error: err instanceof Error ? err.message : 'URL do projeto Supabase inválida.',
+          });
+          return;
+        }
+      }
       current.supabase = {
         ...current.supabase,
-        projectUrl: String(body.supabase.projectUrl || '').trim().slice(0, 200),
+        projectUrl: cleanUrl.slice(0, 200),
         schemaName: sanitizeIdentifier(
           String(body.supabase.schemaName || ''),
           'public',
@@ -1860,31 +1891,30 @@ async function startServer() {
     }
 
     try {
-      const parsed = await validateExternalUrl(rawUrl);
-
       if (provider === 'supabase') {
-        const endpoint = new URL('/rest/v1/', parsed.origin);
-        const headers: Record<string, string> = {};
-        if (process.env.SUPABASE_ANON_KEY) {
-          headers.apikey = process.env.SUPABASE_ANON_KEY;
-        }
-        const response = await fetch(endpoint.toString(), {
-          method: 'GET',
-          headers,
-          signal: AbortSignal.timeout(5000),
-        });
-        state.supabase.projectUrl = parsed.origin;
+        const result = await testSupabaseConnection(
+          rawUrl || state.supabase.projectUrl,
+          state.supabase.schemaName
+        );
+        state.supabase.projectUrl = result.origin;
         state.supabase.lastVerifiedAt = Date.now();
-        state.supabase.lastStatus = `HTTP ${response.status}`;
+        state.supabase.lastStatus = result.tablesReady
+          ? 'Conectado (Tabelas prontas)'
+          : `HTTP ${result.httpStatus}`;
         writeAdminState(state);
         res.json({
           ok: true,
-          reachable: response.status < 500,
-          httpStatus: response.status,
-          statusLabel: `Supabase respondeu com HTTP ${response.status} em ${parsed.hostname}`,
+          reachable: result.reachable,
+          tablesReady: result.tablesReady,
+          hasKeys: result.hasKeys,
+          hasServiceRole: result.hasServiceRole,
+          httpStatus: result.httpStatus,
+          statusLabel: result.statusLabel,
         });
         return;
       }
+
+      const parsed = await validateExternalUrl(rawUrl);
 
       if (provider === 'wordpress') {
         const endpoint = new URL('/wp-json/wp/v2/posts?per_page=5', parsed.origin);
@@ -1932,6 +1962,152 @@ async function startServer() {
         error: err instanceof Error ? err.message : 'Falha ao validar conexão externa.',
       });
     }
+  });
+
+  // Sync existing real users and posts into Supabase PostgreSQL immediately
+  app.post('/api/admin/supabase/sync-now', requireAdminAuth, async (req, res) => {
+    const state = readAdminState();
+    const requestedUrl =
+      typeof req.body?.projectUrl === 'string' && req.body.projectUrl.trim()
+        ? req.body.projectUrl.trim()
+        : state.supabase.projectUrl || DEFAULT_SUPABASE_URL;
+
+    const social = readSharedSocialState();
+    const authRecords = readUserAuthRecords();
+    const clientUsers = Array.isArray(req.body?.users)
+      ? (req.body.users as Array<Record<string, unknown>>).slice(0, 150)
+      : [];
+
+    const userMap = new Map<
+      string,
+      {
+        id: string;
+        username: string;
+        displayName: string;
+        email?: string;
+        bio?: string;
+        avatarUrl?: string;
+        coverUrl?: string;
+        verified?: boolean;
+        boosted?: boolean;
+        restricted?: boolean;
+      }
+    >();
+
+    for (const src of [...(social?.users || []), ...clientUsers]) {
+      if (!src || typeof src !== 'object' || src.isDemoSeed === true) continue;
+      const id = typeof src.id === 'string' ? src.id.trim() : '';
+      const username = typeof src.username === 'string' ? src.username.trim().toLowerCase() : '';
+      if (!id || !username) continue;
+      userMap.set(id, {
+        id,
+        username,
+        displayName:
+          typeof src.displayName === 'string' && src.displayName.trim()
+            ? src.displayName.trim()
+            : username,
+        email: typeof src.email === 'string' ? src.email.trim().toLowerCase() : undefined,
+        bio: typeof src.bio === 'string' ? src.bio : '',
+        avatarUrl: typeof src.avatarUrl === 'string' ? src.avatarUrl : undefined,
+        coverUrl: typeof src.coverUrl === 'string' ? src.coverUrl : undefined,
+        verified: Boolean(src.verified),
+        boosted: Boolean(src.boosted),
+        restricted: Boolean(src.restricted),
+      });
+    }
+
+    for (const rec of authRecords) {
+      const existing = userMap.get(rec.userId);
+      userMap.set(rec.userId, {
+        id: rec.userId,
+        username: rec.username,
+        displayName: existing?.displayName || rec.username,
+        email: existing?.email || rec.email,
+        bio: existing?.bio || '',
+        avatarUrl: existing?.avatarUrl,
+        coverUrl: existing?.coverUrl,
+        verified: existing?.verified ?? false,
+        boosted: existing?.boosted ?? false,
+        restricted: existing?.restricted ?? false,
+      });
+    }
+
+    const sbConfig = {
+      ...state.supabase,
+      projectUrl: requestedUrl,
+    };
+
+    let syncedUsers = 0;
+    let missingKeys = false;
+    let tableMissing = false;
+    let lastErrorMessage = '';
+
+    for (const u of userMap.values()) {
+      const result = await registerOrSyncUserToSupabase(sbConfig, {
+        ...u,
+        source: 'admin-sync',
+      });
+      if (result.synced) {
+        syncedUsers += 1;
+      } else {
+        if (result.missingKeys) missingKeys = true;
+        if (result.tableMissing) tableMissing = true;
+        lastErrorMessage = result.message;
+        if (missingKeys || tableMissing) break;
+      }
+    }
+
+    let syncedPosts = 0;
+    if (!missingKeys && !tableMissing && state.supabase.autoSyncPosts) {
+      const posts = (social?.posts || []).filter((p) => {
+        const authorId = typeof p.authorId === 'string' ? p.authorId : '';
+        return authorId && userMap.has(authorId);
+      });
+      for (const p of posts.slice(0, 100)) {
+        const mediaArr = Array.isArray(p.media) ? (p.media as Array<Record<string, unknown>>) : [];
+        const mediaUrls = mediaArr
+          .map((m) => (typeof m.url === 'string' ? m.url : ''))
+          .filter(Boolean);
+        const postRes = await upsertPostToSupabase(sbConfig, {
+          id: String(p.id || ''),
+          authorId: String(p.authorId || ''),
+          caption: typeof p.caption === 'string' ? p.caption : '',
+          location: typeof p.location === 'string' ? p.location : undefined,
+          category: typeof p.category === 'string' ? p.category : 'Fotografia',
+          aspectRatio: typeof p.aspectRatio === 'string' ? p.aspectRatio : '4:5',
+          isReel: Boolean(p.isReel),
+          mediaUrls,
+          createdAt: typeof p.createdAt === 'number' ? p.createdAt : Date.now(),
+        });
+        if (postRes.synced) syncedPosts += 1;
+      }
+    }
+
+    state.supabase.lastVerifiedAt = Date.now();
+    state.supabase.lastStatus = missingKeys
+      ? 'Aguardando chave no servidor'
+      : tableMissing
+      ? 'Tabela lumina_users pendente'
+      : `${syncedUsers} usuário(s) sincronizado(s)`;
+    writeAdminState(state);
+
+    const statusLabel = missingKeys
+      ? lastErrorMessage
+      : tableMissing
+      ? lastErrorMessage
+      : userMap.size === 0
+      ? 'Conexão pronta! Nenhum usuário real cadastrado ainda para sincronizar.'
+      : `Sincronização concluída: ${syncedUsers}/${userMap.size} usuário(s) real(is) e ${syncedPosts} publicação(ões) salvos no Supabase.`;
+
+    res.json({
+      ok: !missingKeys && !tableMissing,
+      totalRealUsers: userMap.size,
+      syncedUsers,
+      syncedPosts,
+      missingKeys,
+      tableMissing,
+      statusLabel,
+    });
   });
 
   // Check for available site updates
@@ -2131,13 +2307,24 @@ async function startServer() {
     res.json({ ok: true, invites: state.invites });
   });
 
-  app.post('/api/invites/accept', (req, res) => {
+  app.post('/api/invites/accept', async (req, res) => {
     const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase() : '';
     const userId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
     const username =
       typeof req.body?.username === 'string'
         ? req.body.username.trim().toLowerCase().replace(/^@/, '')
         : '';
+    const displayName =
+      typeof req.body?.displayName === 'string' ? req.body.displayName.trim().slice(0, 60) : '';
+    const bio = typeof req.body?.bio === 'string' ? req.body.bio.trim().slice(0, 160) : '';
+    const avatarUrl =
+      typeof req.body?.avatarUrl === 'string' && isSafePreviewMediaUrl(req.body.avatarUrl)
+        ? req.body.avatarUrl.trim()
+        : undefined;
+    const coverUrl =
+      typeof req.body?.coverUrl === 'string' && isSafePreviewMediaUrl(req.body.coverUrl)
+        ? req.body.coverUrl.trim()
+        : undefined;
     const email =
       typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
@@ -2157,6 +2344,7 @@ async function startServer() {
       return;
     }
 
+    const resolvedEmail = email || invite.email.toLowerCase();
     if (password) {
       if (password.length < 6) {
         res.status(400).json({ error: 'A senha de acesso deve ter pelo menos 6 caracteres.' });
@@ -2171,7 +2359,7 @@ async function startServer() {
         existing.unshift({
           userId,
           username,
-          email: email || invite.email.toLowerCase(),
+          email: resolvedEmail,
           salt,
           hash,
           createdAt: Date.now(),
@@ -2183,10 +2371,276 @@ async function startServer() {
     invite.status = 'accepted';
     invite.acceptedByUserId = userId || undefined;
     writeAdminState(state);
-    res.json({ ok: true, invite, grantVerified: invite.grantVerified });
+
+    let supabaseResult: { synced: boolean; message: string } = {
+      synced: false,
+      message: 'Sincronização automática desativada.',
+    };
+    if (userId && username && state.supabase.autoSyncUsers && state.supabase.projectUrl) {
+      supabaseResult = await registerOrSyncUserToSupabase(state.supabase, {
+        id: userId,
+        username,
+        displayName: displayName || invite.invitedName || username,
+        email: resolvedEmail,
+        password: password || undefined,
+        bio: bio || 'Novo membro convidado na Lumina.',
+        avatarUrl,
+        coverUrl,
+        verified: invite.grantVerified,
+        source: 'invite',
+      });
+    }
+
+    res.json({
+      ok: true,
+      invite,
+      grantVerified: invite.grantVerified,
+      supabaseSynced: supabaseResult.synced,
+      supabaseMessage: supabaseResult.message,
+    });
   });
 
-  app.post('/api/auth/login', (req, res) => {
+  // Direct Real User Registration (stores scrypt hash + shared public profile + Supabase DB)
+  app.post('/api/auth/register', express.json({ limit: '1mb' }), async (req, res) => {
+    const rawUsername =
+      typeof req.body?.username === 'string'
+        ? req.body.username.trim().toLowerCase().replace(/^@/, '')
+        : '';
+    const cleanUsername = rawUsername.replace(/[^a-z0-9._]/g, '').slice(0, 32);
+    const displayName =
+      typeof req.body?.displayName === 'string'
+        ? req.body.displayName.trim().slice(0, 60)
+        : '';
+    const email =
+      typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase().slice(0, 140) : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const bio = typeof req.body?.bio === 'string' ? req.body.bio.trim().slice(0, 160) : '';
+    const inviteCode =
+      typeof req.body?.inviteCode === 'string' ? req.body.inviteCode.trim().toUpperCase() : '';
+    const avatarUrl =
+      typeof req.body?.avatarUrl === 'string' && isSafePreviewMediaUrl(req.body.avatarUrl)
+        ? req.body.avatarUrl.trim()
+        : undefined;
+    const coverUrl =
+      typeof req.body?.coverUrl === 'string' && isSafePreviewMediaUrl(req.body.coverUrl)
+        ? req.body.coverUrl.trim()
+        : undefined;
+
+    if (cleanUsername.length < 3 || cleanUsername !== rawUsername) {
+      res.status(400).json({
+        error: 'Escolha um @usuario válido com 3 a 32 caracteres (apenas letras, números, ponto e _).',
+      });
+      return;
+    }
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'Informe um e-mail real válido.' });
+      return;
+    }
+    if (email === ADMIN_EMAIL.toLowerCase() || cleanUsername === 'dadaniel14hiphop') {
+      res.status(403).json({ error: 'Este identificador pertence à conta administrativa.' });
+      return;
+    }
+    if (password.length < 6 || password.length > 128) {
+      res.status(400).json({ error: 'Crie uma senha com entre 6 e 128 caracteres.' });
+      return;
+    }
+
+    const records = readUserAuthRecords();
+    const shared = readSharedSocialState();
+    const existingUsernameInRecords = records.some(
+      (r) => r.username.toLowerCase() === cleanUsername
+    );
+    const existingEmailInRecords = records.some(
+      (r) => r.email && r.email.toLowerCase() === email
+    );
+    const existingUsernameInSocial = Boolean(
+      shared?.users?.some(
+        (u) =>
+          typeof u.username === 'string' &&
+          u.username.toLowerCase() === cleanUsername &&
+          u.isDemoSeed !== true
+      )
+    );
+
+    if (existingUsernameInRecords || existingUsernameInSocial) {
+      res.status(409).json({ error: `O nome de usuário @${cleanUsername} já está cadastrado.` });
+      return;
+    }
+    if (existingEmailInRecords) {
+      res.status(409).json({ error: 'Este e-mail já está cadastrado na Lumina.' });
+      return;
+    }
+
+    const adminState = readAdminState();
+    let grantVerified = false;
+    let matchedInviteId: string | null = null;
+    if (inviteCode) {
+      const invite = adminState.invites.find((i) => i.code.toUpperCase() === inviteCode);
+      if (!invite) {
+        res.status(404).json({ error: 'Código de convite não encontrado.' });
+        return;
+      }
+      if (invite.status !== 'pending' || invite.expiresAt < Date.now()) {
+        res.status(409).json({ error: 'Este código de convite já foi usado, revogado ou expirou.' });
+        return;
+      }
+      grantVerified = Boolean(invite.grantVerified);
+      matchedInviteId = invite.id;
+    }
+
+    const userId = `user_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`;
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = hashPasscode(password, salt);
+
+    records.unshift({
+      userId,
+      username: cleanUsername,
+      email,
+      salt,
+      hash,
+      createdAt: Date.now(),
+    });
+    writeUserAuthRecords(records);
+
+    if (matchedInviteId) {
+      const targetInvite = adminState.invites.find((i) => i.id === matchedInviteId);
+      if (targetInvite) {
+        targetInvite.status = 'accepted';
+        targetInvite.acceptedByUserId = userId;
+        writeAdminState(adminState);
+      }
+    }
+
+    const resolvedDisplayName = displayName || cleanUsername;
+    const resolvedBio = bio || 'Novo usuário real na Lumina.';
+    const publicUser = {
+      id: userId,
+      username: cleanUsername,
+      displayName: resolvedDisplayName,
+      avatarUrl: avatarUrl || '/og-preview.jpg',
+      coverUrl: coverUrl || '/og-preview.jpg',
+      bio: resolvedBio,
+      verified: grantVerified,
+      isOnline: true,
+      isDemoSeed: false,
+      followers: [] as string[],
+      following: [] as string[],
+    };
+
+    const currentShared = shared || {
+      version: 0,
+      updatedAt: Date.now(),
+      users: [],
+      posts: [],
+      stories: [],
+      threads: [],
+      notifications: [],
+    };
+    const nextUsers = [
+      publicUser,
+      ...currentShared.users.filter((u) => u.id !== userId && u.username !== cleanUsername),
+    ].slice(0, 200);
+    writeSharedSocialState({
+      ...currentShared,
+      version: (currentShared.version || 0) + 1,
+      updatedAt: Date.now(),
+      users: nextUsers,
+    });
+
+    let supabaseSynced = false;
+    let supabaseMessage = '';
+    if (adminState.supabase.autoSyncUsers && adminState.supabase.projectUrl) {
+      const sbRes = await registerOrSyncUserToSupabase(adminState.supabase, {
+        id: userId,
+        username: cleanUsername,
+        displayName: resolvedDisplayName,
+        email,
+        password,
+        bio: resolvedBio,
+        avatarUrl,
+        coverUrl,
+        verified: grantVerified,
+        source: matchedInviteId ? 'invite' : 'register',
+      });
+      supabaseSynced = sbRes.synced;
+      supabaseMessage = sbRes.message;
+    }
+
+    res.json({
+      ok: true,
+      user: publicUser,
+      email,
+      grantVerified,
+      supabaseSynced,
+      supabaseMessage,
+    });
+  });
+
+  // Sync Firebase Google-authenticated real users into Supabase PostgreSQL
+  app.post('/api/supabase/sync-user', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Token de sessão necessário.' });
+      return;
+    }
+    const idToken = authHeader.slice('Bearer '.length).trim();
+    let tokenInfo: { uid: string; email: string; emailVerified: boolean };
+    try {
+      tokenInfo = await verifyFirebaseIdToken(idToken);
+    } catch (err) {
+      res.status(401).json({
+        error: err instanceof Error ? err.message : 'Token Firebase inválido.',
+      });
+      return;
+    }
+    if (!tokenInfo.emailVerified) {
+      res.status(403).json({ error: 'Conta Google sem e-mail verificado.' });
+      return;
+    }
+
+    const adminState = readAdminState();
+    if (!adminState.supabase.autoSyncUsers || !adminState.supabase.projectUrl) {
+      res.json({ ok: true, synced: false, message: 'Sincronização automática desativada.' });
+      return;
+    }
+
+    const isExclusiveAdmin = tokenInfo.email === ADMIN_EMAIL.toLowerCase();
+    const rawUsername =
+      typeof req.body?.username === 'string'
+        ? req.body.username.trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9._]/g, '')
+        : '';
+    const username = rawUsername.length >= 3 ? rawUsername : `user.${tokenInfo.uid.slice(0, 6).toLowerCase()}`;
+    const displayName =
+      typeof req.body?.displayName === 'string' && req.body.displayName.trim()
+        ? req.body.displayName.trim().slice(0, 60)
+        : username;
+    const bio = typeof req.body?.bio === 'string' ? req.body.bio.trim().slice(0, 160) : '';
+    const avatarUrl =
+      typeof req.body?.avatarUrl === 'string' && isSafePreviewMediaUrl(req.body.avatarUrl)
+        ? req.body.avatarUrl.trim()
+        : undefined;
+    const coverUrl =
+      typeof req.body?.coverUrl === 'string' && isSafePreviewMediaUrl(req.body.coverUrl)
+        ? req.body.coverUrl.trim()
+        : undefined;
+
+    const result = await registerOrSyncUserToSupabase(adminState.supabase, {
+      id: tokenInfo.uid,
+      authUid: tokenInfo.uid,
+      username,
+      displayName,
+      email: tokenInfo.email,
+      bio,
+      avatarUrl,
+      coverUrl,
+      verified: isExclusiveAdmin,
+      source: 'google',
+    });
+
+    res.json({ ok: result.synced, ...result });
+  });
+
+  app.post('/api/auth/login', async (req, res) => {
     const identifierRaw =
       typeof req.body?.identifier === 'string' ? req.body.identifier.trim().toLowerCase() : '';
     const identifier = identifierRaw.replace(/^@/, '');
@@ -2220,12 +2674,34 @@ async function startServer() {
         (r.email && r.email.toLowerCase() === identifierRaw)
     );
 
-    if (!match || !verifyUserPassword(password, match)) {
-      res.status(401).json({ error: 'Usuário/e-mail ou senha incorretos.' });
+    if (match && verifyUserPassword(password, match)) {
+      res.json({ ok: true, userId: match.userId, username: match.username });
       return;
     }
 
-    res.json({ ok: true, userId: match.userId, username: match.username });
+    // Fallback to Supabase Auth if email login was created directly in Supabase
+    const adminState = readAdminState();
+    if (identifierRaw.includes('@') && adminState.supabase.projectUrl) {
+      const sbLogin = await verifySupabasePasswordLogin(
+        adminState.supabase.projectUrl,
+        identifierRaw,
+        password
+      );
+      if (sbLogin.ok) {
+        res.json({
+          ok: true,
+          userId: sbLogin.authUid || `sb_${Date.now()}`,
+          username:
+            sbLogin.username ||
+            identifierRaw.split('@')[0].replace(/[^a-z0-9._]/g, '').slice(0, 24),
+          displayName: sbLogin.displayName,
+          email: identifierRaw,
+        });
+        return;
+      }
+    }
+
+    res.status(401).json({ error: 'Usuário/e-mail ou senha incorretos.' });
   });
 
   app.get('/api/auth/has-password', (req, res) => {
@@ -2299,10 +2775,55 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // Shared Social State Sync (multi-device fallback for Node-hosted instances)
-  app.get('/api/social/state', (_req, res) => {
+  let supabaseUsersCache: { fetchedAt: number; users: Record<string, unknown>[] } | null = null;
+
+  // Shared Social State Sync (multi-device fallback for Node-hosted instances + Supabase public users)
+  app.get('/api/social/state', async (_req, res) => {
     const social = readSharedSocialState();
-    res.json({ ok: true, state: social });
+    const adminState = readAdminState();
+
+    if (
+      adminState.supabase.autoSyncUsers &&
+      adminState.supabase.projectUrl &&
+      (!supabaseUsersCache || Date.now() - supabaseUsersCache.fetchedAt > 30_000)
+    ) {
+      const sbUsers = await fetchPublicRealUsersFromSupabase(adminState.supabase);
+      supabaseUsersCache = { fetchedAt: Date.now(), users: sbUsers };
+    }
+
+    const sbUsers = supabaseUsersCache?.users || [];
+    if (sbUsers.length === 0) {
+      res.json({ ok: true, state: social });
+      return;
+    }
+
+    const baseState: SharedSocialState = social || {
+      version: 1,
+      updatedAt: Date.now(),
+      users: [],
+      posts: [],
+      stories: [],
+      threads: [],
+      notifications: [],
+    };
+
+    const existingIds = new Set(baseState.users.map((u) => String(u.id || '')));
+    const mergedUsers = [...baseState.users];
+    for (const sbu of sbUsers) {
+      const sid = String(sbu.id || '');
+      if (sid && !existingIds.has(sid)) {
+        mergedUsers.push(sbu);
+        existingIds.add(sid);
+      }
+    }
+
+    res.json({
+      ok: true,
+      state: {
+        ...baseState,
+        users: mergedUsers,
+      },
+    });
   });
 
   app.put('/api/social/state', express.json({ limit: '10mb' }), (req, res) => {

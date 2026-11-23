@@ -4,13 +4,13 @@ import {
   Cloud,
   Eye,
   EyeOff,
-  KeyRound,
   Lock,
   LogIn,
   Moon,
   Share2,
   Shield,
   Sun,
+  UserPlus,
 } from 'lucide-react';
 import React, { useMemo, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
@@ -281,8 +281,8 @@ export function AuthView() {
             onClick={() => openAuthModal('register')}
             className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 text-xs font-semibold text-zinc-900 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
           >
-            <KeyRound className="h-3.5 w-3.5 text-sky-600 dark:text-sky-400" />
-            <span>Cadastrar com código de convite</span>
+            <UserPlus className="h-3.5 w-3.5 text-sky-600 dark:text-sky-400" />
+            <span>Criar conta (usuário real)</span>
           </button>
 
           {registeredUsers.length > 0 && (

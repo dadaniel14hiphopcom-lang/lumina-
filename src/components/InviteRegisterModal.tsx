@@ -26,7 +26,7 @@ export function InviteRegisterModal() {
     inviteModalMode,
     pendingInviteCode,
     pendingInviteMeta,
-    registerWithInvite,
+    registerRealUser,
     loginWithCredentials,
     loginWithGoogle,
   } = useSocial();
@@ -92,8 +92,8 @@ export function InviteRegisterModal() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    if (!code.trim()) {
-      setError('Informe o código do convite.');
+    if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      setError('Informe um e-mail real válido para criar a conta.');
       return;
     }
     if (!username.trim()) {
@@ -110,8 +110,8 @@ export function InviteRegisterModal() {
     }
     setSubmitting(true);
     try {
-      const result = await registerWithInvite({
-        code,
+      const result = await registerRealUser({
+        inviteCode: code.trim() || undefined,
         username,
         displayName,
         email,
@@ -164,7 +164,7 @@ export function InviteRegisterModal() {
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4 backdrop-blur-xs"
       role="dialog"
       aria-modal="true"
-      aria-label={mode === 'register' ? 'Cadastro por convite' : 'Entrar com senha'}
+      aria-label={mode === 'register' ? 'Cadastro de usuário real' : 'Entrar com senha'}
       onClick={() => setIsInviteModalOpen(false)}
     >
       <div
@@ -182,11 +182,11 @@ export function InviteRegisterModal() {
             </span>
             <div>
               <h2 className="text-base font-bold text-zinc-950 dark:text-white">
-                {mode === 'register' ? 'Cadastrar com Convite' : 'Entrar na sua Conta'}
+                {mode === 'register' ? 'Criar Conta Real' : 'Entrar na sua Conta'}
               </h2>
               <p className="text-xs text-zinc-500 dark:text-zinc-400">
                 {mode === 'register'
-                  ? 'Crie seu perfil real e defina sua senha de acesso'
+                  ? 'Cadastre seu perfil real com e-mail e senha de acesso'
                   : 'Acesse com o @usuário ou e-mail cadastrado'}
               </p>
             </div>
@@ -216,7 +216,7 @@ export function InviteRegisterModal() {
                   : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400'
               }`}
             >
-              Cadastrar com convite
+              Criar conta real
             </button>
             <button
               type="button"
@@ -230,7 +230,7 @@ export function InviteRegisterModal() {
                   : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400'
               }`}
             >
-              Já tenho senha
+              Já tenho conta
             </button>
           </div>
         </div>
@@ -390,7 +390,24 @@ export function InviteRegisterModal() {
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <label className="block space-y-1">
                 <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                  Código do convite
+                  E-mail real *
+                </span>
+                <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
+                  <Mail className="h-3.5 w-3.5 text-zinc-400" />
+                  <input
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="voce@dominio.com.br"
+                    className="h-10 w-full bg-transparent text-sm text-zinc-950 focus:outline-none dark:text-white"
+                  />
+                </div>
+              </label>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Código de convite (opcional)
                 </span>
                 <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
                   <KeyRound className="h-3.5 w-3.5 text-zinc-400" />
@@ -400,22 +417,6 @@ export function InviteRegisterModal() {
                     onChange={(e) => setCode(e.target.value.toUpperCase())}
                     placeholder="LUM-XXXXXX"
                     className="h-10 w-full bg-transparent font-mono text-sm uppercase text-zinc-950 focus:outline-none dark:text-white"
-                  />
-                </div>
-              </label>
-
-              <label className="block space-y-1">
-                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                  E-mail
-                </span>
-                <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 dark:border-zinc-800 dark:bg-zinc-900">
-                  <Mail className="h-3.5 w-3.5 text-zinc-400" />
-                  <input
-                    type="email"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="voce@dominio.com.br"
-                    className="h-10 w-full bg-transparent text-sm text-zinc-950 focus:outline-none dark:text-white"
                   />
                 </div>
               </label>
@@ -526,7 +527,7 @@ export function InviteRegisterModal() {
               disabled={submitting}
               className="h-11 w-full rounded-xl bg-sky-600 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
             >
-              {submitting ? 'Validando convite...' : 'Concluir cadastro e entrar'}
+              {submitting ? 'Cadastrando...' : 'Criar conta real e entrar'}
             </button>
           </form>
         )}
