@@ -8,7 +8,7 @@ import {
   Search,
   X,
 } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
 import { PostCategory } from '../types';
 import { isVideoAsset, resolvePlayableMediaUrl } from '../utils/media';
@@ -31,6 +31,9 @@ export function ExploreView() {
   const {
     posts,
     users,
+    allUsers,
+    getUserById,
+    refreshPublicUsersFromSupabase,
     exploreQuery,
     setExploreQuery,
     recentSearches,
@@ -43,38 +46,49 @@ export function ExploreView() {
   const [category, setCategory] = useState<'Tudo' | PostCategory>('Tudo');
   const [searchFocused, setSearchFocused] = useState(false);
 
+  useEffect(() => {
+    void refreshPublicUsersFromSupabase();
+  }, []);
+
   const normalized = exploreQuery.trim().toLowerCase();
+  const cleanQuery = normalized.replace(/^@/, '');
 
   const matchedUsers = useMemo(() => {
-    const activeUsers = users
+    const pool = users.length > 0 ? users : allUsers;
+    const activeUsers = pool
       .filter((u) => !u.restricted)
       .sort((a, b) => {
         const aReal = a.isDemoSeed ? 0 : 1;
         const bReal = b.isDemoSeed ? 0 : 1;
         return bReal - aReal;
       });
-    if (!normalized) return activeUsers.slice(0, 12);
+    if (!cleanQuery) return activeUsers.slice(0, 18);
     return activeUsers.filter(
       (u) =>
-        u.username.toLowerCase().includes(normalized) ||
-        u.displayName.toLowerCase().includes(normalized)
+        u.username.toLowerCase().includes(cleanQuery) ||
+        u.displayName.toLowerCase().includes(cleanQuery) ||
+        (u.bio && u.bio.toLowerCase().includes(cleanQuery))
     );
-  }, [users, normalized]);
+  }, [users, allUsers, cleanQuery]);
 
   const filteredPosts = useMemo(() => {
     return posts.filter((p) => {
       const catOk = category === 'Tudo' || p.category === category;
       if (!catOk) return false;
       if (!normalized) return true;
-      const author = users.find((u) => u.id === p.authorId);
+      const author = getUserById(p.authorId) || (p.authorUid ? getUserById(p.authorUid) : undefined);
       return (
         p.caption.toLowerCase().includes(normalized) ||
         (p.location && p.location.toLowerCase().includes(normalized)) ||
         p.category.toLowerCase().includes(normalized) ||
-        (author && author.username.toLowerCase().includes(normalized))
+        Boolean(
+          author &&
+            (author.username.toLowerCase().includes(cleanQuery) ||
+              author.displayName.toLowerCase().includes(cleanQuery))
+        )
       );
     });
-  }, [posts, users, category, normalized]);
+  }, [posts, getUserById, category, normalized, cleanQuery]);
 
   return (
     <div className="mx-auto w-full max-w-5xl px-3 py-4 sm:px-6 sm:py-6">

@@ -35,13 +35,17 @@ import { DEFAULT_VIDEO_RULES, encodeInviteMeta, useSocial } from '../context/Soc
 import { ADMIN_EMAIL, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
 import {
   DEFAULT_SUPABASE_URL,
+  fetchPublicPostsFromSupabaseBrowser,
+  fetchPublicStoriesFromSupabaseBrowser,
   fetchPublicUsersFromSupabaseBrowser,
   getBrowserSupabaseConfig,
   isServiceRoleOrSecretKey,
   isSupabaseApiKeyLike,
   sanitizeSupabaseSchemaName,
+  syncPostsToSupabaseFromBrowser,
   syncUsersToSupabaseFromBrowser,
   testSupabaseFromBrowser,
+  upsertStoryToSupabaseBrowser,
 } from '../lib/supabaseClient';
 import { InviteRecord, VideoRulesConfig } from '../types';
 import {
@@ -273,6 +277,7 @@ export function AdminPanelView() {
   const {
     allUsers,
     allPosts,
+    stories,
     currentUser,
     toggleRestrictUser,
     toggleBoostUser,
@@ -1146,17 +1151,27 @@ export function AdminPanelView() {
           return;
         }
         const localRealUsers = allUsers.filter((u) => !u.isDemoSeed);
+        const realUserIds = new Set(localRealUsers.map((u) => u.id));
         const pushRes = await syncUsersToSupabaseFromBrowser(cfg, localRealUsers);
+        const realPosts = allPosts.filter((p) => realUserIds.has(p.authorId));
+        const postRes = await syncPostsToSupabaseFromBrowser(cfg, realPosts);
+        const realStories = stories.filter((s) => realUserIds.has(s.authorId));
+        for (const s of realStories.slice(0, 40)) {
+          await upsertStoryToSupabaseBrowser(cfg, s);
+        }
+
         const remoteUsers = await fetchPublicUsersFromSupabaseBrowser(cfg);
+        const remotePosts = await fetchPublicPostsFromSupabaseBrowser(cfg);
+        const remoteStories = await fetchPublicStoriesFromSupabaseBrowser(cfg);
         if (remoteUsers.length > 0) {
           mergeExternalUsers(remoteUsers as unknown as typeof allUsers);
         }
+        await refreshPublicUsersFromSupabase();
+
         const msg =
           pushRes.failed > 0 && pushRes.inserted === 0 && remoteUsers.length === 0
             ? `Supabase conectado, mas bloqueou a gravação (${pushRes.lastError || 'RLS'}). Clique em "Copiar SQL" e execute no SQL Editor do Supabase.`
-            : `Sincronização concluída! ${remoteUsers.length} usuário(s) real(is) ativo(s) em ${cfg.schemaName}.lumina_users${
-                pushRes.inserted > 0 ? ` (${pushRes.inserted} enviado(s) agora)` : ''
-              }.`;
+            : `Sincronização concluída! ${remoteUsers.length} usuário(s), ${remotePosts.length} post(s) (${postRes.synced} enviado(s)) e ${remoteStories.length} story(ies) ativos em ${cfg.schemaName}.`;
         setSupabaseTestStatus(msg);
         setOverview((prev) => {
           if (!prev) return prev;
@@ -1165,7 +1180,7 @@ export function AdminPanelView() {
             supabase: {
               ...prev.state.supabase,
               lastVerifiedAt: Date.now(),
-              lastStatus: `${remoteUsers.length} usuário(s) no banco`,
+              lastStatus: `${remoteUsers.length} usuário(s) · ${remotePosts.length} post(s)`,
             },
           };
           saveLocalAdminState(nextState);
@@ -1173,7 +1188,7 @@ export function AdminPanelView() {
         });
         showToast(
           remoteUsers.length > 0
-            ? `${remoteUsers.length} usuário(s) sincronizado(s) do Supabase!`
+            ? `${remoteUsers.length} usuário(s) e ${remotePosts.length} post(s) sincronizado(s)!`
             : 'Conexão confirmada! Execute o SQL atualizado se algum usuário não gravar.'
         );
       } catch (err) {
@@ -1188,11 +1203,16 @@ export function AdminPanelView() {
     setSyncingSupabase(true);
     try {
       const realUsers = allUsers.filter((u) => !u.isDemoSeed);
+      const realUserIds = new Set(realUsers.map((u) => u.id));
+      const realPosts = allPosts.filter((p) => realUserIds.has(p.authorId));
+      const realStories = stories.filter((s) => realUserIds.has(s.authorId));
       const res = await authFetch('/api/admin/supabase/sync-now', {
         method: 'POST',
         body: JSON.stringify({
           projectUrl: overview?.state.supabase.projectUrl,
           users: realUsers,
+          posts: realPosts,
+          stories: realStories,
         }),
       });
       const data = (await res.json()) as {
@@ -1203,7 +1223,7 @@ export function AdminPanelView() {
       const msg = data.statusLabel || data.error || 'Sincronização finalizada.';
       setSupabaseTestStatus(msg);
       await refreshPublicUsersFromSupabase();
-      showToast(data.ok ? 'Usuários reais sincronizados no Supabase' : msg);
+      showToast(data.ok ? 'Usuários, posts e stories sincronizados no Supabase' : msg);
       await loadOverview();
     } finally {
       setSyncingSupabase(false);
@@ -1455,7 +1475,7 @@ export function AdminPanelView() {
     const schema = sanitizeSupabaseSchemaName(overview?.state.supabase.schemaName);
     const ensureSchemaSql =
       schema !== 'public' ? `create schema if not exists ${schema};\n\n` : '';
-    return `-- Schema Supabase para Lumina Social (${overview?.state.supabase.projectUrl || 'https://jpllpvfunpsqexnvjgdt.supabase.co'})
+    return `-- Schema Completo Supabase para Lumina Social (${overview?.state.supabase.projectUrl || 'https://jpllpvfunpsqexnvjgdt.supabase.co'})
 ${ensureSchemaSql}do $$
 declare
   tbl_exists boolean;
@@ -1480,8 +1500,9 @@ begin
 
     execute format('select count(*) from %I.lumina_users', '${schema}') into row_count;
 
-    -- Se a tabela foi criada vazia sem as colunas da Lumina (ex.: tabela padrão do Table Editor), recria limpa
     if row_count = 0 and (id_type is distinct from 'text' or not has_username) then
+      execute format('drop table if exists %I.lumina_messages cascade', '${schema}');
+      execute format('drop table if exists %I.lumina_stories cascade', '${schema}');
       execute format('drop table if exists %I.lumina_posts cascade', '${schema}');
       execute format('drop table if exists %I.lumina_users cascade', '${schema}');
     end if;
@@ -1497,16 +1518,18 @@ create table if not exists ${schema}.lumina_users (
   avatar_url text,
   cover_url text,
   bio text default '',
+  website text default '',
   verified boolean default false,
   boosted boolean default false,
   restricted boolean default false,
   is_real_user boolean default true,
   auth_source text default 'register',
+  followers jsonb not null default '[]'::jsonb,
+  following jsonb not null default '[]'::jsonb,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
 
--- Garante que todas as colunas existam caso lumina_users já existisse com dados
 alter table ${schema}.lumina_users add column if not exists auth_uid uuid;
 alter table ${schema}.lumina_users add column if not exists username text;
 alter table ${schema}.lumina_users add column if not exists display_name text default '';
@@ -1514,11 +1537,14 @@ alter table ${schema}.lumina_users add column if not exists email text;
 alter table ${schema}.lumina_users add column if not exists avatar_url text;
 alter table ${schema}.lumina_users add column if not exists cover_url text;
 alter table ${schema}.lumina_users add column if not exists bio text default '';
+alter table ${schema}.lumina_users add column if not exists website text default '';
 alter table ${schema}.lumina_users add column if not exists verified boolean default false;
 alter table ${schema}.lumina_users add column if not exists boosted boolean default false;
 alter table ${schema}.lumina_users add column if not exists restricted boolean default false;
 alter table ${schema}.lumina_users add column if not exists is_real_user boolean default true;
 alter table ${schema}.lumina_users add column if not exists auth_source text default 'register';
+alter table ${schema}.lumina_users add column if not exists followers jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_users add column if not exists following jsonb default '[]'::jsonb;
 alter table ${schema}.lumina_users add column if not exists created_at timestamptz default now();
 alter table ${schema}.lumina_users add column if not exists updated_at timestamptz default now();
 
@@ -1528,42 +1554,120 @@ create index if not exists idx_lumina_users_auth_uid on ${schema}.lumina_users (
 create table if not exists ${schema}.lumina_posts (
   id text primary key,
   author_id text references ${schema}.lumina_users(id) on delete cascade,
+  author_uid text,
   caption text default '',
   location text,
   category text not null default 'Fotografia',
   aspect_ratio text default '4:5',
   is_reel boolean default false,
+  audio_track text,
   media_urls jsonb not null default '[]'::jsonb,
+  media_assets jsonb not null default '[]'::jsonb,
+  likes jsonb not null default '[]'::jsonb,
+  saved_by jsonb not null default '[]'::jsonb,
+  comments jsonb not null default '[]'::jsonb,
   created_at timestamptz default now()
 );
 
 alter table ${schema}.lumina_posts add column if not exists author_id text;
+alter table ${schema}.lumina_posts add column if not exists author_uid text;
 alter table ${schema}.lumina_posts add column if not exists caption text default '';
 alter table ${schema}.lumina_posts add column if not exists location text;
 alter table ${schema}.lumina_posts add column if not exists category text default 'Fotografia';
 alter table ${schema}.lumina_posts add column if not exists aspect_ratio text default '4:5';
 alter table ${schema}.lumina_posts add column if not exists is_reel boolean default false;
+alter table ${schema}.lumina_posts add column if not exists audio_track text;
 alter table ${schema}.lumina_posts add column if not exists media_urls jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_posts add column if not exists media_assets jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_posts add column if not exists likes jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_posts add column if not exists saved_by jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_posts add column if not exists comments jsonb default '[]'::jsonb;
 alter table ${schema}.lumina_posts add column if not exists created_at timestamptz default now();
+
+create index if not exists idx_lumina_posts_author on ${schema}.lumina_posts (author_id, created_at desc);
+
+create table if not exists ${schema}.lumina_stories (
+  id text primary key,
+  author_id text references ${schema}.lumina_users(id) on delete cascade,
+  author_uid text,
+  media_url text not null,
+  caption text,
+  location text,
+  viewed_by jsonb not null default '[]'::jsonb,
+  reactions jsonb not null default '[]'::jsonb,
+  created_at timestamptz default now(),
+  expires_at timestamptz default (now() + interval '24 hours')
+);
+
+alter table ${schema}.lumina_stories add column if not exists author_id text;
+alter table ${schema}.lumina_stories add column if not exists author_uid text;
+alter table ${schema}.lumina_stories add column if not exists media_url text;
+alter table ${schema}.lumina_stories add column if not exists caption text;
+alter table ${schema}.lumina_stories add column if not exists location text;
+alter table ${schema}.lumina_stories add column if not exists viewed_by jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_stories add column if not exists reactions jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_stories add column if not exists created_at timestamptz default now();
+alter table ${schema}.lumina_stories add column if not exists expires_at timestamptz default (now() + interval '24 hours');
+
+create index if not exists idx_lumina_stories_created on ${schema}.lumina_stories (created_at desc);
+create index if not exists idx_lumina_stories_author on ${schema}.lumina_stories (author_id);
+
+create table if not exists ${schema}.lumina_messages (
+  id text primary key,
+  thread_id text not null,
+  sender_id text not null,
+  recipient_id text not null,
+  text text not null default '',
+  shared_post_id text,
+  story_reply_url text,
+  audio_url text,
+  audio_duration_sec integer,
+  video_url text,
+  video_name text,
+  reaction text,
+  read_by jsonb not null default '[]'::jsonb,
+  created_at timestamptz default now()
+);
+
+alter table ${schema}.lumina_messages add column if not exists thread_id text;
+alter table ${schema}.lumina_messages add column if not exists sender_id text;
+alter table ${schema}.lumina_messages add column if not exists recipient_id text;
+alter table ${schema}.lumina_messages add column if not exists text text default '';
+alter table ${schema}.lumina_messages add column if not exists shared_post_id text;
+alter table ${schema}.lumina_messages add column if not exists story_reply_url text;
+alter table ${schema}.lumina_messages add column if not exists audio_url text;
+alter table ${schema}.lumina_messages add column if not exists audio_duration_sec integer;
+alter table ${schema}.lumina_messages add column if not exists video_url text;
+alter table ${schema}.lumina_messages add column if not exists video_name text;
+alter table ${schema}.lumina_messages add column if not exists reaction text;
+alter table ${schema}.lumina_messages add column if not exists read_by jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_messages add column if not exists created_at timestamptz default now();
+
+create index if not exists idx_lumina_messages_thread on ${schema}.lumina_messages (thread_id, created_at);
+create index if not exists idx_lumina_messages_participants on ${schema}.lumina_messages (sender_id, recipient_id);
 
 alter table ${schema}.lumina_users enable row level security;
 alter table ${schema}.lumina_posts enable row level security;
+alter table ${schema}.lumina_stories enable row level security;
+alter table ${schema}.lumina_messages enable row level security;
 
--- Protege e-mail privado contra leitura anônima via API pública, liberando cadastro real validado
+-- Protege e-mail privado e selos administrativos; libera busca, links de perfil, posts, stories e mensagens
 revoke all on table ${schema}.lumina_users from anon, authenticated;
-grant select (id, auth_uid, username, display_name, avatar_url, cover_url, bio, verified, boosted, restricted, is_real_user, auth_source, created_at, updated_at)
+grant select (id, auth_uid, username, display_name, avatar_url, cover_url, bio, website, verified, boosted, restricted, is_real_user, auth_source, followers, following, created_at, updated_at)
   on table ${schema}.lumina_users to anon, authenticated;
-grant insert (id, auth_uid, username, display_name, email, avatar_url, cover_url, bio, is_real_user, auth_source, created_at, updated_at)
+grant insert (id, auth_uid, username, display_name, email, avatar_url, cover_url, bio, website, is_real_user, auth_source, created_at, updated_at)
   on table ${schema}.lumina_users to anon, authenticated;
-grant update on table ${schema}.lumina_users to authenticated;
+grant update (username, display_name, avatar_url, cover_url, bio, website, followers, following, updated_at)
+  on table ${schema}.lumina_users to anon, authenticated;
 
-grant select on table ${schema}.lumina_posts to anon, authenticated;
-grant insert, update, delete on table ${schema}.lumina_posts to authenticated;
+grant select, insert, update, delete on table ${schema}.lumina_posts to anon, authenticated;
+grant select, insert, update, delete on table ${schema}.lumina_stories to anon, authenticated;
+grant select, insert, update on table ${schema}.lumina_messages to anon, authenticated;
 
 drop policy if exists "Perfis públicos visíveis" on ${schema}.lumina_users;
 create policy "Perfis públicos visíveis"
   on ${schema}.lumina_users for select
-  using (not restricted);
+  using (coalesce(restricted, false) = false);
 
 drop policy if exists "Usuário insere próprio perfil" on ${schema}.lumina_users;
 drop policy if exists "Cadastro público validado de usuário real" on ${schema}.lumina_users;
@@ -1571,7 +1675,7 @@ create policy "Cadastro público validado de usuário real"
   on ${schema}.lumina_users for insert
   to anon, authenticated
   with check (
-    is_real_user = true
+    coalesce(is_real_user, true) = true
     and coalesce(verified, false) = false
     and coalesce(boosted, false) = false
     and coalesce(restricted, false) = false
@@ -1580,18 +1684,113 @@ create policy "Cadastro público validado de usuário real"
   );
 
 drop policy if exists "Usuário atualiza próprio perfil" on ${schema}.lumina_users;
-create policy "Usuário atualiza próprio perfil"
+drop policy if exists "Atualização validada de perfis ativos" on ${schema}.lumina_users;
+create policy "Atualização validada de perfis ativos"
   on ${schema}.lumina_users for update
-  to authenticated
-  using (auth.uid() = auth_uid)
-  with check (auth.uid() = auth_uid);
+  to anon, authenticated
+  using (coalesce(is_real_user, true) = true and coalesce(restricted, false) = false)
+  with check (
+    coalesce(is_real_user, true) = true
+    and coalesce(restricted, false) = false
+    and length(trim(username)) >= 3
+    and trim(username) ~ '^[a-z0-9._]+$'
+  );
 
 drop policy if exists "Publicações de contas ativas" on ${schema}.lumina_posts;
 create policy "Publicações de contas ativas"
   on ${schema}.lumina_posts for select
   using (true);
 
--- Sincronização automática: todo usuário criado no Supabase Auth entra em lumina_users
+drop policy if exists "Publicação validada de contas reais" on ${schema}.lumina_posts;
+create policy "Publicação validada de contas reais"
+  on ${schema}.lumina_posts for insert
+  to anon, authenticated
+  with check (
+    exists (
+      select 1 from ${schema}.lumina_users lu
+      where lu.id = author_id and coalesce(lu.restricted, false) = false
+    )
+  );
+
+drop policy if exists "Atualização de publicações ativas" on ${schema}.lumina_posts;
+create policy "Atualização de publicações ativas"
+  on ${schema}.lumina_posts for update
+  to anon, authenticated
+  using (true)
+  with check (
+    exists (
+      select 1 from ${schema}.lumina_users lu
+      where lu.id = author_id and coalesce(lu.restricted, false) = false
+    )
+  );
+
+drop policy if exists "Remoção de publicações ativas" on ${schema}.lumina_posts;
+create policy "Remoção de publicações ativas"
+  on ${schema}.lumina_posts for delete
+  to anon, authenticated
+  using (
+    exists (
+      select 1 from ${schema}.lumina_users lu
+      where lu.id = author_id
+    )
+  );
+
+drop policy if exists "Stories públicos ativos" on ${schema}.lumina_stories;
+create policy "Stories públicos ativos"
+  on ${schema}.lumina_stories for select
+  using (true);
+
+drop policy if exists "Criação de story validada" on ${schema}.lumina_stories;
+create policy "Criação de story validada"
+  on ${schema}.lumina_stories for insert
+  to anon, authenticated
+  with check (
+    exists (
+      select 1 from ${schema}.lumina_users lu
+      where lu.id = author_id and coalesce(lu.restricted, false) = false
+    )
+  );
+
+drop policy if exists "Atualização de story ativa" on ${schema}.lumina_stories;
+create policy "Atualização de story ativa"
+  on ${schema}.lumina_stories for update
+  to anon, authenticated
+  using (true)
+  with check (
+    exists (
+      select 1 from ${schema}.lumina_users lu
+      where lu.id = author_id and coalesce(lu.restricted, false) = false
+    )
+  );
+
+drop policy if exists "Leitura de mensagens reais" on ${schema}.lumina_messages;
+create policy "Leitura de mensagens reais"
+  on ${schema}.lumina_messages for select
+  to anon, authenticated
+  using (
+    exists (select 1 from ${schema}.lumina_users lu where lu.id = sender_id)
+    and exists (select 1 from ${schema}.lumina_users lu where lu.id = recipient_id)
+  );
+
+drop policy if exists "Envio de mensagens entre contas reais" on ${schema}.lumina_messages;
+create policy "Envio de mensagens entre contas reais"
+  on ${schema}.lumina_messages for insert
+  to anon, authenticated
+  with check (
+    exists (select 1 from ${schema}.lumina_users lu where lu.id = sender_id and coalesce(lu.restricted, false) = false)
+    and exists (select 1 from ${schema}.lumina_users lu where lu.id = recipient_id and coalesce(lu.restricted, false) = false)
+  );
+
+drop policy if exists "Atualização de reação/leitura em mensagens" on ${schema}.lumina_messages;
+create policy "Atualização de reação/leitura em mensagens"
+  on ${schema}.lumina_messages for update
+  to anon, authenticated
+  using (true)
+  with check (
+    exists (select 1 from ${schema}.lumina_users lu where lu.id = sender_id)
+    and exists (select 1 from ${schema}.lumina_users lu where lu.id = recipient_id)
+  );
+
 create or replace function ${schema}.handle_new_lumina_user()
 returns trigger
 language plpgsql
@@ -1644,7 +1843,6 @@ create trigger on_auth_user_created_lumina
   after insert on auth.users
   for each row execute function ${schema}.handle_new_lumina_user();
 
--- Importa usuários já existentes no Authentication que ainda não estejam em lumina_users
 do $$
 begin
   insert into ${schema}.lumina_users (
@@ -1675,6 +1873,8 @@ begin
 exception when others then
   null;
 end $$;
+
+notify pgrst, 'reload schema';
 `;
   };
 

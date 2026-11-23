@@ -5,7 +5,7 @@ interface RichCaptionProps {
 }
 
 export function RichCaption({ text }: RichCaptionProps) {
-  const { openHashtagInExplore, users, openProfile } = useSocial();
+  const { openHashtagInExplore, users, allUsers, openProfile } = useSocial();
   const tokens = text.split(/(\s+)/);
 
   return (
@@ -31,7 +31,9 @@ export function RichCaption({ text }: RichCaptionProps) {
           const clean = token.replace(/[.,!?;:]+$/, '');
           const trailing = token.slice(clean.length);
           const handle = clean.slice(1).toLowerCase();
-          const matchedUser = users.find((u) => u.username.toLowerCase() === handle);
+          const matchedUser =
+            users.find((u) => u.username.toLowerCase() === handle) ||
+            allUsers.find((u) => !u.restricted && u.username.toLowerCase() === handle);
           if (matchedUser) {
             return (
               <span key={idx}>

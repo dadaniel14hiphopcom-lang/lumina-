@@ -152,8 +152,12 @@ export function MessagesView() {
   const {
     threads,
     users,
+    allUsers,
     posts,
     currentUser,
+    isAuthenticated,
+    openAuthModal,
+    refreshPublicUsersFromSupabase,
     getUserById,
     sendMessage,
     markThreadRead,
@@ -166,25 +170,42 @@ export function MessagesView() {
     setPendingChatUserId,
   } = useSocial();
 
+  const isCurrentUserRef = (id: string) =>
+    id === currentUser.id || Boolean(currentUser.uid && id === currentUser.uid);
+
+  const threadHasUser = (
+    participantIds: string[],
+    user?: { id: string; uid?: string } | null
+  ) =>
+    Boolean(
+      user &&
+        (participantIds.includes(user.id) ||
+          (user.uid && participantIds.includes(user.uid)))
+    );
+
   const [selectedRecipientId, setSelectedRecipientId] = useState<string | null>(
     () => {
-      if (pendingChatUserId && pendingChatUserId !== currentUser.id) {
-        return pendingChatUserId;
+      if (pendingChatUserId && !isCurrentUserRef(pendingChatUserId)) {
+        return getUserById(pendingChatUserId)?.id || pendingChatUserId;
       }
-      const first = threads.find((t) =>
-        t.participantIds.includes(currentUser.id)
-      );
+      const first = threads.find((t) => threadHasUser(t.participantIds, currentUser));
       if (!first) return null;
-      return first.participantIds.find((id) => id !== currentUser.id) || null;
+      const partnerId = first.participantIds.find((id) => !isCurrentUserRef(id));
+      return partnerId ? getUserById(partnerId)?.id || partnerId : null;
     }
   );
 
   useEffect(() => {
-    if (pendingChatUserId && pendingChatUserId !== currentUser.id) {
-      setSelectedRecipientId(pendingChatUserId);
+    void refreshPublicUsersFromSupabase();
+  }, []);
+
+  useEffect(() => {
+    if (pendingChatUserId && !isCurrentUserRef(pendingChatUserId)) {
+      const resolved = getUserById(pendingChatUserId);
+      setSelectedRecipientId(resolved?.id || pendingChatUserId);
       setPendingChatUserId(null);
     }
-  }, [pendingChatUserId, currentUser.id, setPendingChatUserId]);
+  }, [pendingChatUserId, currentUser.id, currentUser.uid, getUserById, setPendingChatUserId]);
   const [search, setSearch] = useState('');
   const [draft, setDraft] = useState('');
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -216,31 +237,62 @@ export function MessagesView() {
   const videoFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const contacts = useMemo(() => {
-    return users
-      .filter((u) => u.id !== currentUser.id)
+    const cleanSearch = search.trim().toLowerCase().replace(/^@/, '');
+    const pool = users.length > 0 ? users : allUsers;
+    const filtered = pool
+      .filter((u) => !u.restricted && !isCurrentUserRef(u.id) && (!u.uid || !isCurrentUserRef(u.uid)))
       .filter(
         (u) =>
-          !search.trim() ||
-          u.username.toLowerCase().includes(search.toLowerCase()) ||
-          u.displayName.toLowerCase().includes(search.toLowerCase())
+          !cleanSearch ||
+          u.username.toLowerCase().includes(cleanSearch) ||
+          u.displayName.toLowerCase().includes(cleanSearch) ||
+          (u.bio && u.bio.toLowerCase().includes(cleanSearch))
       );
-  }, [users, currentUser.id, search]);
+
+    return [...filtered].sort((a, b) => {
+      const threadA = threads.find(
+        (t) => threadHasUser(t.participantIds, currentUser) && threadHasUser(t.participantIds, a)
+      );
+      const threadB = threads.find(
+        (t) => threadHasUser(t.participantIds, currentUser) && threadHasUser(t.participantIds, b)
+      );
+      const timeA = threadA?.updatedAt || 0;
+      const timeB = threadB?.updatedAt || 0;
+      if (timeA !== timeB) return timeB - timeA;
+      const aReal = a.isDemoSeed ? 0 : 1;
+      const bReal = b.isDemoSeed ? 0 : 1;
+      return bReal - aReal;
+    });
+  }, [users, allUsers, threads, currentUser, search]);
+
+  const recipient = useMemo(() => {
+    if (!selectedRecipientId) return undefined;
+    return (
+      getUserById(selectedRecipientId) ||
+      allUsers.find(
+        (u) =>
+          u.id === selectedRecipientId ||
+          u.uid === selectedRecipientId ||
+          u.username.toLowerCase() === selectedRecipientId.toLowerCase()
+      )
+    );
+  }, [selectedRecipientId, getUserById, allUsers]);
 
   const activeThread = useMemo(() => {
     if (!selectedRecipientId) return undefined;
     return threads.find(
       (t) =>
-        t.participantIds.includes(currentUser.id) &&
-        t.participantIds.includes(selectedRecipientId)
+        threadHasUser(t.participantIds, currentUser) &&
+        (threadHasUser(t.participantIds, recipient) ||
+          t.participantIds.includes(selectedRecipientId))
     );
-  }, [threads, currentUser.id, selectedRecipientId]);
-
-  const recipient = selectedRecipientId
-    ? getUserById(selectedRecipientId)
-    : undefined;
+  }, [threads, currentUser, recipient, selectedRecipientId]);
 
   useEffect(() => {
-    if (activeThread && activeThread.unreadBy.includes(currentUser.id)) {
+    if (
+      activeThread &&
+      activeThread.unreadBy.some((uidOrId) => isCurrentUserRef(uidOrId))
+    ) {
       markThreadRead(activeThread.id);
     }
   }, [activeThread?.id, activeThread?.messages.length]);
@@ -512,62 +564,87 @@ export function MessagesView() {
         </div>
 
         <div className="flex-1 overflow-y-auto">
-          {contacts.map((contact) => {
-            const thread = threads.find(
-              (t) =>
-                t.participantIds.includes(currentUser.id) &&
-                t.participantIds.includes(contact.id)
-            );
-            const lastMsg = thread?.messages[thread.messages.length - 1];
-            const isUnread = thread?.unreadBy.includes(currentUser.id);
-            const isSelected = selectedRecipientId === contact.id;
-
-            return (
+          {!isAuthenticated && (
+            <div className="border-b border-zinc-200 bg-sky-50/70 p-3 dark:border-zinc-800 dark:bg-sky-950/30">
+              <p className="text-xs font-medium text-sky-900 dark:text-sky-200">
+                Entre com sua conta real para enviar e receber mensagens diretas.
+              </p>
               <button
-                key={contact.id}
                 type="button"
-                onClick={() => setSelectedRecipientId(contact.id)}
-                className={`flex w-full items-center gap-3 px-4 py-3 text-left transition-colors ${
-                  isSelected
-                    ? 'bg-zinc-100 dark:bg-zinc-900'
-                    : 'hover:bg-zinc-50 dark:hover:bg-zinc-900/50'
-                }`}
+                onClick={() => openAuthModal('login')}
+                className="mt-2 h-8 w-full rounded-lg bg-sky-600 text-xs font-semibold text-white hover:bg-sky-700"
               >
-                <AvatarRing
-                  src={contact.avatarUrl}
-                  alt={contact.username}
-                  size="md"
-                  showOnlineIndicator={Boolean(contact.isOnline)}
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
-                      {contact.displayName}
-                    </span>
-                    {lastMsg && (
-                      <span className="shrink-0 text-[11px] text-zinc-400">
-                        {formatRelativeTime(lastMsg.createdAt)}
-                      </span>
-                    )}
-                  </div>
-                  <p
-                    className={`truncate text-xs ${
-                      isUnread
-                        ? 'font-semibold text-zinc-950 dark:text-white'
-                        : 'text-zinc-500 dark:text-zinc-400'
-                    }`}
-                  >
-                    {lastMsg
-                      ? `${lastMsg.senderId === currentUser.id ? 'Você: ' : ''}${lastMsg.text}`
-                      : `@${contact.username}`}
-                  </p>
-                </div>
-                {isUnread && (
-                  <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-sky-600" />
-                )}
+                Entrar na conta
               </button>
-            );
-          })}
+            </div>
+          )}
+
+          {contacts.length === 0 ? (
+            <p className="px-4 py-8 text-center text-xs text-zinc-500 dark:text-zinc-400">
+              Nenhum usuário encontrado para conversar.
+            </p>
+          ) : (
+            contacts.map((contact) => {
+              const thread = threads.find(
+                (t) =>
+                  threadHasUser(t.participantIds, currentUser) &&
+                  threadHasUser(t.participantIds, contact)
+              );
+              const lastMsg = thread?.messages[thread.messages.length - 1];
+              const isUnread = thread?.unreadBy.some((id) => isCurrentUserRef(id));
+              const isSelected = Boolean(
+                selectedRecipientId &&
+                  (selectedRecipientId === contact.id ||
+                    (contact.uid && selectedRecipientId === contact.uid))
+              );
+
+              return (
+                <button
+                  key={contact.id}
+                  type="button"
+                  onClick={() => setSelectedRecipientId(contact.id)}
+                  className={`flex w-full items-center gap-3 px-4 py-3 text-left transition-colors ${
+                    isSelected
+                      ? 'bg-zinc-100 dark:bg-zinc-900'
+                      : 'hover:bg-zinc-50 dark:hover:bg-zinc-900/50'
+                  }`}
+                >
+                  <AvatarRing
+                    src={contact.avatarUrl}
+                    alt={contact.username}
+                    size="md"
+                    showOnlineIndicator={Boolean(contact.isOnline)}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
+                        {contact.displayName}
+                      </span>
+                      {lastMsg && (
+                        <span className="shrink-0 text-[11px] text-zinc-400">
+                          {formatRelativeTime(lastMsg.createdAt)}
+                        </span>
+                      )}
+                    </div>
+                    <p
+                      className={`truncate text-xs ${
+                        isUnread
+                          ? 'font-semibold text-zinc-950 dark:text-white'
+                          : 'text-zinc-500 dark:text-zinc-400'
+                      }`}
+                    >
+                      {lastMsg
+                        ? `${isCurrentUserRef(lastMsg.senderId) ? 'Você: ' : ''}${lastMsg.text}`
+                        : `@${contact.username}`}
+                    </p>
+                  </div>
+                  {isUnread && (
+                    <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-sky-600" />
+                  )}
+                </button>
+              );
+            })
+          )}
         </div>
       </div>
 
@@ -632,7 +709,7 @@ export function MessagesView() {
               )}
 
               {activeThread?.messages.map((msg) => {
-                const isMine = msg.senderId === currentUser.id;
+                const isMine = isCurrentUserRef(msg.senderId);
                 const sharedPost = msg.sharedPostId
                   ? posts.find((p) => p.id === msg.sharedPostId)
                   : undefined;

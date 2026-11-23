@@ -40,6 +40,7 @@ export function ProfileView() {
     currentUser,
     viewingProfileId,
     users,
+    allUsers,
     posts,
     stories,
     getUserById,
@@ -48,8 +49,8 @@ export function ProfileView() {
     setSelectedPostId,
     setActiveStoryAuthorId,
     openProfile,
+    openChatWithUser,
     setActiveNav,
-    sendMessage,
     showToast,
     theme,
     toggleTheme,
@@ -65,11 +66,33 @@ export function ProfileView() {
     setPendingProfileSlug,
   } = useSocial();
 
+  const userPool = allUsers.filter(
+    (u) => !u.restricted || u.id === viewingProfileId || u.uid === viewingProfileId
+  );
+  const cleanPendingSlug = pendingProfileSlug?.trim().toLowerCase().replace(/^@/, '');
   const resolvedViewingUser = viewingProfileId
-    ? getUserById(viewingProfileId)
-    : pendingProfileSlug
-    ? users.find((u) => !u.isDemoSeed && u.username.toLowerCase() === pendingProfileSlug.toLowerCase()) ||
-      users.find((u) => u.username.toLowerCase() === pendingProfileSlug.toLowerCase())
+    ? getUserById(viewingProfileId) ||
+      userPool.find(
+        (u) =>
+          u.id === viewingProfileId ||
+          u.uid === viewingProfileId ||
+          u.username.toLowerCase() === viewingProfileId.toLowerCase()
+      )
+    : cleanPendingSlug
+    ? userPool.find(
+        (u) =>
+          !u.isDemoSeed &&
+          (u.username.toLowerCase() === cleanPendingSlug ||
+            u.id === pendingProfileSlug ||
+            u.uid === pendingProfileSlug)
+      ) ||
+      userPool.find(
+        (u) =>
+          u.username.toLowerCase() === cleanPendingSlug ||
+          u.id === pendingProfileSlug ||
+          u.uid === pendingProfileSlug
+      ) ||
+      users.find((u) => u.username.toLowerCase() === cleanPendingSlug)
     : undefined;
   const unresolvedPendingProfile = Boolean(pendingProfileSlug && !resolvedViewingUser);
   const targetUser = resolvedViewingUser || currentUser;
@@ -124,8 +147,16 @@ export function ProfileView() {
   const quickCoverInputRef = useRef<HTMLInputElement | null>(null);
 
   const userPosts = useMemo(
-    () => posts.filter((p) => p.authorId === targetUser.id),
-    [posts, targetUser.id]
+    () =>
+      posts.filter(
+        (p) =>
+          p.authorId === targetUser.id ||
+          Boolean(
+            targetUser.uid &&
+              (p.authorId === targetUser.uid || p.authorUid === targetUser.uid)
+          )
+      ),
+    [posts, targetUser.id, targetUser.uid]
   );
 
   const userReels = useMemo(
@@ -145,7 +176,15 @@ export function ProfileView() {
       ? userReels
       : savedPosts;
 
-  const userStories = stories.filter((s) => s.authorId === targetUser.id);
+  const userStories = stories.filter(
+    (s) =>
+      Date.now() - s.createdAt < 24 * 60 * 60 * 1000 &&
+      (s.authorId === targetUser.id ||
+        Boolean(
+          targetUser.uid &&
+            (s.authorId === targetUser.uid || s.authorUid === targetUser.uid)
+        ))
+  );
   const hasStory = userStories.length > 0;
   const hasUnseenStory = userStories.some((s) => !s.viewedBy.includes(currentUser.id));
 
@@ -265,7 +304,9 @@ export function ProfileView() {
 
   const listIds =
     listModal === 'followers' ? targetUser.followers : targetUser.following;
-  const listUsers = users.filter((u) => listIds.includes(u.id));
+  const listUsers = (allUsers.length > 0 ? allUsers : users).filter(
+    (u) => !u.restricted && (listIds.includes(u.id) || (u.uid ? listIds.includes(u.uid) : false))
+  );
 
   if (unresolvedPendingProfile) {
     return (
@@ -489,10 +530,7 @@ export function ProfileView() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    sendMessage(targetUser.id, `Oi @${targetUser.username}!`);
-                    setActiveNav('messages');
-                  }}
+                  onClick={() => openChatWithUser(targetUser.id)}
                   className="h-9 rounded-lg bg-zinc-100 px-4 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
                 >
                   Mensagem

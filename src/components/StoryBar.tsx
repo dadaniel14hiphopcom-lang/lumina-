@@ -9,7 +9,16 @@ interface StoryBarProps {
 }
 
 export function StoryBar({ onAddStory }: StoryBarProps) {
-  const { stories, users, currentUser, setActiveStoryAuthorId } = useSocial();
+  const { stories, getUserById, currentUser, setActiveStoryAuthorId } = useSocial();
+
+  const activeStories = useMemo(() => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    return stories.filter((s) => s.createdAt >= cutoff);
+  }, [stories]);
+
+  const isMyStory = (s: { authorId: string; authorUid?: string }) =>
+    s.authorId === currentUser.id ||
+    Boolean(currentUser.uid && (s.authorId === currentUser.uid || s.authorUid === currentUser.uid));
 
   const storyAuthors = useMemo(() => {
     const authorMap = new Map<
@@ -17,12 +26,17 @@ export function StoryBar({ onAddStory }: StoryBarProps) {
       { userId: string; hasUnseen: boolean; latestAt: number }
     >();
 
-    for (const s of stories) {
-      const existing = authorMap.get(s.authorId);
+    for (const s of activeStories) {
+      if (isMyStory(s)) continue;
+      const resolvedAuthor =
+        getUserById(s.authorId) || (s.authorUid ? getUserById(s.authorUid) : undefined);
+      if (!resolvedAuthor || resolvedAuthor.restricted) continue;
+      const canonicalId = resolvedAuthor.id;
+      const existing = authorMap.get(canonicalId);
       const isUnseen = !s.viewedBy.includes(currentUser.id);
       if (!existing) {
-        authorMap.set(s.authorId, {
-          userId: s.authorId,
+        authorMap.set(canonicalId, {
+          userId: canonicalId,
           hasUnseen: isUnseen,
           latestAt: s.createdAt,
         });
@@ -38,9 +52,9 @@ export function StoryBar({ onAddStory }: StoryBarProps) {
         if (a.hasUnseen !== b.hasUnseen) return a.hasUnseen ? -1 : 1;
         return b.latestAt - a.latestAt;
       });
-  }, [stories, currentUser.id]);
+  }, [activeStories, currentUser.id, currentUser.uid, getUserById]);
 
-  const myStories = stories.filter((s) => s.authorId === currentUser.id);
+  const myStories = activeStories.filter((s) => isMyStory(s));
   const myHasStory = myStories.length > 0;
   const myHasUnseen = myStories.some((s) => !s.viewedBy.includes(currentUser.id));
 
@@ -83,7 +97,7 @@ export function StoryBar({ onAddStory }: StoryBarProps) {
 
         {/* Following & creator stories */}
         {storyAuthors.map((entry) => {
-          const author = users.find((u) => u.id === entry.userId);
+          const author = getUserById(entry.userId);
           if (!author) return null;
           return (
             <ProfileHoverCard key={author.id} userId={author.id} className="inline-flex shrink-0">

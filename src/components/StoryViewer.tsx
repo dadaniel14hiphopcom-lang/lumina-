@@ -22,26 +22,49 @@ export function StoryViewer() {
     openProfile,
   } = useSocial();
 
+  const activeStories = useMemo(() => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    return stories.filter((s) => s.createdAt >= cutoff);
+  }, [stories]);
+
+  const resolveCanonicalAuthorId = (story: { authorId: string; authorUid?: string }) =>
+    getUserById(story.authorId)?.id ||
+    (story.authorUid ? getUserById(story.authorUid)?.id : undefined) ||
+    story.authorId;
+
   const authorGroups = useMemo(() => {
     const order: string[] = [];
-    for (const s of stories) {
-      if (!order.includes(s.authorId)) order.push(s.authorId);
+    for (const s of activeStories) {
+      const canonicalId = resolveCanonicalAuthorId(s);
+      if (!order.includes(canonicalId)) order.push(canonicalId);
     }
     return order;
-  }, [stories]);
+  }, [activeStories, getUserById]);
 
   const [slideIndex, setSlideIndex] = useState(0);
   const [progress, setProgress] = useState(0);
   const [paused, setPaused] = useState(false);
   const [replyText, setReplyText] = useState('');
 
+  const author = activeStoryAuthorId ? getUserById(activeStoryAuthorId) : undefined;
+  const canonicalTargetId = author?.id || activeStoryAuthorId;
+
   const authorStories = useMemo(
-    () => stories.filter((s) => s.authorId === activeStoryAuthorId),
-    [stories, activeStoryAuthorId]
+    () =>
+      canonicalTargetId
+        ? activeStories.filter((s) => {
+            const cId = resolveCanonicalAuthorId(s);
+            return (
+              cId === canonicalTargetId ||
+              s.authorId === canonicalTargetId ||
+              (author?.uid ? s.authorId === author.uid || s.authorUid === author.uid : false)
+            );
+          })
+        : [],
+    [activeStories, canonicalTargetId, author?.uid, getUserById]
   );
 
   const currentStory = authorStories[slideIndex];
-  const author = activeStoryAuthorId ? getUserById(activeStoryAuthorId) : undefined;
 
   useEffect(() => {
     setSlideIndex(0);
@@ -59,8 +82,8 @@ export function StoryViewer() {
     if (slideIndex < authorStories.length - 1) {
       setSlideIndex((i) => i + 1);
       setProgress(0);
-    } else if (activeStoryAuthorId) {
-      const currGroupIdx = authorGroups.indexOf(activeStoryAuthorId);
+    } else if (canonicalTargetId) {
+      const currGroupIdx = authorGroups.indexOf(canonicalTargetId);
       if (currGroupIdx >= 0 && currGroupIdx < authorGroups.length - 1) {
         setActiveStoryAuthorId(authorGroups[currGroupIdx + 1]);
       } else {
@@ -73,8 +96,8 @@ export function StoryViewer() {
     if (slideIndex > 0) {
       setSlideIndex((i) => i - 1);
       setProgress(0);
-    } else if (activeStoryAuthorId) {
-      const currGroupIdx = authorGroups.indexOf(activeStoryAuthorId);
+    } else if (canonicalTargetId) {
+      const currGroupIdx = authorGroups.indexOf(canonicalTargetId);
       if (currGroupIdx > 0) {
         setActiveStoryAuthorId(authorGroups[currGroupIdx - 1]);
       } else {

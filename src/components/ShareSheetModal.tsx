@@ -19,6 +19,7 @@ export function ShareSheetModal() {
     setSharePostId,
     posts,
     users,
+    getUserById,
     currentUser,
     sendMessage,
     showToast,
@@ -29,7 +30,10 @@ export function ShareSheetModal() {
   const [ssrActive, setSsrActive] = useState<boolean | null>(null);
 
   const targetPost = sharePostId ? posts.find((p) => p.id === sharePostId) : undefined;
-  const author = targetPost ? users.find((u) => u.id === targetPost.authorId) : undefined;
+  const author = targetPost
+    ? getUserById(targetPost.authorId) ||
+      (targetPost.authorUid ? getUserById(targetPost.authorUid) : undefined)
+    : undefined;
 
   useEffect(() => {
     if (!sharePostId || !targetPost) return;
@@ -76,7 +80,7 @@ export function ShareSheetModal() {
 
   if (!sharePostId) return null;
 
-  const recipients = users.filter((u) => u.id !== currentUser.id);
+  const recipients = users.filter((u) => !u.restricted && u.id !== currentUser.id);
 
   const shareUrl =
     typeof window !== 'undefined'

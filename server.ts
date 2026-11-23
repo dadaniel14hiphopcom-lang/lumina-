@@ -23,12 +23,20 @@ import {
 import { normalizeVideoFileForWeb } from './server/videoTranscoder.ts';
 import {
   DEFAULT_SUPABASE_URL,
+  deletePostFromSupabase,
+  fetchDirectThreadsForUserFromSupabase,
+  fetchPublicPostsFromSupabase,
   fetchPublicRealUsersFromSupabase,
+  fetchPublicStoriesFromSupabase,
   fetchPublicUserByUsernameFromSupabase,
   isSecretSupabaseKey,
   registerOrSyncUserToSupabase,
+  resolveSupabaseEmailByUsername,
   testSupabaseConnection,
+  updateUserInSupabase,
+  upsertMessageToSupabase,
   upsertPostToSupabase,
+  upsertStoryToSupabase,
   verifySupabasePasswordLogin,
 } from './server/supabaseService.ts';
 
@@ -197,6 +205,12 @@ let memoryUserAuthRecords: UserAuthRecord[] | null = null;
 let memorySocialState: SharedSocialState | null = null;
 let memoryPostPreviews: Map<string, PostPreviewRecord> | null = null;
 let supabaseUsersCache: { fetchedAt: number; users: Record<string, unknown>[] } | null = null;
+let supabaseContentCache: {
+  fetchedAt: number;
+  posts: Record<string, unknown>[];
+  stories: Record<string, unknown>[];
+} | null = null;
+const deletedPostIds = new Set<string>();
 
 interface IntegrationState {
   aws: {
@@ -504,6 +518,110 @@ function writeSharedSocialState(next: SharedSocialState): void {
   } catch {
     // Keep in memory if filesystem is read-only
   }
+}
+
+function mergeByIdRecords(
+  existing: Record<string, unknown>[],
+  incoming: Record<string, unknown>[],
+  limit: number,
+  sortField?: 'createdAt' | 'updatedAt'
+): Record<string, unknown>[] {
+  const map = new Map<string, Record<string, unknown>>();
+  for (const item of existing) {
+    if (item && typeof item.id === 'string' && item.id) {
+      map.set(item.id, item);
+    }
+  }
+  for (const item of incoming) {
+    if (!item || typeof item.id !== 'string' || !item.id) continue;
+    const prev = map.get(item.id);
+    if (!prev) {
+      map.set(item.id, item);
+    } else if (Array.isArray(prev.messages) && Array.isArray(item.messages)) {
+      const msgMap = new Map<string, Record<string, unknown>>();
+      for (const m of prev.messages as Record<string, unknown>[]) {
+        if (m && typeof m.id === 'string') msgMap.set(m.id, m);
+      }
+      for (const m of item.messages as Record<string, unknown>[]) {
+        if (m && typeof m.id === 'string') msgMap.set(m.id, m);
+      }
+      const mergedMessages = Array.from(msgMap.values()).sort(
+        (a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0)
+      );
+      map.set(item.id, {
+        ...prev,
+        ...item,
+        messages: mergedMessages,
+        updatedAt: Math.max(Number(prev.updatedAt || 0), Number(item.updatedAt || 0)),
+      });
+    } else {
+      map.set(item.id, { ...prev, ...item });
+    }
+  }
+  const arr = Array.from(map.values());
+  if (sortField) {
+    arr.sort((a, b) => Number(b[sortField] || 0) - Number(a[sortField] || 0));
+  }
+  return arr.slice(0, limit);
+}
+
+function mergeSharedUsersList(
+  existing: Record<string, unknown>[],
+  incoming: Record<string, unknown>[]
+): Record<string, unknown>[] {
+  const list = existing.map((u) => {
+    const copy = { ...u };
+    delete copy.email;
+    return copy;
+  });
+
+  for (const raw of incoming) {
+    if (!raw || typeof raw.id !== 'string' || !raw.id || typeof raw.username !== 'string') continue;
+    const item: Record<string, unknown> = { ...raw };
+    delete item.email;
+    const cleanUname = raw.username.trim().toLowerCase();
+    const isDemo = item.isDemoSeed === true;
+    const matchIdx = list.findIndex(
+      (u) =>
+        u.id === item.id ||
+        (!isDemo &&
+          u.isDemoSeed !== true &&
+          typeof u.username === 'string' &&
+          u.username.trim().toLowerCase() === cleanUname)
+    );
+    if (matchIdx === -1) {
+      list.push(item);
+    } else {
+      const prev = list[matchIdx];
+      const prevFollowers = Array.isArray(prev.followers) ? prev.followers : [];
+      const incFollowers = Array.isArray(item.followers) ? item.followers : [];
+      const prevFollowing = Array.isArray(prev.following) ? prev.following : [];
+      const incFollowing = Array.isArray(item.following) ? item.following : [];
+      list[matchIdx] = {
+        ...prev,
+        ...item,
+        id: String(prev.id || item.id),
+        uid: item.uid || prev.uid,
+        verified: Boolean(prev.verified || item.verified),
+        boosted: Boolean(prev.boosted || item.boosted),
+        restricted: Boolean(item.restricted !== undefined ? item.restricted : prev.restricted),
+        avatarUrl:
+          typeof item.avatarUrl === 'string' && item.avatarUrl.trim() && item.avatarUrl !== '/og-preview.jpg'
+            ? item.avatarUrl
+            : prev.avatarUrl || item.avatarUrl,
+        coverUrl: item.coverUrl || prev.coverUrl,
+        bio: typeof item.bio === 'string' && item.bio.trim() ? item.bio : prev.bio,
+        website: item.website || prev.website,
+        displayName:
+          typeof item.displayName === 'string' && item.displayName.trim()
+            ? item.displayName
+            : prev.displayName,
+        followers: incFollowers.length >= prevFollowers.length ? incFollowers : prevFollowers,
+        following: incFollowing.length >= prevFollowing.length ? incFollowing : prevFollowing,
+      };
+    }
+  }
+  return list.slice(0, 250);
 }
 
 function signSessionToken(): string {
@@ -2187,13 +2305,20 @@ async function startServer() {
       }
     }
 
+    const clientPosts = Array.isArray(req.body?.posts)
+      ? (req.body.posts as Array<Record<string, unknown>>).slice(0, 100)
+      : [];
+    const clientStories = Array.isArray(req.body?.stories)
+      ? (req.body.stories as Array<Record<string, unknown>>).slice(0, 80)
+      : [];
+
     let syncedPosts = 0;
     if (!missingKeys && !tableMissing && state.supabase.autoSyncPosts) {
-      const posts = (social?.posts || []).filter((p) => {
+      const mergedPosts = mergeByIdRecords(social?.posts || [], clientPosts, 150, 'createdAt').filter((p) => {
         const authorId = typeof p.authorId === 'string' ? p.authorId : '';
-        return authorId && userMap.has(authorId);
+        return authorId && userMap.has(authorId) && !deletedPostIds.has(String(p.id || ''));
       });
-      for (const p of posts.slice(0, 100)) {
+      for (const p of mergedPosts.slice(0, 100)) {
         const mediaArr = Array.isArray(p.media) ? (p.media as Array<Record<string, unknown>>) : [];
         const mediaUrls = mediaArr
           .map((m) => (typeof m.url === 'string' ? m.url : ''))
@@ -2201,15 +2326,48 @@ async function startServer() {
         const postRes = await upsertPostToSupabase(sbConfig, {
           id: String(p.id || ''),
           authorId: String(p.authorId || ''),
+          authorUid: typeof p.authorUid === 'string' ? p.authorUid : undefined,
           caption: typeof p.caption === 'string' ? p.caption : '',
           location: typeof p.location === 'string' ? p.location : undefined,
           category: typeof p.category === 'string' ? p.category : 'Fotografia',
           aspectRatio: typeof p.aspectRatio === 'string' ? p.aspectRatio : '4:5',
           isReel: Boolean(p.isReel),
+          audioTrack: typeof p.audioTrack === 'string' ? p.audioTrack : undefined,
           mediaUrls,
+          mediaAssets: mediaArr.map((m) => ({
+            id: typeof m.id === 'string' ? m.id : undefined,
+            url: typeof m.url === 'string' ? m.url : '',
+            alt: typeof m.alt === 'string' ? m.alt : undefined,
+            filterCss: typeof m.filterCss === 'string' ? m.filterCss : undefined,
+            mediaType: m.mediaType === 'video' ? 'video' : 'image',
+            durationSec: typeof m.durationSec === 'number' ? m.durationSec : undefined,
+          })),
+          likes: Array.isArray(p.likes) ? (p.likes as string[]) : [],
+          savedBy: Array.isArray(p.savedBy) ? (p.savedBy as string[]) : [],
+          comments: Array.isArray(p.comments) ? p.comments : [],
           createdAt: typeof p.createdAt === 'number' ? p.createdAt : Date.now(),
         });
         if (postRes.synced) syncedPosts += 1;
+      }
+
+      const mergedStories = mergeByIdRecords(social?.stories || [], clientStories, 80, 'createdAt').filter((s) => {
+        const authorId = typeof s.authorId === 'string' ? s.authorId : '';
+        return authorId && userMap.has(authorId);
+      });
+      for (const s of mergedStories.slice(0, 60)) {
+        await upsertStoryToSupabase(sbConfig, {
+          id: String(s.id || ''),
+          authorId: String(s.authorId || ''),
+          authorUid: typeof s.authorUid === 'string' ? s.authorUid : undefined,
+          mediaUrl: typeof s.mediaUrl === 'string' ? s.mediaUrl : '',
+          caption: typeof s.caption === 'string' ? s.caption : undefined,
+          location: typeof s.location === 'string' ? s.location : undefined,
+          viewedBy: Array.isArray(s.viewedBy) ? (s.viewedBy as string[]) : [],
+          reactions: Array.isArray(s.reactions)
+            ? (s.reactions as Array<{ userId: string; emoji: string }>)
+            : [],
+          createdAt: typeof s.createdAt === 'number' ? s.createdAt : Date.now(),
+        });
       }
     }
 
@@ -2218,9 +2376,10 @@ async function startServer() {
       ? 'Aguardando chave no servidor'
       : tableMissing
       ? 'Tabela lumina_users pendente'
-      : `${syncedUsers} usuário(s) sincronizado(s)`;
+      : `${syncedUsers} usuário(s) · ${syncedPosts} post(s)`;
     writeAdminState(state);
     supabaseUsersCache = null;
+    supabaseContentCache = null;
 
     const statusLabel = missingKeys
       ? lastErrorMessage
@@ -2809,30 +2968,71 @@ async function startServer() {
     );
 
     if (match && verifyUserPassword(password, match)) {
-      res.json({ ok: true, userId: match.userId, username: match.username });
+      const shared = readSharedSocialState();
+      const matchedProfile = shared?.users.find(
+        (u) =>
+          String(u.id || '') === match.userId ||
+          (typeof u.username === 'string' && u.username.toLowerCase() === match.username.toLowerCase())
+      );
+      if (matchedProfile) {
+        const { email: _stripEmail, ...publicProfile } = matchedProfile;
+        res.json({ ok: true, userId: match.userId, username: match.username, user: publicProfile });
+      } else {
+        res.json({ ok: true, userId: match.userId, username: match.username });
+      }
       return;
     }
 
-    // Fallback to Supabase Auth if email login was created directly in Supabase
+    // Fallback to Supabase Auth if account was registered on another device or directly in Supabase
     const adminState = readAdminState();
-    if (identifierRaw.includes('@') && adminState.supabase.projectUrl) {
-      const sbLogin = await verifySupabasePasswordLogin(
-        adminState.supabase.projectUrl,
-        identifierRaw,
-        password,
-        adminState.supabase.anonKey
-      );
-      if (sbLogin.ok) {
-        res.json({
-          ok: true,
-          userId: sbLogin.authUid || `sb_${Date.now()}`,
-          username:
+    if (adminState.supabase.projectUrl) {
+      let resolvedEmail = identifierRaw.includes('@') ? identifierRaw : '';
+      if (!resolvedEmail) {
+        resolvedEmail =
+          records.find((r) => r.username.toLowerCase() === identifier && r.email)?.email?.toLowerCase() ||
+          (await resolveSupabaseEmailByUsername(adminState.supabase, identifier)) ||
+          '';
+      }
+      if (resolvedEmail) {
+        const sbLogin = await verifySupabasePasswordLogin(
+          adminState.supabase.projectUrl,
+          resolvedEmail,
+          password,
+          adminState.supabase.anonKey,
+          adminState.supabase.schemaName
+        );
+        if (sbLogin.ok) {
+          const resolvedUsername =
             sbLogin.username ||
-            identifierRaw.split('@')[0].replace(/[^a-z0-9._]/g, '').slice(0, 24),
-          displayName: sbLogin.displayName,
-          email: identifierRaw,
-        });
-        return;
+            resolvedEmail.split('@')[0].replace(/[^a-z0-9._]/g, '').slice(0, 24);
+          const resolvedId = sbLogin.userId || sbLogin.authUid || `sb_${Date.now()}`;
+          if (sbLogin.user) {
+            const shared = readSharedSocialState() || {
+              version: 0,
+              updatedAt: Date.now(),
+              users: [],
+              posts: [],
+              stories: [],
+              threads: [],
+              notifications: [],
+            };
+            writeSharedSocialState({
+              ...shared,
+              version: (shared.version || 0) + 1,
+              updatedAt: Date.now(),
+              users: mergeSharedUsersList(shared.users, [sbLogin.user]),
+            });
+          }
+          res.json({
+            ok: true,
+            userId: resolvedId,
+            username: resolvedUsername,
+            displayName: sbLogin.displayName,
+            email: resolvedEmail,
+            user: sbLogin.user,
+          });
+          return;
+        }
       }
     }
 
@@ -2910,71 +3110,122 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // Public profile lookup by @username or ID (used for shared profile links)
+  // Public profile lookup by @username, ID or UID (used for shared profile links)
   app.get('/api/social/profile/:username', async (req, res) => {
-    const cleanHandle = String(req.params.username || '')
-      .trim()
-      .toLowerCase()
-      .replace(/^@/, '')
-      .slice(0, 64);
+    const rawParam = String(req.params.username || '').trim().replace(/^@/, '').slice(0, 80);
+    const cleanHandle = rawParam.toLowerCase();
     if (!cleanHandle) {
       res.status(400).json({ error: 'Perfil inválido.' });
       return;
     }
 
     const social = readSharedSocialState();
-    const localMatch = social?.users.find(
-      (u) =>
-        (typeof u.username === 'string' && u.username.toLowerCase() === cleanHandle) ||
-        (typeof u.id === 'string' && u.id.toLowerCase() === cleanHandle)
-    );
-    if (localMatch) {
-      const { email: _stripEmail, ...publicFields } = localMatch;
-      res.json({ ok: true, user: publicFields });
-      return;
-    }
-
-    const cachedMatch = supabaseUsersCache?.users.find(
-      (u) =>
-        (typeof u.username === 'string' && u.username.toLowerCase() === cleanHandle) ||
-        (typeof u.id === 'string' && u.id.toLowerCase() === cleanHandle)
-    );
-    if (cachedMatch) {
-      const { email: _stripEmail, ...publicFields } = cachedMatch;
-      res.json({ ok: true, user: publicFields });
-      return;
-    }
-
     const adminState = readAdminState();
-    if (adminState.supabase.projectUrl) {
-      const sbUser = await fetchPublicUserByUsernameFromSupabase(adminState.supabase, cleanHandle);
-      if (sbUser) {
-        res.json({ ok: true, user: sbUser });
-        return;
-      }
+    let resolvedUser: Record<string, unknown> | null =
+      social?.users.find(
+        (u) =>
+          (typeof u.username === 'string' && u.username.toLowerCase() === cleanHandle) ||
+          (typeof u.id === 'string' && u.id.toLowerCase() === cleanHandle) ||
+          (typeof u.uid === 'string' && u.uid.toLowerCase() === cleanHandle)
+      ) || null;
+
+    if (!resolvedUser && supabaseUsersCache?.users) {
+      resolvedUser =
+        supabaseUsersCache.users.find(
+          (u) =>
+            (typeof u.username === 'string' && u.username.toLowerCase() === cleanHandle) ||
+            (typeof u.id === 'string' && u.id.toLowerCase() === cleanHandle) ||
+            (typeof u.uid === 'string' && u.uid.toLowerCase() === cleanHandle)
+        ) || null;
     }
 
-    res.status(404).json({ ok: false, error: 'Perfil não encontrado.' });
+    if (!resolvedUser && adminState.supabase.projectUrl) {
+      resolvedUser = await fetchPublicUserByUsernameFromSupabase(adminState.supabase, rawParam);
+    }
+
+    if (!resolvedUser) {
+      res.status(404).json({ ok: false, error: 'Perfil não encontrado.' });
+      return;
+    }
+
+    const { email: _stripEmail, ...publicFields } = resolvedUser;
+    const targetIds = new Set(
+      [String(publicFields.id || ''), typeof publicFields.uid === 'string' ? publicFields.uid : ''].filter(Boolean)
+    );
+
+    const localPosts = (social?.posts || []).filter(
+      (p) =>
+        !deletedPostIds.has(String(p.id || '')) &&
+        (targetIds.has(String(p.authorId || '')) ||
+          (typeof p.authorUid === 'string' && targetIds.has(p.authorUid)))
+    );
+    const localStories = (social?.stories || []).filter(
+      (s) =>
+        (targetIds.has(String(s.authorId || '')) ||
+          (typeof s.authorUid === 'string' && targetIds.has(s.authorUid))) &&
+        Date.now() - Number(s.createdAt || 0) <= 24 * 60 * 60 * 1000
+    );
+
+    let sbPosts: Record<string, unknown>[] = [];
+    let sbStories: Record<string, unknown>[] = [];
+    if (adminState.supabase.projectUrl && publicFields.id) {
+      [sbPosts, sbStories] = await Promise.all([
+        fetchPublicPostsFromSupabase(adminState.supabase, String(publicFields.id)),
+        fetchPublicStoriesFromSupabase(adminState.supabase, String(publicFields.id)),
+      ]);
+    }
+
+    const posts = mergeByIdRecords(localPosts, sbPosts, 100, 'createdAt').filter(
+      (p) => !deletedPostIds.has(String(p.id || ''))
+    );
+    const stories = mergeByIdRecords(localStories, sbStories, 40, 'createdAt');
+
+    res.json({ ok: true, user: publicFields, posts, stories });
   });
 
-  // Shared Social State Sync (multi-device fallback for Node-hosted instances + Supabase public users)
-  app.get('/api/social/state', async (_req, res) => {
+  // Shared Social State Sync (multi-device fallback for Node-hosted instances + Supabase public data)
+  app.get('/api/social/state', async (req, res) => {
     const social = readSharedSocialState();
     const adminState = readAdminState();
+    const viewerIdsParam = typeof req.query.userIds === 'string' ? req.query.userIds : '';
+    const viewerIds = viewerIdsParam
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 4);
 
     if (
       adminState.supabase.autoSyncUsers &&
       adminState.supabase.projectUrl &&
-      (!supabaseUsersCache || Date.now() - supabaseUsersCache.fetchedAt > 15_000)
+      (!supabaseUsersCache || Date.now() - supabaseUsersCache.fetchedAt > 10_000)
     ) {
       const sbUsers = await fetchPublicRealUsersFromSupabase(adminState.supabase);
       supabaseUsersCache = { fetchedAt: Date.now(), users: sbUsers };
     }
 
+    if (
+      adminState.supabase.autoSyncPosts &&
+      adminState.supabase.projectUrl &&
+      (!supabaseContentCache || Date.now() - supabaseContentCache.fetchedAt > 10_000)
+    ) {
+      const [sbPosts, sbStories] = await Promise.all([
+        fetchPublicPostsFromSupabase(adminState.supabase),
+        fetchPublicStoriesFromSupabase(adminState.supabase),
+      ]);
+      supabaseContentCache = {
+        fetchedAt: Date.now(),
+        posts: sbPosts,
+        stories: sbStories,
+      };
+    }
+
     const sbUsers = supabaseUsersCache?.users || [];
-    if (sbUsers.length === 0) {
-      res.json({ ok: true, state: social });
-      return;
+    const sbPosts = supabaseContentCache?.posts || [];
+    const sbStories = supabaseContentCache?.stories || [];
+
+    let sbThreads: Record<string, unknown>[] = [];
+    if (viewerIds.length > 0 && adminState.supabase.projectUrl) {
+      sbThreads = await fetchDirectThreadsForUserFromSupabase(adminState.supabase, viewerIds);
     }
 
     const baseState: SharedSocialState = social || {
@@ -2987,51 +3238,19 @@ async function startServer() {
       notifications: [],
     };
 
-    const mergedUsers = baseState.users.map((u) => {
-      const uEmailStrip = { ...u };
-      delete uEmailStrip.email;
-      return uEmailStrip;
-    });
-
-    for (const sbu of sbUsers) {
-      const sid = String(sbu.id || '');
-      const sUsername = String(sbu.username || '').trim().toLowerCase();
-      if (!sid || !sUsername) continue;
-
-      const existingIndex = mergedUsers.findIndex(
-        (u) =>
-          String(u.id || '') === sid ||
-          (u.isDemoSeed !== true && String(u.username || '').trim().toLowerCase() === sUsername)
-      );
-
-      if (existingIndex === -1) {
-        mergedUsers.push(sbu);
-      } else {
-        const existing = mergedUsers[existingIndex];
-        mergedUsers[existingIndex] = {
-          ...existing,
-          verified: Boolean(existing.verified || sbu.verified),
-          boosted: Boolean(existing.boosted || sbu.boosted),
-          restricted: Boolean(existing.restricted || sbu.restricted),
-          avatarUrl:
-            typeof existing.avatarUrl === 'string' && existing.avatarUrl.trim()
-              ? existing.avatarUrl
-              : sbu.avatarUrl,
-          bio:
-            typeof existing.bio === 'string' && existing.bio.trim()
-              ? existing.bio
-              : sbu.bio,
-          displayName:
-            typeof existing.displayName === 'string' && existing.displayName.trim()
-              ? existing.displayName
-              : sbu.displayName,
-        };
-      }
-    }
+    const mergedUsers = mergeSharedUsersList(baseState.users, sbUsers);
+    const mergedPosts = mergeByIdRecords(baseState.posts, sbPosts, 200, 'createdAt').filter(
+      (p) => !deletedPostIds.has(String(p.id || ''))
+    );
+    const mergedStories = mergeByIdRecords(baseState.stories, sbStories, 100, 'createdAt').filter(
+      (s) => Date.now() - Number(s.createdAt || 0) <= 24 * 60 * 60 * 1000
+    );
+    const mergedThreads = mergeByIdRecords(baseState.threads, sbThreads, 150, 'updatedAt');
 
     const effectiveUpdatedAt = Math.max(
       baseState.updatedAt || 0,
-      supabaseUsersCache?.fetchedAt || 0
+      supabaseUsersCache?.fetchedAt || 0,
+      supabaseContentCache?.fetchedAt || 0
     );
 
     res.json({
@@ -3040,6 +3259,9 @@ async function startServer() {
         ...baseState,
         updatedAt: effectiveUpdatedAt,
         users: mergedUsers,
+        posts: mergedPosts,
+        stories: mergedStories,
+        threads: mergedThreads,
       },
     });
   });
@@ -3051,26 +3273,321 @@ async function startServer() {
       return;
     }
 
-    const sanitizedUsers = (body.users as Record<string, unknown>[])
-      .slice(0, 200)
-      .map((u) => {
-        const { email: _stripEmail, ...publicFields } = u;
-        return publicFields;
-      });
+    const current = readSharedSocialState() || {
+      version: 0,
+      updatedAt: Date.now(),
+      users: [],
+      posts: [],
+      stories: [],
+      threads: [],
+      notifications: [],
+    };
+
+    const incomingUsers = (body.users as Record<string, unknown>[]).slice(0, 200);
+    const incomingPosts = (body.posts as Record<string, unknown>[])
+      .filter((p) => !deletedPostIds.has(String(p?.id || '')))
+      .slice(0, 200);
+    const incomingStories = Array.isArray(body.stories)
+      ? (body.stories as Record<string, unknown>[]).slice(0, 100)
+      : [];
+    const incomingThreads = Array.isArray(body.threads)
+      ? (body.threads as Record<string, unknown>[]).slice(0, 100)
+      : [];
+    const incomingNotifications = Array.isArray(body.notifications)
+      ? (body.notifications as Record<string, unknown>[]).slice(0, 200)
+      : [];
 
     const nextState: SharedSocialState = {
-      version: (memorySocialState?.version || 0) + 1,
+      version: Math.max(memorySocialState?.version || 0, current.version || 0) + 1,
       updatedAt: Date.now(),
-      users: sanitizedUsers,
-      posts: (body.posts as Record<string, unknown>[]).slice(0, 200),
-      stories: Array.isArray(body.stories) ? (body.stories as Record<string, unknown>[]).slice(0, 100) : [],
-      threads: Array.isArray(body.threads) ? (body.threads as Record<string, unknown>[]).slice(0, 100) : [],
-      notifications: Array.isArray(body.notifications)
-        ? (body.notifications as Record<string, unknown>[]).slice(0, 200)
-        : [],
+      users: mergeSharedUsersList(current.users, incomingUsers),
+      posts: mergeByIdRecords(
+        current.posts.filter((p) => !deletedPostIds.has(String(p?.id || ''))),
+        incomingPosts,
+        220,
+        'createdAt'
+      ),
+      stories: mergeByIdRecords(current.stories, incomingStories, 120, 'createdAt').filter(
+        (s) => Date.now() - Number(s.createdAt || 0) <= 24 * 60 * 60 * 1000
+      ),
+      threads: mergeByIdRecords(current.threads, incomingThreads, 150, 'updatedAt'),
+      notifications: mergeByIdRecords(
+        current.notifications,
+        incomingNotifications,
+        250,
+        'createdAt'
+      ),
     };
     writeSharedSocialState(nextState);
     res.json({ ok: true, version: nextState.version, updatedAt: nextState.updatedAt });
+  });
+
+  // Immediate real-time endpoints for posts, stories, DMs, and profile updates (synced to Supabase)
+  app.post('/api/social/posts', express.json({ limit: '6mb' }), async (req, res) => {
+    const post = req.body?.post as Record<string, unknown> | undefined;
+    if (!post || typeof post.id !== 'string' || typeof post.authorId !== 'string') {
+      res.status(400).json({ error: 'Publicação inválida.' });
+      return;
+    }
+    deletedPostIds.delete(post.id);
+    const current = readSharedSocialState() || {
+      version: 0,
+      updatedAt: Date.now(),
+      users: [],
+      posts: [],
+      stories: [],
+      threads: [],
+      notifications: [],
+    };
+    const nextPosts = mergeByIdRecords(current.posts, [post], 220, 'createdAt');
+    writeSharedSocialState({
+      ...current,
+      version: (current.version || 0) + 1,
+      updatedAt: Date.now(),
+      posts: nextPosts,
+    });
+    supabaseContentCache = null;
+
+    const adminState = readAdminState();
+    let synced = false;
+    if (adminState.supabase.autoSyncPosts && adminState.supabase.projectUrl) {
+      const mediaArr = Array.isArray(post.media) ? (post.media as Array<Record<string, unknown>>) : [];
+      const sbRes = await upsertPostToSupabase(adminState.supabase, {
+        id: String(post.id),
+        authorId: String(post.authorId),
+        authorUid: typeof post.authorUid === 'string' ? post.authorUid : undefined,
+        caption: typeof post.caption === 'string' ? post.caption : '',
+        location: typeof post.location === 'string' ? post.location : undefined,
+        category: typeof post.category === 'string' ? post.category : 'Fotografia',
+        aspectRatio: typeof post.aspectRatio === 'string' ? post.aspectRatio : '4:5',
+        isReel: Boolean(post.isReel),
+        audioTrack: typeof post.audioTrack === 'string' ? post.audioTrack : undefined,
+        mediaUrls: mediaArr
+          .map((m) => (typeof m.url === 'string' ? m.url : ''))
+          .filter(Boolean),
+        mediaAssets: mediaArr.map((m) => ({
+          id: typeof m.id === 'string' ? m.id : undefined,
+          url: typeof m.url === 'string' ? m.url : '',
+          alt: typeof m.alt === 'string' ? m.alt : undefined,
+          filterCss: typeof m.filterCss === 'string' ? m.filterCss : undefined,
+          mediaType: m.mediaType === 'video' ? 'video' : 'image',
+          durationSec: typeof m.durationSec === 'number' ? m.durationSec : undefined,
+        })),
+        likes: Array.isArray(post.likes) ? (post.likes as string[]) : [],
+        savedBy: Array.isArray(post.savedBy) ? (post.savedBy as string[]) : [],
+        comments: Array.isArray(post.comments) ? post.comments : [],
+        createdAt: typeof post.createdAt === 'number' ? post.createdAt : Date.now(),
+      });
+      synced = sbRes.synced;
+    }
+    res.json({ ok: true, supabaseSynced: synced });
+  });
+
+  app.delete('/api/social/posts/:id', async (req, res) => {
+    const postId = String(req.params.id || '').trim();
+    if (!postId || !/^[a-zA-Z0-9_-]{1,128}$/.test(postId)) {
+      res.status(400).json({ error: 'ID inválido.' });
+      return;
+    }
+    deletedPostIds.add(postId);
+    const current = readSharedSocialState();
+    if (current) {
+      writeSharedSocialState({
+        ...current,
+        version: (current.version || 0) + 1,
+        updatedAt: Date.now(),
+        posts: current.posts.filter((p) => String(p.id || '') !== postId),
+      });
+    }
+    supabaseContentCache = null;
+    const adminState = readAdminState();
+    if (adminState.supabase.projectUrl) {
+      await deletePostFromSupabase(adminState.supabase, postId);
+    }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/social/stories', express.json({ limit: '5mb' }), async (req, res) => {
+    const story = req.body?.story as Record<string, unknown> | undefined;
+    if (!story || typeof story.id !== 'string' || typeof story.authorId !== 'string') {
+      res.status(400).json({ error: 'Story inválido.' });
+      return;
+    }
+    const current = readSharedSocialState() || {
+      version: 0,
+      updatedAt: Date.now(),
+      users: [],
+      posts: [],
+      stories: [],
+      threads: [],
+      notifications: [],
+    };
+    const nextStories = mergeByIdRecords(current.stories, [story], 120, 'createdAt');
+    writeSharedSocialState({
+      ...current,
+      version: (current.version || 0) + 1,
+      updatedAt: Date.now(),
+      stories: nextStories,
+    });
+    supabaseContentCache = null;
+
+    const adminState = readAdminState();
+    let synced = false;
+    if (adminState.supabase.projectUrl) {
+      synced = await upsertStoryToSupabase(adminState.supabase, {
+        id: String(story.id),
+        authorId: String(story.authorId),
+        authorUid: typeof story.authorUid === 'string' ? story.authorUid : undefined,
+        mediaUrl: typeof story.mediaUrl === 'string' ? story.mediaUrl : '',
+        caption: typeof story.caption === 'string' ? story.caption : undefined,
+        location: typeof story.location === 'string' ? story.location : undefined,
+        viewedBy: Array.isArray(story.viewedBy) ? (story.viewedBy as string[]) : [],
+        reactions: Array.isArray(story.reactions)
+          ? (story.reactions as Array<{ userId: string; emoji: string }>)
+          : [],
+        createdAt: typeof story.createdAt === 'number' ? story.createdAt : Date.now(),
+      });
+    }
+    res.json({ ok: true, supabaseSynced: synced });
+  });
+
+  app.get('/api/social/messages', async (req, res) => {
+    const userIdsParam = typeof req.query.userIds === 'string' ? req.query.userIds : '';
+    const userIds = userIdsParam
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    if (userIds.length === 0) {
+      res.status(400).json({ error: 'userIds obrigatório.' });
+      return;
+    }
+    const idSet = new Set(userIds);
+    const current = readSharedSocialState();
+    const localThreads = (current?.threads || []).filter(
+      (t) => Array.isArray(t.participantIds) && t.participantIds.some((id) => idSet.has(String(id)))
+    );
+
+    const adminState = readAdminState();
+    let sbThreads: Record<string, unknown>[] = [];
+    if (adminState.supabase.projectUrl) {
+      sbThreads = await fetchDirectThreadsForUserFromSupabase(adminState.supabase, userIds);
+    }
+
+    const merged = mergeByIdRecords(localThreads, sbThreads, 150, 'updatedAt');
+    res.json({ ok: true, threads: merged });
+  });
+
+  app.post('/api/social/messages', express.json({ limit: '5mb' }), async (req, res) => {
+    const { threadId, senderId, recipientId, message, thread } = req.body || {};
+    if (
+      typeof threadId !== 'string' ||
+      typeof senderId !== 'string' ||
+      typeof recipientId !== 'string' ||
+      !message ||
+      typeof message.id !== 'string'
+    ) {
+      res.status(400).json({ error: 'Mensagem inválida.' });
+      return;
+    }
+    const current = readSharedSocialState() || {
+      version: 0,
+      updatedAt: Date.now(),
+      users: [],
+      posts: [],
+      stories: [],
+      threads: [],
+      notifications: [],
+    };
+    const threadRecord =
+      thread && typeof thread === 'object'
+        ? (thread as Record<string, unknown>)
+        : {
+            id: threadId,
+            participantIds: [senderId, recipientId].filter((v, i, arr) => arr.indexOf(v) === i),
+            messages: [message],
+            unreadBy: [recipientId],
+            updatedAt: Number(message.createdAt || Date.now()),
+          };
+    const nextThreads = mergeByIdRecords(current.threads, [threadRecord], 150, 'updatedAt');
+    writeSharedSocialState({
+      ...current,
+      version: (current.version || 0) + 1,
+      updatedAt: Date.now(),
+      threads: nextThreads,
+    });
+
+    const adminState = readAdminState();
+    let synced = false;
+    if (adminState.supabase.projectUrl) {
+      synced = await upsertMessageToSupabase(adminState.supabase, {
+        id: String(message.id),
+        threadId,
+        senderId,
+        recipientId,
+        text: typeof message.text === 'string' ? message.text : '',
+        sharedPostId: typeof message.sharedPostId === 'string' ? message.sharedPostId : undefined,
+        storyReplyUrl: typeof message.storyReplyUrl === 'string' ? message.storyReplyUrl : undefined,
+        audioUrl: typeof message.audioUrl === 'string' ? message.audioUrl : undefined,
+        audioDurationSec:
+          typeof message.audioDurationSec === 'number' ? message.audioDurationSec : undefined,
+        videoUrl: typeof message.videoUrl === 'string' ? message.videoUrl : undefined,
+        videoName: typeof message.videoName === 'string' ? message.videoName : undefined,
+        reaction: typeof message.reaction === 'string' ? message.reaction : undefined,
+        readBy: [senderId],
+        createdAt: typeof message.createdAt === 'number' ? message.createdAt : Date.now(),
+      });
+    }
+    res.json({ ok: true, supabaseSynced: synced });
+  });
+
+  app.patch('/api/social/users/:id', express.json({ limit: '4mb' }), async (req, res) => {
+    const userId = String(req.params.id || '').trim();
+    if (!userId) {
+      res.status(400).json({ error: 'ID de usuário inválido.' });
+      return;
+    }
+    const patch = (req.body || {}) as Record<string, unknown>;
+    const current = readSharedSocialState();
+    if (current) {
+      const updatedUsers = current.users.map((u) => {
+        if (String(u.id || '') !== userId) return u;
+        return {
+          ...u,
+          ...(typeof patch.displayName === 'string' ? { displayName: patch.displayName } : {}),
+          ...(typeof patch.username === 'string' ? { username: patch.username } : {}),
+          ...(typeof patch.bio === 'string' ? { bio: patch.bio } : {}),
+          ...(typeof patch.website === 'string' ? { website: patch.website } : {}),
+          ...(typeof patch.avatarUrl === 'string' ? { avatarUrl: patch.avatarUrl } : {}),
+          ...(typeof patch.coverUrl === 'string' ? { coverUrl: patch.coverUrl } : {}),
+          ...(Array.isArray(patch.followers) ? { followers: patch.followers } : {}),
+          ...(Array.isArray(patch.following) ? { following: patch.following } : {}),
+        };
+      });
+      writeSharedSocialState({
+        ...current,
+        version: (current.version || 0) + 1,
+        updatedAt: Date.now(),
+        users: updatedUsers,
+      });
+    }
+    supabaseUsersCache = null;
+
+    const adminState = readAdminState();
+    let synced = false;
+    if (adminState.supabase.projectUrl) {
+      synced = await updateUserInSupabase(adminState.supabase, userId, {
+        displayName: typeof patch.displayName === 'string' ? patch.displayName : undefined,
+        username: typeof patch.username === 'string' ? patch.username : undefined,
+        bio: typeof patch.bio === 'string' ? patch.bio : undefined,
+        website: typeof patch.website === 'string' ? patch.website : undefined,
+        avatarUrl: typeof patch.avatarUrl === 'string' ? patch.avatarUrl : undefined,
+        coverUrl: typeof patch.coverUrl === 'string' ? patch.coverUrl : undefined,
+        followers: Array.isArray(patch.followers) ? (patch.followers as string[]) : undefined,
+        following: Array.isArray(patch.following) ? (patch.following as string[]) : undefined,
+      });
+    }
+    res.json({ ok: true, supabaseSynced: synced });
   });
 
   // Public post OpenGraph preview index (synced from Firestore & local posts for external link cards)
