@@ -18,6 +18,7 @@ import {
   MessageCircle,
   Moon,
   Settings,
+  Share2,
   Sun,
   Upload,
   X,
@@ -59,11 +60,43 @@ export function ProfileView() {
     loginWithGoogle,
     hasPasswordForCurrentUser,
     changePassword,
+    pendingProfileSlug,
+    profileLookupLoading,
+    setPendingProfileSlug,
   } = useSocial();
 
-  const targetUser = getUserById(viewingProfileId || currentUser.id) || currentUser;
-  const isOwnProfile = targetUser.id === currentUser.id && isAuthenticated;
+  const resolvedViewingUser = viewingProfileId
+    ? getUserById(viewingProfileId)
+    : pendingProfileSlug
+    ? users.find((u) => !u.isDemoSeed && u.username.toLowerCase() === pendingProfileSlug.toLowerCase()) ||
+      users.find((u) => u.username.toLowerCase() === pendingProfileSlug.toLowerCase())
+    : undefined;
+  const unresolvedPendingProfile = Boolean(pendingProfileSlug && !resolvedViewingUser);
+  const targetUser = resolvedViewingUser || currentUser;
+  const isOwnProfile = !unresolvedPendingProfile && targetUser.id === currentUser.id && isAuthenticated;
   const isFollowing = currentUser.following.includes(targetUser.id);
+
+  const handleShareProfile = async () => {
+    const shareUrl = `${window.location.origin}/?perfil=${encodeURIComponent(targetUser.username)}`;
+    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+      try {
+        await navigator.share({
+          title: `${targetUser.displayName} (@${targetUser.username}) na Lumina`,
+          text: `Confira o perfil de @${targetUser.username} na Lumina.`,
+          url: shareUrl,
+        });
+        return;
+      } catch {
+        // Fallback to clipboard copy
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      showToast(`Link do perfil @${targetUser.username} copiado!`);
+    } catch {
+      showToast(`Link: ${shareUrl}`);
+    }
+  };
 
   const [activeTab, setActiveTab] = useState<'posts' | 'reels' | 'saved'>('posts');
   const [editOpen, setEditOpen] = useState(false);
@@ -234,6 +267,57 @@ export function ProfileView() {
     listModal === 'followers' ? targetUser.followers : targetUser.following;
   const listUsers = users.filter((u) => listIds.includes(u.id));
 
+  if (unresolvedPendingProfile) {
+    return (
+      <div className="mx-auto w-full max-w-xl px-4 py-16 text-center">
+        <div className="rounded-2xl border border-zinc-200 bg-white p-8 dark:border-zinc-800 dark:bg-zinc-950">
+          {profileLookupLoading ? (
+            <>
+              <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-2 border-sky-600 border-t-transparent" />
+              <p className="text-sm font-semibold text-zinc-950 dark:text-white">
+                Buscando perfil @{pendingProfileSlug}...
+              </p>
+              <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                Consultando perfis públicos na Lumina.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-base font-bold text-zinc-950 dark:text-white">
+                Perfil @{pendingProfileSlug} não encontrado
+              </p>
+              <p className="mt-1.5 text-xs text-zinc-500 dark:text-zinc-400">
+                Verifique se o link está correto ou explore os membros já cadastrados na rede.
+              </p>
+              <div className="mt-5 flex flex-wrap justify-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingProfileSlug(null);
+                    setActiveNav('explore');
+                  }}
+                  className="h-9 rounded-xl bg-zinc-950 px-4 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
+                >
+                  Explorar perfis
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingProfileSlug(null);
+                    setActiveNav('feed');
+                  }}
+                  className="h-9 rounded-xl border border-zinc-200 px-4 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                >
+                  Ir para o início
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
       {/* Cover Banner behind Profile Photo */}
@@ -334,6 +418,14 @@ export function ProfileView() {
                 </button>
                 <button
                   type="button"
+                  onClick={() => void handleShareProfile()}
+                  className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg bg-zinc-100 px-3 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                >
+                  <Share2 className="h-3.5 w-3.5" />
+                  <span>Compartilhar perfil</span>
+                </button>
+                <button
+                  type="button"
                   onClick={toggleTheme}
                   aria-label="Alternar tema claro/escuro"
                   className="flex h-9 w-9 items-center justify-center rounded-lg bg-zinc-100 text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
@@ -364,16 +456,26 @@ export function ProfileView() {
                 )}
               </div>
             ) : !isAuthenticated ? (
-              <button
-                type="button"
-                onClick={() => openAuthModal('login')}
-                className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg bg-sky-600 px-4 text-xs font-semibold text-white hover:bg-sky-700"
-              >
-                <LogIn className="h-3.5 w-3.5" />
-                <span>Entrar</span>
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => openAuthModal('login')}
+                  className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg bg-sky-600 px-4 text-xs font-semibold text-white hover:bg-sky-700"
+                >
+                  <LogIn className="h-3.5 w-3.5" />
+                  <span>Entrar</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleShareProfile()}
+                  className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg bg-zinc-100 px-3 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                >
+                  <Share2 className="h-3.5 w-3.5" />
+                  <span>Compartilhar perfil</span>
+                </button>
+              </div>
             ) : (
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={() => toggleFollow(targetUser.id)}
@@ -394,6 +496,14 @@ export function ProfileView() {
                   className="h-9 rounded-lg bg-zinc-100 px-4 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
                 >
                   Mensagem
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleShareProfile()}
+                  className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg bg-zinc-100 px-3 text-xs font-semibold text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                >
+                  <Share2 className="h-3.5 w-3.5" />
+                  <span>Compartilhar</span>
                 </button>
               </div>
             )}

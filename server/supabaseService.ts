@@ -306,6 +306,9 @@ export async function registerOrSyncUserToSupabase(
   let authJwtForPostgrest = isJwtLike(keys.activeKey) ? keys.activeKey : '';
 
   // 1. Create / register credential in Supabase Auth when email + password are present
+  const safeMetaAvatar = compactAssetForDb(user.avatarUrl);
+  const safeMetaCover = compactAssetForDb(user.coverUrl);
+
   if (user.email && user.password) {
     try {
       if (keys.serviceRoleKey) {
@@ -321,8 +324,11 @@ export async function registerOrSyncUserToSupabase(
             email_confirm: true,
             user_metadata: {
               lumina_id: user.id,
-              username: user.username,
+              username: user.username.toLowerCase(),
               display_name: user.displayName,
+              bio: (user.bio || '').slice(0, 160),
+              ...(safeMetaAvatar ? { avatar_url: safeMetaAvatar } : {}),
+              ...(safeMetaCover ? { cover_url: safeMetaCover } : {}),
             },
           }),
           signal: AbortSignal.timeout(7000),
@@ -344,8 +350,11 @@ export async function registerOrSyncUserToSupabase(
             password: user.password,
             data: {
               lumina_id: user.id,
-              username: user.username,
+              username: user.username.toLowerCase(),
               display_name: user.displayName,
+              bio: (user.bio || '').slice(0, 160),
+              ...(safeMetaAvatar ? { avatar_url: safeMetaAvatar } : {}),
+              ...(safeMetaCover ? { cover_url: safeMetaCover } : {}),
             },
           }),
           signal: AbortSignal.timeout(7000),
@@ -368,16 +377,17 @@ export async function registerOrSyncUserToSupabase(
     }
   }
 
-  // 2. Upsert user profile record into lumina_users table via PostgREST
+  // 2. Upsert/insert user profile record into lumina_users table via PostgREST
+  const cleanHandle = user.username.toLowerCase();
   const row = {
     id: user.id,
     auth_uid: resolvedAuthUid,
-    username: user.username.toLowerCase(),
+    username: cleanHandle,
     display_name: user.displayName.slice(0, 80),
     email: user.email ? user.email.toLowerCase().slice(0, 140) : null,
     bio: (user.bio || '').slice(0, 160),
-    avatar_url: compactAssetForDb(user.avatarUrl),
-    cover_url: compactAssetForDb(user.coverUrl),
+    avatar_url: safeMetaAvatar,
+    cover_url: safeMetaCover,
     verified: Boolean(user.verified),
     boosted: Boolean(user.boosted),
     restricted: Boolean(user.restricted),
@@ -386,21 +396,35 @@ export async function registerOrSyncUserToSupabase(
     updated_at: new Date().toISOString(),
   };
 
+  const canMergeDuplicates = Boolean(keys.serviceRoleKey || (authJwtForPostgrest && authJwtForPostgrest !== keys.anonKey));
+
   try {
-    const restRes = await fetch(
-      new URL('/rest/v1/lumina_users?on_conflict=id', origin).toString(),
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...buildSupabaseHeaders(keys.activeKey, authJwtForPostgrest),
-          'Content-Profile': schema,
-          Prefer: 'resolution=merge-duplicates,return=representation',
-        },
-        body: JSON.stringify(row),
-        signal: AbortSignal.timeout(7000),
-      }
-    );
+    const restUrl = canMergeDuplicates
+      ? new URL('/rest/v1/lumina_users?on_conflict=id', origin).toString()
+      : new URL('/rest/v1/lumina_users', origin).toString();
+
+    const restRes = await fetch(restUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildSupabaseHeaders(keys.activeKey, authJwtForPostgrest),
+        'Content-Profile': schema,
+        Prefer: canMergeDuplicates
+          ? 'resolution=merge-duplicates,return=representation'
+          : 'resolution=ignore-duplicates,return=representation',
+      },
+      body: JSON.stringify(
+        canMergeDuplicates
+          ? row
+          : {
+              ...row,
+              verified: false,
+              boosted: false,
+              restricted: false,
+            }
+      ),
+      signal: AbortSignal.timeout(7000),
+    });
 
     if (restRes.ok) {
       return {
@@ -412,6 +436,38 @@ export async function registerOrSyncUserToSupabase(
     }
 
     const errText = await restRes.text().catch(() => '');
+
+    // Verify if the auth trigger handle_new_lumina_user already created the row in lumina_users
+    try {
+      const checkRes = await fetch(
+        new URL(
+          `/rest/v1/lumina_users?select=id,username&username=eq.${encodeURIComponent(cleanHandle)}&limit=1`,
+          origin
+        ).toString(),
+        {
+          method: 'GET',
+          headers: {
+            ...buildSupabaseHeaders(keys.activeKey),
+            'Accept-Profile': schema,
+          },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+      if (checkRes.ok) {
+        const rows = (await checkRes.json()) as Array<{ id?: string; username?: string }>;
+        if (Array.isArray(rows) && rows.length > 0) {
+          return {
+            synced: true,
+            authCreated,
+            httpStatus: checkRes.status,
+            message: `Usuário @${user.username} sincronizado no Supabase (${schema}.lumina_users).`,
+          };
+        }
+      }
+    } catch {
+      // Fall through to error return
+    }
+
     const tableMissing =
       restRes.status === 404 ||
       /relation .*lumina_users.* does not exist|PGRST205|Could not find the table/i.test(errText);
@@ -423,7 +479,7 @@ export async function registerOrSyncUserToSupabase(
       httpStatus: restRes.status,
       message: tableMissing
         ? `Execute o script SQL no SQL Editor do Supabase para criar a tabela ${schema}.lumina_users.`
-        : `Supabase retornou HTTP ${restRes.status} ao gravar usuário.`,
+        : `Supabase retornou HTTP ${restRes.status} ao gravar usuário${errText ? `: ${errText.slice(0, 120)}` : '.'}`,
     };
   } catch (err) {
     return {
@@ -551,6 +607,32 @@ export async function upsertPostToSupabase(
   }
 }
 
+function mapSupabaseUserRow(r: Record<string, unknown>): Record<string, unknown> {
+  const username = String(r.username || '');
+  return {
+    id: String(r.id || ''),
+    uid: typeof r.auth_uid === 'string' && r.auth_uid ? r.auth_uid : undefined,
+    username,
+    displayName: String(r.display_name || username || ''),
+    bio: String(r.bio || 'Novo usuário real na Lumina.'),
+    avatarUrl:
+      typeof r.avatar_url === 'string' && r.avatar_url.trim()
+        ? r.avatar_url.trim()
+        : '/og-preview.jpg',
+    coverUrl:
+      typeof r.cover_url === 'string' && r.cover_url.trim()
+        ? r.cover_url.trim()
+        : undefined,
+    verified: Boolean(r.verified),
+    boosted: Boolean(r.boosted),
+    restricted: Boolean(r.restricted),
+    isOnline: false,
+    isDemoSeed: false,
+    followers: [],
+    following: [],
+  };
+}
+
 export async function fetchPublicRealUsersFromSupabase(
   config: SupabaseRuntimeConfig
 ): Promise<Array<Record<string, unknown>>> {
@@ -562,7 +644,7 @@ export async function fetchPublicRealUsersFromSupabase(
     const schema = sanitizeSchemaName(config.schemaName);
     const res = await fetch(
       new URL(
-        '/rest/v1/lumina_users?select=id,username,display_name,bio,avatar_url,cover_url,verified,boosted,restricted,created_at&is_real_user=eq.true&order=created_at.desc&limit=200',
+        '/rest/v1/lumina_users?select=id,auth_uid,username,display_name,bio,avatar_url,cover_url,verified,boosted,restricted,created_at&is_real_user=eq.true&order=created_at.desc&limit=200',
         origin
       ).toString(),
       {
@@ -577,22 +659,44 @@ export async function fetchPublicRealUsersFromSupabase(
     if (!res.ok) return [];
     const rows = (await res.json()) as Array<Record<string, unknown>>;
     if (!Array.isArray(rows)) return [];
-    return rows.map((r) => ({
-      id: String(r.id || ''),
-      username: String(r.username || ''),
-      displayName: String(r.display_name || r.username || ''),
-      bio: String(r.bio || ''),
-      avatarUrl: typeof r.avatar_url === 'string' && r.avatar_url ? r.avatar_url : undefined,
-      coverUrl: typeof r.cover_url === 'string' && r.cover_url ? r.cover_url : undefined,
-      verified: Boolean(r.verified),
-      boosted: Boolean(r.boosted),
-      restricted: Boolean(r.restricted),
-      isOnline: false,
-      isDemoSeed: false,
-      followers: [],
-      following: [],
-    }));
+    return rows.map(mapSupabaseUserRow).filter((u) => Boolean(u.id && u.username));
   } catch {
     return [];
+  }
+}
+
+export async function fetchPublicUserByUsernameFromSupabase(
+  config: SupabaseRuntimeConfig,
+  rawUsername: string
+): Promise<Record<string, unknown> | null> {
+  const cleanHandle = rawUsername.trim().toLowerCase().replace(/^@/, '');
+  if (!cleanHandle) return null;
+  const keys = getSupabaseKeys(config.anonKey);
+  if (!keys.hasKeys) return null;
+
+  try {
+    const origin = await resolveValidatedSupabaseOrigin(config.projectUrl);
+    const schema = sanitizeSchemaName(config.schemaName);
+    const res = await fetch(
+      new URL(
+        `/rest/v1/lumina_users?select=id,auth_uid,username,display_name,bio,avatar_url,cover_url,verified,boosted,restricted,created_at&username=ilike.${encodeURIComponent(cleanHandle)}&limit=1`,
+        origin
+      ).toString(),
+      {
+        method: 'GET',
+        headers: {
+          ...buildSupabaseHeaders(keys.activeKey),
+          'Accept-Profile': schema,
+        },
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    if (!res.ok) return null;
+    const rows = (await res.json()) as Array<Record<string, unknown>>;
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const mapped = mapSupabaseUserRow(rows[0]);
+    return mapped.id && mapped.username ? mapped : null;
+  } catch {
+    return null;
   }
 }

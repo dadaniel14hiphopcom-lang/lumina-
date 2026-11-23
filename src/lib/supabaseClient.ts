@@ -90,6 +90,23 @@ function buildBrowserSupabaseHeaders(
   return headers;
 }
 
+let runtimeServerPublicConfig: Partial<BrowserSupabaseConfig> | null = null;
+
+export function setRuntimePublicSupabaseConfig(
+  cfg?: Partial<BrowserSupabaseConfig> | null
+): void {
+  if (!cfg) return;
+  const candidateAnon = (cfg.anonKey || '').trim();
+  const safeAnon =
+    candidateAnon && !isServiceRoleOrSecretKey(candidateAnon) ? candidateAnon : '';
+  runtimeServerPublicConfig = {
+    projectUrl: cfg.projectUrl?.trim() || undefined,
+    schemaName: cfg.schemaName ? sanitizeSupabaseSchemaName(cfg.schemaName) : undefined,
+    anonKey: safeAnon || undefined,
+    autoSyncUsers: typeof cfg.autoSyncUsers === 'boolean' ? cfg.autoSyncUsers : undefined,
+  };
+}
+
 export function getBrowserSupabaseConfig(): BrowserSupabaseConfig {
   const envUrl =
     typeof import.meta !== 'undefined' && import.meta.env?.VITE_SUPABASE_URL
@@ -140,12 +157,27 @@ export function getBrowserSupabaseConfig(): BrowserSupabaseConfig {
   }
 
   const safeEnvAnon = envAnonKey && !isServiceRoleOrSecretKey(envAnonKey) ? envAnonKey : '';
+  const runtimeAnon =
+    runtimeServerPublicConfig?.anonKey &&
+    !isServiceRoleOrSecretKey(runtimeServerPublicConfig.anonKey)
+      ? runtimeServerPublicConfig.anonKey
+      : '';
 
   return {
-    projectUrl: storedUrl || envUrl || DEFAULT_SUPABASE_URL,
-    schemaName: storedSchema || 'public',
-    anonKey: storedAnonKey || safeEnvAnon,
-    autoSyncUsers,
+    projectUrl:
+      storedUrl ||
+      runtimeServerPublicConfig?.projectUrl ||
+      envUrl ||
+      DEFAULT_SUPABASE_URL,
+    schemaName:
+      storedSchema ||
+      runtimeServerPublicConfig?.schemaName ||
+      'public',
+    anonKey: storedAnonKey || runtimeAnon || safeEnvAnon,
+    autoSyncUsers:
+      runtimeServerPublicConfig?.autoSyncUsers !== undefined
+        ? runtimeServerPublicConfig.autoSyncUsers
+        : autoSyncUsers,
   };
 }
 
@@ -241,6 +273,15 @@ export async function testSupabaseFromBrowser(params: {
   };
 }
 
+function compactBrowserMediaUrl(raw?: string): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed.slice(0, 600);
+  if (/^\/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]+$/.test(trimmed)) return trimmed.slice(0, 300);
+  return null;
+}
+
 export async function signupRealUserInSupabaseFromBrowser(
   config: BrowserSupabaseConfig,
   payload: {
@@ -253,7 +294,13 @@ export async function signupRealUserInSupabaseFromBrowser(
     avatarUrl?: string;
     coverUrl?: string;
   }
-): Promise<{ ok: boolean; authUid?: string; tableSynced?: boolean; error?: string }> {
+): Promise<{
+  ok: boolean;
+  authUid?: string;
+  tableSynced?: boolean;
+  needsEmailConfirm?: boolean;
+  error?: string;
+}> {
   if (!config.anonKey || isServiceRoleOrSecretKey(config.anonKey)) {
     return { ok: false, error: 'Chave pública anon do Supabase não configurada.' };
   }
@@ -264,6 +311,11 @@ export async function signupRealUserInSupabaseFromBrowser(
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'URL do Supabase inválida.' };
   }
+
+  const schema = sanitizeSupabaseSchemaName(config.schemaName);
+  const cleanHandle = payload.username.trim().toLowerCase();
+  const safeAvatar = compactBrowserMediaUrl(payload.avatarUrl);
+  const safeCover = compactBrowserMediaUrl(payload.coverUrl);
 
   const signupRes = await fetch(`${origin}/auth/v1/signup`, {
     method: 'POST',
@@ -276,9 +328,11 @@ export async function signupRealUserInSupabaseFromBrowser(
       password: payload.password,
       data: {
         lumina_id: payload.id,
-        username: payload.username.toLowerCase(),
+        username: cleanHandle,
         display_name: payload.displayName.slice(0, 60),
         bio: (payload.bio || '').slice(0, 160),
+        ...(safeAvatar ? { avatar_url: safeAvatar } : {}),
+        ...(safeCover ? { cover_url: safeCover } : {}),
       },
     }),
     signal: AbortSignal.timeout(8000),
@@ -287,7 +341,7 @@ export async function signupRealUserInSupabaseFromBrowser(
   const signupData = (await signupRes.json().catch(() => ({}))) as {
     id?: string;
     access_token?: string;
-    user?: { id?: string };
+    user?: { id?: string; identities?: unknown[] };
     msg?: string;
     error_description?: string;
     message?: string;
@@ -306,45 +360,178 @@ export async function signupRealUserInSupabaseFromBrowser(
 
   const authUid = signupData.user?.id || signupData.id;
   let tableSynced = false;
+  let lastRestError = '';
 
-  if (signupData.access_token && authUid) {
+  // Always attempt inserting into lumina_users (works with JWT OR with validated anon insert policy)
+  try {
+    const hasSessionToken = Boolean(signupData.access_token && authUid);
+    const restUrl = hasSessionToken
+      ? `${origin}/rest/v1/lumina_users?on_conflict=id`
+      : `${origin}/rest/v1/lumina_users`;
+
+    const restRes = await fetch(restUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildBrowserSupabaseHeaders(config.anonKey, signupData.access_token),
+        'Content-Profile': schema,
+        Prefer: hasSessionToken
+          ? 'resolution=merge-duplicates,return=representation'
+          : 'resolution=ignore-duplicates,return=representation',
+      },
+      body: JSON.stringify({
+        id: payload.id,
+        auth_uid: authUid || null,
+        username: cleanHandle,
+        display_name: payload.displayName.slice(0, 60),
+        email: payload.email.trim().toLowerCase(),
+        bio: (payload.bio || '').slice(0, 160),
+        avatar_url: safeAvatar,
+        cover_url: safeCover,
+        verified: false,
+        boosted: false,
+        restricted: false,
+        is_real_user: true,
+        auth_source: 'register',
+        updated_at: new Date().toISOString(),
+      }),
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (restRes.ok) {
+      tableSynced = true;
+    } else {
+      lastRestError = await restRes.text().catch(() => `HTTP ${restRes.status}`);
+    }
+  } catch {
+    // Check below whether auth trigger inserted the row
+  }
+
+  if (!tableSynced) {
     try {
-      const schema = sanitizeSupabaseSchemaName(config.schemaName);
-      const safeAvatar =
-        payload.avatarUrl && /^https?:\/\//i.test(payload.avatarUrl) ? payload.avatarUrl : null;
-      const safeCover =
-        payload.coverUrl && /^https?:\/\//i.test(payload.coverUrl) ? payload.coverUrl : null;
+      const verifyRes = await fetch(
+        `${origin}/rest/v1/lumina_users?select=id,username&username=eq.${encodeURIComponent(cleanHandle)}&limit=1`,
+        {
+          method: 'GET',
+          headers: {
+            ...buildBrowserSupabaseHeaders(config.anonKey),
+            'Accept-Profile': schema,
+          },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+      if (verifyRes.ok) {
+        const rows = (await verifyRes.json()) as Array<{ id?: string }>;
+        if (Array.isArray(rows) && rows.length > 0) {
+          tableSynced = true;
+        }
+      }
+    } catch {
+      // Ignore verification network error
+    }
+  }
 
-      const restRes = await fetch(`${origin}/rest/v1/lumina_users?on_conflict=id`, {
+  if (!tableSynced && Array.isArray(signupData.user?.identities) && signupData.user.identities.length === 0) {
+    return {
+      ok: false,
+      error: 'Este e-mail já existe no Supabase Auth ou não pôde ser gravado em lumina_users.',
+    };
+  }
+
+  return {
+    ok: true,
+    authUid,
+    tableSynced,
+    needsEmailConfirm: !signupData.access_token,
+    error: tableSynced ? undefined : lastRestError || undefined,
+  };
+}
+
+export async function syncUsersToSupabaseFromBrowser(
+  config: BrowserSupabaseConfig,
+  users: Array<{
+    id: string;
+    uid?: string;
+    username: string;
+    displayName: string;
+    email?: string;
+    bio?: string;
+    avatarUrl?: string;
+    coverUrl?: string;
+    isDemoSeed?: boolean;
+  }>
+): Promise<{ attempted: number; inserted: number; failed: number; lastError?: string }> {
+  if (!config.anonKey || isServiceRoleOrSecretKey(config.anonKey)) {
+    return { attempted: 0, inserted: 0, failed: 0, lastError: 'Chave pública anon não configurada.' };
+  }
+  const realUsers = users.filter((u) => !u.isDemoSeed && u.id && u.username);
+  if (realUsers.length === 0) {
+    return { attempted: 0, inserted: 0, failed: 0 };
+  }
+
+  let origin: string;
+  try {
+    origin = normalizeSupabaseOrigin(config.projectUrl);
+  } catch (err) {
+    return {
+      attempted: realUsers.length,
+      inserted: 0,
+      failed: realUsers.length,
+      lastError: err instanceof Error ? err.message : 'URL do Supabase inválida.',
+    };
+  }
+
+  const schema = sanitizeSupabaseSchemaName(config.schemaName);
+  let inserted = 0;
+  let failed = 0;
+  let lastError = '';
+
+  for (const u of realUsers) {
+    try {
+      const res = await fetch(`${origin}/rest/v1/lumina_users`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...buildBrowserSupabaseHeaders(config.anonKey, signupData.access_token),
+          ...buildBrowserSupabaseHeaders(config.anonKey),
           'Content-Profile': schema,
-          Prefer: 'resolution=merge-duplicates,return=minimal',
+          Prefer: 'resolution=ignore-duplicates,return=minimal',
         },
         body: JSON.stringify({
-          id: payload.id,
-          auth_uid: authUid,
-          username: payload.username.toLowerCase(),
-          display_name: payload.displayName.slice(0, 60),
-          email: payload.email.trim().toLowerCase(),
-          bio: (payload.bio || '').slice(0, 160),
-          avatar_url: safeAvatar,
-          cover_url: safeCover,
+          id: u.id,
+          auth_uid: u.uid || null,
+          username: u.username.trim().toLowerCase(),
+          display_name: (u.displayName || u.username).slice(0, 80),
+          email: u.email ? u.email.trim().toLowerCase().slice(0, 140) : null,
+          bio: (u.bio || 'Novo usuário real na Lumina.').slice(0, 160),
+          avatar_url: compactBrowserMediaUrl(u.avatarUrl),
+          cover_url: compactBrowserMediaUrl(u.coverUrl),
+          verified: false,
+          boosted: false,
+          restricted: false,
           is_real_user: true,
-          auth_source: 'register',
+          auth_source: 'admin-sync',
           updated_at: new Date().toISOString(),
         }),
         signal: AbortSignal.timeout(6000),
       });
-      tableSynced = restRes.ok;
-    } catch {
-      // Trigger on auth.users handles fallback insert if direct REST fails
+      if (res.ok) {
+        inserted += 1;
+      } else {
+        failed += 1;
+        lastError = await res.text().catch(() => `HTTP ${res.status}`);
+      }
+    } catch (err) {
+      failed += 1;
+      lastError = err instanceof Error ? err.message : 'Erro de rede';
     }
   }
 
-  return { ok: true, authUid, tableSynced };
+  return {
+    attempted: realUsers.length,
+    inserted,
+    failed,
+    lastError: lastError || undefined,
+  };
 }
 
 export async function loginSupabaseFromBrowser(
@@ -394,6 +581,32 @@ export async function loginSupabaseFromBrowser(
   }
 }
 
+function mapBrowserSupabaseUserRow(r: Record<string, unknown>): Record<string, unknown> {
+  const username = String(r.username || '');
+  return {
+    id: String(r.id || ''),
+    uid: typeof r.auth_uid === 'string' && r.auth_uid ? r.auth_uid : undefined,
+    username,
+    displayName: String(r.display_name || username || ''),
+    bio: String(r.bio || 'Novo usuário real na Lumina.'),
+    avatarUrl:
+      typeof r.avatar_url === 'string' && r.avatar_url.trim()
+        ? r.avatar_url.trim()
+        : '/og-preview.jpg',
+    coverUrl:
+      typeof r.cover_url === 'string' && r.cover_url.trim()
+        ? r.cover_url.trim()
+        : undefined,
+    verified: Boolean(r.verified),
+    boosted: Boolean(r.boosted),
+    restricted: Boolean(r.restricted),
+    isOnline: false,
+    isDemoSeed: false,
+    followers: [],
+    following: [],
+  };
+}
+
 export async function fetchPublicUsersFromSupabaseBrowser(
   config: BrowserSupabaseConfig
 ): Promise<Array<Record<string, unknown>>> {
@@ -402,7 +615,7 @@ export async function fetchPublicUsersFromSupabaseBrowser(
     const origin = normalizeSupabaseOrigin(config.projectUrl);
     const schema = sanitizeSupabaseSchemaName(config.schemaName);
     const res = await fetch(
-      `${origin}/rest/v1/lumina_users?select=id,username,display_name,bio,avatar_url,cover_url,verified,boosted,restricted,created_at&is_real_user=eq.true&order=created_at.desc&limit=200`,
+      `${origin}/rest/v1/lumina_users?select=id,auth_uid,username,display_name,bio,avatar_url,cover_url,verified,boosted,restricted,created_at&is_real_user=eq.true&order=created_at.desc&limit=200`,
       {
         method: 'GET',
         headers: {
@@ -415,22 +628,38 @@ export async function fetchPublicUsersFromSupabaseBrowser(
     if (!res.ok) return [];
     const rows = (await res.json()) as Array<Record<string, unknown>>;
     if (!Array.isArray(rows)) return [];
-    return rows.map((r) => ({
-      id: String(r.id || ''),
-      username: String(r.username || ''),
-      displayName: String(r.display_name || r.username || ''),
-      bio: String(r.bio || ''),
-      avatarUrl: typeof r.avatar_url === 'string' && r.avatar_url ? r.avatar_url : undefined,
-      coverUrl: typeof r.cover_url === 'string' && r.cover_url ? r.cover_url : undefined,
-      verified: Boolean(r.verified),
-      boosted: Boolean(r.boosted),
-      restricted: Boolean(r.restricted),
-      isOnline: false,
-      isDemoSeed: false,
-      followers: [],
-      following: [],
-    }));
+    return rows.map(mapBrowserSupabaseUserRow).filter((u) => Boolean(u.id && u.username));
   } catch {
     return [];
+  }
+}
+
+export async function fetchPublicUserByUsernameFromSupabaseBrowser(
+  config: BrowserSupabaseConfig,
+  rawUsername: string
+): Promise<Record<string, unknown> | null> {
+  const cleanHandle = rawUsername.trim().toLowerCase().replace(/^@/, '');
+  if (!cleanHandle || !config.anonKey || isServiceRoleOrSecretKey(config.anonKey)) return null;
+  try {
+    const origin = normalizeSupabaseOrigin(config.projectUrl);
+    const schema = sanitizeSupabaseSchemaName(config.schemaName);
+    const res = await fetch(
+      `${origin}/rest/v1/lumina_users?select=id,auth_uid,username,display_name,bio,avatar_url,cover_url,verified,boosted,restricted,created_at&username=ilike.${encodeURIComponent(cleanHandle)}&limit=1`,
+      {
+        method: 'GET',
+        headers: {
+          ...buildBrowserSupabaseHeaders(config.anonKey),
+          'Accept-Profile': schema,
+        },
+        signal: AbortSignal.timeout(6000),
+      }
+    );
+    if (!res.ok) return null;
+    const rows = (await res.json()) as Array<Record<string, unknown>>;
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const mapped = mapBrowserSupabaseUserRow(rows[0]);
+    return mapped.id && mapped.username ? mapped : null;
+  } catch {
+    return null;
   }
 }

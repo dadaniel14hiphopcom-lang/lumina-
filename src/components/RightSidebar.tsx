@@ -84,14 +84,16 @@ export function RightSidebar() {
 
   const suggestions = useMemo(() => {
     const trendingIds = new Set(trendingUsers.map((t) => t.user.id));
-    const nonTrending = users.filter(
-      (u) => u.id !== currentUser.id && !trendingIds.has(u.id)
-    );
-    const pool =
-      nonTrending.length > 0
-        ? nonTrending
-        : users.filter((u) => u.id !== currentUser.id);
-    return pool.slice(0, 4);
+    const eligible = users.filter((u) => u.id !== currentUser.id && !u.restricted);
+    const nonTrending = eligible.filter((u) => !trendingIds.has(u.id));
+    const pool = nonTrending.length > 0 ? nonTrending : eligible;
+    return [...pool]
+      .sort((a, b) => {
+        const aReal = a.isDemoSeed ? 0 : 1;
+        const bReal = b.isDemoSeed ? 0 : 1;
+        return bReal - aReal;
+      })
+      .slice(0, 6);
   }, [users, currentUser.id, trendingUsers]);
 
   const handlePasswordLogin = async (e: React.FormEvent) => {

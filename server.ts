@@ -24,6 +24,7 @@ import { normalizeVideoFileForWeb } from './server/videoTranscoder.ts';
 import {
   DEFAULT_SUPABASE_URL,
   fetchPublicRealUsersFromSupabase,
+  fetchPublicUserByUsernameFromSupabase,
   isSecretSupabaseKey,
   registerOrSyncUserToSupabase,
   testSupabaseConnection,
@@ -195,6 +196,7 @@ let memoryAdminState: IntegrationState | null = null;
 let memoryUserAuthRecords: UserAuthRecord[] | null = null;
 let memorySocialState: SharedSocialState | null = null;
 let memoryPostPreviews: Map<string, PostPreviewRecord> | null = null;
+let supabaseUsersCache: { fetchedAt: number; users: Record<string, unknown>[] } | null = null;
 
 interface IntegrationState {
   aws: {
@@ -839,6 +841,16 @@ function injectLinkPreviewMeta(html: string, req: Request): string {
   const pathMatch = req.path.match(/^\/(?:p|post)\/([a-zA-Z0-9_-]{1,128})\/?$/);
   const postParam = queryPostParam || (pathMatch ? pathMatch[1] : '');
   const inviteParam = typeof req.query.invite === 'string' ? req.query.invite.trim().toUpperCase() : '';
+  const rawProfileQuery =
+    (typeof req.query.perfil === 'string' && req.query.perfil) ||
+    (typeof req.query.profile === 'string' && req.query.profile) ||
+    (typeof req.query.u === 'string' && req.query.u) ||
+    (typeof req.query.user === 'string' && req.query.user) ||
+    '';
+  const profilePathMatch = req.path.match(/^\/(?:@|perfil\/)([a-zA-Z0-9._]{2,40})\/?$/i);
+  const profileParam = (rawProfileQuery.trim().replace(/^@/, '') || (profilePathMatch ? profilePathMatch[1] : ''))
+    .toLowerCase()
+    .slice(0, 40);
 
   if (postParam && /^[a-zA-Z0-9_-]{1,128}$/.test(postParam)) {
     canonicalUrl = `${origin}/?post=${encodeURIComponent(postParam)}`;
@@ -865,6 +877,38 @@ function injectLinkPreviewMeta(html: string, req: Request): string {
     } else {
       ogType = 'article';
       title = 'Publicação na Lumina — Rede Social Visual';
+      imageAlt = title;
+    }
+  } else if (profileParam && /^[a-z0-9._]{2,40}$/.test(profileParam)) {
+    canonicalUrl = `${origin}/?perfil=${encodeURIComponent(profileParam)}`;
+    ogType = 'profile';
+    const shared = readSharedSocialState();
+    const candidates = [...(shared?.users || []), ...(supabaseUsersCache?.users || [])];
+    const matchedProfile = candidates.find(
+      (u) =>
+        (typeof u.username === 'string' && u.username.toLowerCase() === profileParam) ||
+        (typeof u.id === 'string' && u.id.toLowerCase() === profileParam)
+    ) as
+      | { username?: string; displayName?: string; bio?: string; avatarUrl?: string }
+      | undefined;
+    if (matchedProfile) {
+      const uname = (matchedProfile.username || profileParam).replace(/^@/, '');
+      const dname = matchedProfile.displayName?.trim() || uname;
+      title = `${dname} (@${uname}) na Lumina`;
+      description =
+        matchedProfile.bio?.trim().slice(0, 155) ||
+        `Veja o perfil e as publicações de @${uname} na Lumina.`;
+      imageAlt = title;
+      if (matchedProfile.avatarUrl && isSafePreviewMediaUrl(matchedProfile.avatarUrl)) {
+        if (/^https?:\/\//i.test(matchedProfile.avatarUrl)) {
+          imageUrl = matchedProfile.avatarUrl;
+        } else if (matchedProfile.avatarUrl.startsWith('/')) {
+          imageUrl = `${origin}${matchedProfile.avatarUrl}`;
+        }
+      }
+    } else {
+      title = `@${profileParam} na Lumina`;
+      description = `Confira o perfil de @${profileParam} na Lumina.`;
       imageAlt = title;
     }
   } else if (inviteParam && /^[A-Z0-9_-]{4,32}$/.test(inviteParam)) {
@@ -1754,15 +1798,27 @@ async function startServer() {
     res.json({ ok: true, token: signSessionToken(), email: ADMIN_EMAIL });
   });
 
-  // Public lightweight site metadata (version, banner, realUsersOnly, videoRules)
+  // Public lightweight site metadata (version, banner, realUsersOnly, videoRules, non-secret Supabase public config)
   app.get('/api/site/meta', (_req, res) => {
     const state = readAdminState();
+    const candidateAnon =
+      (state.supabase.anonKey || '').trim() ||
+      (process.env.SUPABASE_ANON_KEY || '').trim() ||
+      (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+    const safePublicAnon =
+      candidateAnon && !isSecretSupabaseKey(candidateAnon) ? candidateAnon : '';
     res.json({
       version: state.site.version,
       announcementBanner: state.site.announcementBanner,
       maintenanceMode: state.site.maintenanceMode,
       realUsersOnly: Boolean(state.site.realUsersOnly),
       videoRules: state.site.videoRules,
+      supabase: {
+        projectUrl: state.supabase.projectUrl || DEFAULT_SUPABASE_URL,
+        schemaName: state.supabase.schemaName || 'public',
+        anonKey: safePublicAnon,
+        autoSyncUsers: Boolean(state.supabase.autoSyncUsers),
+      },
     });
   });
 
@@ -1892,6 +1948,7 @@ async function startServer() {
     }
 
     writeAdminState(current);
+    supabaseUsersCache = null;
     res.json({ ok: true, state: current });
   });
 
@@ -1974,6 +2031,7 @@ async function startServer() {
           ? 'Chave OK · Falta SQL'
           : 'Falta chave pública (anon)';
         writeAdminState(state);
+        supabaseUsersCache = null;
         res.json({
           ok: true,
           reachable: result.reachable,
@@ -2162,6 +2220,7 @@ async function startServer() {
       ? 'Tabela lumina_users pendente'
       : `${syncedUsers} usuário(s) sincronizado(s)`;
     writeAdminState(state);
+    supabaseUsersCache = null;
 
     const statusLabel = missingKeys
       ? lastErrorMessage
@@ -2462,6 +2521,7 @@ async function startServer() {
         source: 'invite',
       });
     }
+    supabaseUsersCache = null;
 
     res.json({
       ok: true,
@@ -2637,6 +2697,7 @@ async function startServer() {
       supabaseSynced = sbRes.synced;
       supabaseMessage = sbRes.message;
     }
+    supabaseUsersCache = null;
 
     res.json({
       ok: true,
@@ -2708,6 +2769,7 @@ async function startServer() {
       verified: isExclusiveAdmin,
       source: 'google',
     });
+    supabaseUsersCache = null;
 
     res.json({ ok: result.synced, ...result });
   });
@@ -2848,7 +2910,52 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  let supabaseUsersCache: { fetchedAt: number; users: Record<string, unknown>[] } | null = null;
+  // Public profile lookup by @username or ID (used for shared profile links)
+  app.get('/api/social/profile/:username', async (req, res) => {
+    const cleanHandle = String(req.params.username || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^@/, '')
+      .slice(0, 64);
+    if (!cleanHandle) {
+      res.status(400).json({ error: 'Perfil inválido.' });
+      return;
+    }
+
+    const social = readSharedSocialState();
+    const localMatch = social?.users.find(
+      (u) =>
+        (typeof u.username === 'string' && u.username.toLowerCase() === cleanHandle) ||
+        (typeof u.id === 'string' && u.id.toLowerCase() === cleanHandle)
+    );
+    if (localMatch) {
+      const { email: _stripEmail, ...publicFields } = localMatch;
+      res.json({ ok: true, user: publicFields });
+      return;
+    }
+
+    const cachedMatch = supabaseUsersCache?.users.find(
+      (u) =>
+        (typeof u.username === 'string' && u.username.toLowerCase() === cleanHandle) ||
+        (typeof u.id === 'string' && u.id.toLowerCase() === cleanHandle)
+    );
+    if (cachedMatch) {
+      const { email: _stripEmail, ...publicFields } = cachedMatch;
+      res.json({ ok: true, user: publicFields });
+      return;
+    }
+
+    const adminState = readAdminState();
+    if (adminState.supabase.projectUrl) {
+      const sbUser = await fetchPublicUserByUsernameFromSupabase(adminState.supabase, cleanHandle);
+      if (sbUser) {
+        res.json({ ok: true, user: sbUser });
+        return;
+      }
+    }
+
+    res.status(404).json({ ok: false, error: 'Perfil não encontrado.' });
+  });
 
   // Shared Social State Sync (multi-device fallback for Node-hosted instances + Supabase public users)
   app.get('/api/social/state', async (_req, res) => {
@@ -2858,7 +2965,7 @@ async function startServer() {
     if (
       adminState.supabase.autoSyncUsers &&
       adminState.supabase.projectUrl &&
-      (!supabaseUsersCache || Date.now() - supabaseUsersCache.fetchedAt > 30_000)
+      (!supabaseUsersCache || Date.now() - supabaseUsersCache.fetchedAt > 15_000)
     ) {
       const sbUsers = await fetchPublicRealUsersFromSupabase(adminState.supabase);
       supabaseUsersCache = { fetchedAt: Date.now(), users: sbUsers };
@@ -2880,20 +2987,58 @@ async function startServer() {
       notifications: [],
     };
 
-    const existingIds = new Set(baseState.users.map((u) => String(u.id || '')));
-    const mergedUsers = [...baseState.users];
+    const mergedUsers = baseState.users.map((u) => {
+      const uEmailStrip = { ...u };
+      delete uEmailStrip.email;
+      return uEmailStrip;
+    });
+
     for (const sbu of sbUsers) {
       const sid = String(sbu.id || '');
-      if (sid && !existingIds.has(sid)) {
+      const sUsername = String(sbu.username || '').trim().toLowerCase();
+      if (!sid || !sUsername) continue;
+
+      const existingIndex = mergedUsers.findIndex(
+        (u) =>
+          String(u.id || '') === sid ||
+          (u.isDemoSeed !== true && String(u.username || '').trim().toLowerCase() === sUsername)
+      );
+
+      if (existingIndex === -1) {
         mergedUsers.push(sbu);
-        existingIds.add(sid);
+      } else {
+        const existing = mergedUsers[existingIndex];
+        mergedUsers[existingIndex] = {
+          ...existing,
+          verified: Boolean(existing.verified || sbu.verified),
+          boosted: Boolean(existing.boosted || sbu.boosted),
+          restricted: Boolean(existing.restricted || sbu.restricted),
+          avatarUrl:
+            typeof existing.avatarUrl === 'string' && existing.avatarUrl.trim()
+              ? existing.avatarUrl
+              : sbu.avatarUrl,
+          bio:
+            typeof existing.bio === 'string' && existing.bio.trim()
+              ? existing.bio
+              : sbu.bio,
+          displayName:
+            typeof existing.displayName === 'string' && existing.displayName.trim()
+              ? existing.displayName
+              : sbu.displayName,
+        };
       }
     }
+
+    const effectiveUpdatedAt = Math.max(
+      baseState.updatedAt || 0,
+      supabaseUsersCache?.fetchedAt || 0
+    );
 
     res.json({
       ok: true,
       state: {
         ...baseState,
+        updatedAt: effectiveUpdatedAt,
         users: mergedUsers,
       },
     });

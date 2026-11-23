@@ -1,4 +1,5 @@
 import {
+  BadgeCheck,
   Clock,
   Film,
   Heart,
@@ -45,8 +46,15 @@ export function ExploreView() {
   const normalized = exploreQuery.trim().toLowerCase();
 
   const matchedUsers = useMemo(() => {
-    if (!normalized) return [];
-    return users.filter(
+    const activeUsers = users
+      .filter((u) => !u.restricted)
+      .sort((a, b) => {
+        const aReal = a.isDemoSeed ? 0 : 1;
+        const bReal = b.isDemoSeed ? 0 : 1;
+        return bReal - aReal;
+      });
+    if (!normalized) return activeUsers.slice(0, 12);
+    return activeUsers.filter(
       (u) =>
         u.username.toLowerCase().includes(normalized) ||
         u.displayName.toLowerCase().includes(normalized)
@@ -154,19 +162,26 @@ export function ExploreView() {
         })}
       </div>
 
-      {/* Matched Profiles when Searching */}
+      {/* Matched or Active Community Profiles */}
       {matchedUsers.length > 0 && (
         <div className="mb-6">
-          <h2 className="mb-2.5 text-xs font-semibold text-zinc-500 dark:text-zinc-400">
-            Perfis encontrados
-          </h2>
+          <div className="mb-2.5 flex items-center justify-between">
+            <h2 className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
+              {normalized ? 'Perfis encontrados' : 'Membros na Lumina'}
+            </h2>
+            {!normalized && (
+              <span className="text-[11px] text-zinc-400 dark:text-zinc-500">
+                {matchedUsers.length} perfis públicos
+              </span>
+            )}
+          </div>
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {matchedUsers.map((u) => (
               <ProfileHoverCard key={u.id} userId={u.id} className="block w-full">
                 <button
                   type="button"
                   onClick={() => {
-                    addRecentSearch(u.username);
+                    if (normalized) addRecentSearch(u.username);
                     openProfile(u.id);
                   }}
                   className="flex w-full items-center gap-3 rounded-xl border border-zinc-200 bg-white p-3 text-left transition-colors hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
@@ -177,10 +192,13 @@ export function ExploreView() {
                     size="sm"
                     showOnlineIndicator={Boolean(u.isOnline)}
                   />
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
-                      {u.username}
-                    </p>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1">
+                      <p className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
+                        @{u.username}
+                      </p>
+                      {u.verified && <BadgeCheck className="h-3.5 w-3.5 shrink-0 text-sky-500" />}
+                    </div>
                     <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
                       {u.displayName}
                     </p>

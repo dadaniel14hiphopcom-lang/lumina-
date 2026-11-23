@@ -40,6 +40,7 @@ import {
   isServiceRoleOrSecretKey,
   isSupabaseApiKeyLike,
   sanitizeSupabaseSchemaName,
+  syncUsersToSupabaseFromBrowser,
   testSupabaseFromBrowser,
 } from '../lib/supabaseClient';
 import { InviteRecord, VideoRulesConfig } from '../types';
@@ -284,6 +285,8 @@ export function AdminPanelView() {
     createInvite,
     revokeInvite,
     purgeDemoUsers,
+    refreshPublicUsersFromSupabase,
+    mergeExternalUsers,
     firebaseUser,
     adminMemoryToken,
     setAdminMemoryToken,
@@ -440,6 +443,7 @@ export function AdminPanelView() {
   };
 
   const loadOverview = async (tokenOverride?: string, serverMode = authStatus.serverAvailable) => {
+    void refreshPublicUsersFromSupabase();
     if (!serverMode) {
       loadLocalOverview();
       return;
@@ -713,23 +717,38 @@ export function AdminPanelView() {
     }
   };
 
+  useEffect(() => {
+    if (!adminToken || manualLock) return;
+    if (activeTab === 'users') {
+      void refreshPublicUsersFromSupabase();
+    }
+  }, [activeTab, adminToken, manualLock]);
+
   const filteredUsers = useMemo(() => {
     const q = userSearch.trim().toLowerCase();
-    return allUsers.filter((u) => {
-      if (userFilter === 'verified' && !u.verified) return false;
-      if (userFilter === 'boosted' && !u.boosted) return false;
-      if (userFilter === 'restricted' && !u.restricted) return false;
-      if (!q) return true;
-      return (
-        u.username.toLowerCase().includes(q) ||
-        u.displayName.toLowerCase().includes(q)
-      );
-    });
+    return allUsers
+      .filter((u) => {
+        if (userFilter === 'verified' && !u.verified) return false;
+        if (userFilter === 'boosted' && !u.boosted) return false;
+        if (userFilter === 'restricted' && !u.restricted) return false;
+        if (!q) return true;
+        return (
+          u.username.toLowerCase().includes(q) ||
+          u.displayName.toLowerCase().includes(q)
+        );
+      })
+      .sort((a, b) => {
+        const aReal = a.isDemoSeed ? 0 : 1;
+        const bReal = b.isDemoSeed ? 0 : 1;
+        if (aReal !== bReal) return bReal - aReal;
+        return 0;
+      });
   }, [allUsers, userSearch, userFilter]);
 
   const userStats = useMemo(
     () => ({
       total: allUsers.length,
+      real: allUsers.filter((u) => !u.isDemoSeed).length,
       verified: allUsers.filter((u) => u.verified).length,
       boosted: allUsers.filter((u) => u.boosted).length,
       restricted: allUsers.filter((u) => u.restricted).length,
@@ -1126,8 +1145,18 @@ export function AdminPanelView() {
           showToast(check.hasKey ? 'Execute o SQL no Supabase antes de sincronizar' : 'Cole a Chave Pública (anon) do Supabase');
           return;
         }
+        const localRealUsers = allUsers.filter((u) => !u.isDemoSeed);
+        const pushRes = await syncUsersToSupabaseFromBrowser(cfg, localRealUsers);
         const remoteUsers = await fetchPublicUsersFromSupabaseBrowser(cfg);
-        const msg = `Banco conectado direto pelo navegador! ${remoteUsers.length} usuário(s) real(is) encontrado(s) em ${cfg.schemaName}.lumina_users. Novos cadastros feitos no site gravam automaticamente neste banco.`;
+        if (remoteUsers.length > 0) {
+          mergeExternalUsers(remoteUsers as unknown as typeof allUsers);
+        }
+        const msg =
+          pushRes.failed > 0 && pushRes.inserted === 0 && remoteUsers.length === 0
+            ? `Supabase conectado, mas bloqueou a gravação (${pushRes.lastError || 'RLS'}). Clique em "Copiar SQL" e execute no SQL Editor do Supabase.`
+            : `Sincronização concluída! ${remoteUsers.length} usuário(s) real(is) ativo(s) em ${cfg.schemaName}.lumina_users${
+                pushRes.inserted > 0 ? ` (${pushRes.inserted} enviado(s) agora)` : ''
+              }.`;
         setSupabaseTestStatus(msg);
         setOverview((prev) => {
           if (!prev) return prev;
@@ -1142,7 +1171,11 @@ export function AdminPanelView() {
           saveLocalAdminState(nextState);
           return { ...prev, state: nextState };
         });
-        showToast('Conexão e leitura do Supabase confirmadas!');
+        showToast(
+          remoteUsers.length > 0
+            ? `${remoteUsers.length} usuário(s) sincronizado(s) do Supabase!`
+            : 'Conexão confirmada! Execute o SQL atualizado se algum usuário não gravar.'
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Falha ao consultar Supabase.';
         setSupabaseTestStatus(msg);
@@ -1169,6 +1202,7 @@ export function AdminPanelView() {
       };
       const msg = data.statusLabel || data.error || 'Sincronização finalizada.';
       setSupabaseTestStatus(msg);
+      await refreshPublicUsersFromSupabase();
       showToast(data.ok ? 'Usuários reais sincronizados no Supabase' : msg);
       await loadOverview();
     } finally {
@@ -1515,11 +1549,13 @@ alter table ${schema}.lumina_posts add column if not exists created_at timestamp
 alter table ${schema}.lumina_users enable row level security;
 alter table ${schema}.lumina_posts enable row level security;
 
--- Protege e-mail privado contra leitura anônima via API pública
+-- Protege e-mail privado contra leitura anônima via API pública, liberando cadastro real validado
 revoke all on table ${schema}.lumina_users from anon, authenticated;
 grant select (id, auth_uid, username, display_name, avatar_url, cover_url, bio, verified, boosted, restricted, is_real_user, auth_source, created_at, updated_at)
   on table ${schema}.lumina_users to anon, authenticated;
-grant insert, update on table ${schema}.lumina_users to authenticated;
+grant insert (id, auth_uid, username, display_name, email, avatar_url, cover_url, bio, is_real_user, auth_source, created_at, updated_at)
+  on table ${schema}.lumina_users to anon, authenticated;
+grant update on table ${schema}.lumina_users to authenticated;
 
 grant select on table ${schema}.lumina_posts to anon, authenticated;
 grant insert, update, delete on table ${schema}.lumina_posts to authenticated;
@@ -1530,10 +1566,18 @@ create policy "Perfis públicos visíveis"
   using (not restricted);
 
 drop policy if exists "Usuário insere próprio perfil" on ${schema}.lumina_users;
-create policy "Usuário insere próprio perfil"
+drop policy if exists "Cadastro público validado de usuário real" on ${schema}.lumina_users;
+create policy "Cadastro público validado de usuário real"
   on ${schema}.lumina_users for insert
-  to authenticated
-  with check (auth.uid() = auth_uid);
+  to anon, authenticated
+  with check (
+    is_real_user = true
+    and coalesce(verified, false) = false
+    and coalesce(boosted, false) = false
+    and coalesce(restricted, false) = false
+    and length(trim(username)) >= 3
+    and trim(username) ~ '^[a-z0-9._]+$'
+  );
 
 drop policy if exists "Usuário atualiza próprio perfil" on ${schema}.lumina_users;
 create policy "Usuário atualiza próprio perfil"
@@ -1570,13 +1614,15 @@ begin
   end if;
 
   insert into ${schema}.lumina_users (
-    id, auth_uid, username, display_name, email, bio, is_real_user, auth_source, updated_at
+    id, auth_uid, username, display_name, email, avatar_url, cover_url, bio, is_real_user, auth_source, updated_at
   ) values (
     resolved_id,
     new.id,
     clean_handle,
     coalesce(nullif(new.raw_user_meta_data->>'display_name', ''), clean_handle),
     new.email,
+    nullif(new.raw_user_meta_data->>'avatar_url', ''),
+    nullif(new.raw_user_meta_data->>'cover_url', ''),
     coalesce(new.raw_user_meta_data->>'bio', 'Novo usuário real na Lumina.'),
     true,
     'register',
@@ -1586,6 +1632,8 @@ begin
     auth_uid = excluded.auth_uid,
     display_name = excluded.display_name,
     email = coalesce(excluded.email, ${schema}.lumina_users.email),
+    avatar_url = coalesce(excluded.avatar_url, ${schema}.lumina_users.avatar_url),
+    cover_url = coalesce(excluded.cover_url, ${schema}.lumina_users.cover_url),
     updated_at = now();
   return new;
 end;
@@ -1595,6 +1643,38 @@ drop trigger if exists on_auth_user_created_lumina on auth.users;
 create trigger on_auth_user_created_lumina
   after insert on auth.users
   for each row execute function ${schema}.handle_new_lumina_user();
+
+-- Importa usuários já existentes no Authentication que ainda não estejam em lumina_users
+do $$
+begin
+  insert into ${schema}.lumina_users (
+    id, auth_uid, username, display_name, email, avatar_url, cover_url, bio, is_real_user, auth_source, created_at, updated_at
+  )
+  select
+    coalesce(nullif(u.raw_user_meta_data->>'lumina_id', ''), u.id::text),
+    u.id,
+    case
+      when length(regexp_replace(lower(coalesce(u.raw_user_meta_data->>'username', split_part(u.email, '@', 1), 'user')), '[^a-z0-9._]', '', 'g')) >= 3
+      then regexp_replace(lower(coalesce(u.raw_user_meta_data->>'username', split_part(u.email, '@', 1), 'user')), '[^a-z0-9._]', '', 'g')
+      else 'user.' || substr(replace(u.id::text, '-', ''), 1, 6)
+    end,
+    coalesce(nullif(u.raw_user_meta_data->>'display_name', ''), split_part(u.email, '@', 1), 'Membro Lumina'),
+    u.email,
+    nullif(u.raw_user_meta_data->>'avatar_url', ''),
+    nullif(u.raw_user_meta_data->>'cover_url', ''),
+    coalesce(u.raw_user_meta_data->>'bio', 'Novo usuário real na Lumina.'),
+    true,
+    'auth-backfill',
+    coalesce(u.created_at, now()),
+    now()
+  from auth.users u
+  where not exists (
+    select 1 from ${schema}.lumina_users lu where lu.auth_uid = u.id
+  )
+  on conflict do nothing;
+exception when others then
+  null;
+end $$;
 `;
   };
 
@@ -1979,7 +2059,7 @@ ${itemsXml}
           {/* Metrics Strip */}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             {[
-              { label: 'Contas registradas', value: userStats.total },
+              { label: `Contas registradas (${userStats.real} reais)`, value: userStats.total },
               { label: 'Com selo verificado', value: userStats.verified },
               { label: 'Perfis impulsionados', value: userStats.boosted },
               { label: 'Contas restritas', value: userStats.restricted },
@@ -2081,6 +2161,10 @@ ${itemsXml}
                               </div>
                               <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
                                 {user.displayName}
+                                {' · '}
+                                <span className={user.isDemoSeed ? 'text-zinc-400' : 'font-medium text-emerald-600 dark:text-emerald-400'}>
+                                  {user.isDemoSeed ? 'Demo' : 'Conta real'}
+                                </span>
                                 {user.id === currentUser.id ? ' · Sessão atual' : ''}
                               </p>
                             </div>
@@ -3015,6 +3099,8 @@ ${itemsXml}
                     <span className="font-medium text-emerald-600 dark:text-emerald-400">
                       Chave Supabase configurada! Novos usuários reais são gravados em{' '}
                       <code className="font-mono">{state.supabase.schemaName}.lumina_users</code>.
+                      Se cadastros não aparecerem na tabela, clique em <strong>Copiar SQL</strong>,
+                      execute no SQL Editor e clique em <strong>Sincronizar usuários</strong>.
                     </span>
                   ) : (
                     <>
