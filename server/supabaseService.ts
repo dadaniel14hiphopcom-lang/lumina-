@@ -318,8 +318,32 @@ export async function testSupabaseConnection(
   );
 
   const tablesReady = tableRes.ok;
-  let statusLabel = '';
+  let schemaOutdated = false;
   if (tablesReady) {
+    try {
+      const schemaProbe = await fetch(
+        new URL('/rest/v1/lumina_users?select=id,is_real_user,followers,following,website&limit=1', origin).toString(),
+        {
+          method: 'GET',
+          headers: {
+            ...headers,
+            'Accept-Profile': schema,
+          },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+      if (schemaProbe.status === 400) {
+        schemaOutdated = true;
+      }
+    } catch {
+      // Non-fatal schema probe
+    }
+  }
+
+  let statusLabel = '';
+  if (tablesReady && schemaOutdated) {
+    statusLabel = `Conectado ao Supabase (${new URL(origin).hostname}), mas a tabela ${schema}.lumina_users está com colunas antigas — clique em "Copiar SQL" e execute novamente no SQL Editor.`;
+  } else if (tablesReady) {
     statusLabel = `Conectado ao banco ${new URL(origin).hostname} (tabela ${schema}.lumina_users pronta para usuários reais)`;
   } else if (tableRes.status === 404 || tableRes.status === 400) {
     statusLabel = `Conectado ao Supabase (${new URL(origin).hostname}), mas a tabela ${schema}.lumina_users ainda não existe — baixe e execute o SQL no SQL Editor do Supabase.`;
@@ -440,54 +464,51 @@ export async function registerOrSyncUserToSupabase(
     }
   }
 
-  const cleanHandle = user.username.toLowerCase();
-  const baseRow: Record<string, unknown> = {
+  const cleanHandle = user.username.trim().toLowerCase().replace(/^@/, '');
+  const nowIso = new Date().toISOString();
+  const baseAnonRow: Record<string, unknown> = {
     id: user.id,
     auth_uid: resolvedAuthUid,
     username: cleanHandle,
-    display_name: user.displayName.slice(0, 80),
+    display_name: (user.displayName || cleanHandle).slice(0, 80),
     email: user.email ? user.email.toLowerCase().slice(0, 140) : null,
     bio: (user.bio || '').slice(0, 220),
     avatar_url: safeMetaAvatar,
     cover_url: safeMetaCover,
-    verified: Boolean(user.verified),
-    boosted: Boolean(user.boosted),
-    restricted: Boolean(user.restricted),
     is_real_user: true,
     auth_source: user.source,
-    updated_at: new Date().toISOString(),
+    updated_at: nowIso,
   };
 
-  const extendedRow: Record<string, unknown> = {
-    ...baseRow,
+  const extendedAnonRow: Record<string, unknown> = {
+    ...baseAnonRow,
     ...(typeof user.website === 'string' ? { website: user.website.slice(0, 200) } : {}),
     ...(Array.isArray(user.followers) ? { followers: user.followers.slice(0, 2000) } : {}),
     ...(Array.isArray(user.following) ? { following: user.following.slice(0, 2000) } : {}),
   };
 
-  const canMergeDuplicates = Boolean(
-    keys.serviceRoleKey || (authJwtForPostgrest && authJwtForPostgrest !== keys.anonKey)
-  );
+  const canServiceMerge = Boolean(keys.serviceRoleKey);
+  const effectiveKey = keys.serviceRoleKey || keys.activeKey;
 
   const tryPostRow = async (rowBody: Record<string, unknown>) => {
-    const restUrl = canMergeDuplicates
+    const bodyToSend = canServiceMerge
+      ? {
+          ...rowBody,
+          verified: Boolean(user.verified),
+          boosted: Boolean(user.boosted),
+          restricted: Boolean(user.restricted),
+        }
+      : rowBody;
+    const restUrl = canServiceMerge
       ? new URL('/rest/v1/lumina_users?on_conflict=id', origin).toString()
       : new URL('/rest/v1/lumina_users', origin).toString();
-    const bodyToSend = canMergeDuplicates
-      ? rowBody
-      : {
-          ...rowBody,
-          verified: false,
-          boosted: false,
-          restricted: false,
-        };
     return fetch(restUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...buildSupabaseHeaders(keys.activeKey, authJwtForPostgrest),
+        ...buildSupabaseHeaders(effectiveKey, authJwtForPostgrest),
         'Content-Profile': schema,
-        Prefer: canMergeDuplicates
+        Prefer: canServiceMerge
           ? 'resolution=merge-duplicates,return=representation'
           : 'resolution=ignore-duplicates,return=representation',
       },
@@ -496,18 +517,65 @@ export async function registerOrSyncUserToSupabase(
     });
   };
 
+  const patchExistingAnonRow = async (filterQuery: string): Promise<boolean> => {
+    const patchFull: Record<string, unknown> = {
+      display_name: (user.displayName || cleanHandle).slice(0, 80),
+      bio: (user.bio || '').slice(0, 220),
+      avatar_url: safeMetaAvatar,
+      cover_url: safeMetaCover,
+      updated_at: nowIso,
+    };
+    if (typeof user.website === 'string') patchFull.website = user.website.slice(0, 200);
+    if (Array.isArray(user.followers)) patchFull.followers = user.followers.slice(0, 2000);
+    if (Array.isArray(user.following)) patchFull.following = user.following.slice(0, 2000);
+
+    let pRes = await fetch(new URL(`/rest/v1/lumina_users?${filterQuery}`, origin).toString(), {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildSupabaseHeaders(effectiveKey, authJwtForPostgrest),
+        'Content-Profile': schema,
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify(patchFull),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (pRes.status === 400) {
+      const pCore = { ...patchFull };
+      delete pCore.website;
+      delete pCore.followers;
+      delete pCore.following;
+      pRes = await fetch(new URL(`/rest/v1/lumina_users?${filterQuery}`, origin).toString(), {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildSupabaseHeaders(effectiveKey, authJwtForPostgrest),
+          'Content-Profile': schema,
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify(pCore),
+        signal: AbortSignal.timeout(6000),
+      });
+    }
+    return pRes.ok;
+  };
+
   try {
-    let restRes = await tryPostRow(extendedRow);
-    if (restRes.status === 400 && extendedRow !== baseRow) {
-      restRes = await tryPostRow(baseRow);
+    let restRes = await tryPostRow(extendedAnonRow);
+    if (restRes.status === 400) {
+      restRes = await tryPostRow(baseAnonRow);
     }
 
     if (restRes.ok) {
+      const createdRows = (await restRes.json().catch(() => [])) as Array<{ id?: string }>;
+      if (Array.isArray(createdRows) && createdRows.length === 0 && !canServiceMerge) {
+        await patchExistingAnonRow(`id=eq.${encodeURIComponent(user.id)}`).catch(() => false);
+      }
       return {
         synced: true,
         authCreated,
         httpStatus: restRes.status,
-        message: `Usuário @${user.username} gravado no Supabase (${schema}.lumina_users).`,
+        message: `Usuário @${cleanHandle} gravado no Supabase (${schema}.lumina_users).`,
       };
     }
 
@@ -516,13 +584,13 @@ export async function registerOrSyncUserToSupabase(
     try {
       const checkRes = await fetch(
         new URL(
-          `/rest/v1/lumina_users?select=id,username&username=eq.${encodeURIComponent(cleanHandle)}&limit=1`,
+          `/rest/v1/lumina_users?select=id,username&username=ilike.${encodeURIComponent(cleanHandle)}&limit=1`,
           origin
         ).toString(),
         {
           method: 'GET',
           headers: {
-            ...buildSupabaseHeaders(keys.activeKey),
+            ...buildSupabaseHeaders(effectiveKey),
             'Accept-Profile': schema,
           },
           signal: AbortSignal.timeout(5000),
@@ -530,12 +598,13 @@ export async function registerOrSyncUserToSupabase(
       );
       if (checkRes.ok) {
         const rows = (await checkRes.json()) as Array<{ id?: string; username?: string }>;
-        if (Array.isArray(rows) && rows.length > 0) {
+        if (Array.isArray(rows) && rows.length > 0 && rows[0].id) {
+          await patchExistingAnonRow(`id=eq.${encodeURIComponent(rows[0].id)}`).catch(() => false);
           return {
             synced: true,
             authCreated,
             httpStatus: checkRes.status,
-            message: `Usuário @${user.username} sincronizado no Supabase (${schema}.lumina_users).`,
+            message: `Usuário @${cleanHandle} sincronizado no Supabase (${schema}.lumina_users).`,
           };
         }
       }
@@ -554,7 +623,7 @@ export async function registerOrSyncUserToSupabase(
       httpStatus: restRes.status,
       message: tableMissing
         ? `Execute o script SQL no SQL Editor do Supabase para criar a tabela ${schema}.lumina_users.`
-        : `Supabase retornou HTTP ${restRes.status} ao gravar usuário${errText ? `: ${errText.slice(0, 120)}` : '.'}`,
+        : `Supabase retornou HTTP ${restRes.status} ao gravar usuário${errText ? `: ${errText.slice(0, 140)}` : '.'}`,
     };
   } catch (err) {
     return {
@@ -604,9 +673,12 @@ export async function updateUserInSupabase(
       const safe = compactAssetForDb(patch.coverUrl, 220_000);
       if (safe) fullBody.cover_url = safe;
     }
-    if (typeof patch.verified === 'boolean') fullBody.verified = patch.verified;
-    if (typeof patch.boosted === 'boolean') fullBody.boosted = patch.boosted;
-    if (typeof patch.restricted === 'boolean') fullBody.restricted = patch.restricted;
+    // Only send admin/moderation flags if server holds service_role key
+    if (keys.hasServiceRole) {
+      if (typeof patch.verified === 'boolean') fullBody.verified = patch.verified;
+      if (typeof patch.boosted === 'boolean') fullBody.boosted = patch.boosted;
+      if (typeof patch.restricted === 'boolean') fullBody.restricted = patch.restricted;
+    }
     if (Array.isArray(patch.followers)) fullBody.followers = patch.followers.slice(0, 2000);
     if (Array.isArray(patch.following)) fullBody.following = patch.following.slice(0, 2000);
 
@@ -1017,25 +1089,26 @@ export async function fetchPublicRealUsersFromSupabase(
   try {
     const origin = await resolveValidatedSupabaseOrigin(config.projectUrl);
     const schema = sanitizeSchemaName(config.schemaName);
-    for (const cols of [SELECT_USERS_EXTENDED, SELECT_USERS_CORE]) {
-      const res = await fetch(
-        new URL(
-          `/rest/v1/lumina_users?select=${cols}&is_real_user=eq.true&order=created_at.desc&limit=250`,
-          origin
-        ).toString(),
-        {
-          method: 'GET',
-          headers: {
-            ...buildSupabaseHeaders(keys.activeKey),
-            'Accept-Profile': schema,
-          },
-          signal: AbortSignal.timeout(5000),
-        }
-      );
+    const queries = [
+      `/rest/v1/lumina_users?select=${SELECT_USERS_EXTENDED}&or=(is_real_user.eq.true,is_real_user.is.null)&or=(restricted.eq.false,restricted.is.null)&order=created_at.desc&limit=250`,
+      `/rest/v1/lumina_users?select=${SELECT_USERS_CORE}&or=(is_real_user.eq.true,is_real_user.is.null)&or=(restricted.eq.false,restricted.is.null)&order=created_at.desc&limit=250`,
+      `/rest/v1/lumina_users?select=${SELECT_USERS_CORE}&order=created_at.desc&limit=250`,
+    ];
+    for (const qPath of queries) {
+      const res = await fetch(new URL(qPath, origin).toString(), {
+        method: 'GET',
+        headers: {
+          ...buildSupabaseHeaders(keys.activeKey),
+          'Accept-Profile': schema,
+        },
+        signal: AbortSignal.timeout(5000),
+      });
       if (res.ok) {
         const rows = (await res.json()) as Array<Record<string, unknown>>;
         if (!Array.isArray(rows)) return [];
-        return rows.map(mapSupabaseUserRow).filter((u) => Boolean(u.id && u.username));
+        return rows
+          .map(mapSupabaseUserRow)
+          .filter((u) => Boolean(u.id && u.username && u.restricted !== true));
       }
       if (res.status !== 400) break;
     }
@@ -1149,6 +1222,18 @@ export async function upsertStoryToSupabase(
     const origin = await resolveValidatedSupabaseOrigin(config.projectUrl);
     const schema = sanitizeSchemaName(config.schemaName);
     const createdAt = story.createdAt || Date.now();
+    const fullBody = {
+      id: story.id,
+      author_id: story.authorId,
+      author_uid: story.authorUid || null,
+      media_url: safeMedia,
+      caption: story.caption ? story.caption.slice(0, 300) : null,
+      location: story.location ? story.location.slice(0, 120) : null,
+      viewed_by: Array.isArray(story.viewedBy) ? story.viewedBy.slice(0, 2000) : [],
+      reactions: Array.isArray(story.reactions) ? story.reactions.slice(0, 500) : [],
+      created_at: new Date(createdAt).toISOString(),
+      expires_at: new Date(createdAt + 24 * 60 * 60 * 1000).toISOString(),
+    };
     const res = await fetch(
       new URL('/rest/v1/lumina_stories?on_conflict=id', origin).toString(),
       {
@@ -1159,22 +1244,38 @@ export async function upsertStoryToSupabase(
           'Content-Profile': schema,
           Prefer: 'resolution=merge-duplicates,return=minimal',
         },
-        body: JSON.stringify({
-          id: story.id,
-          author_id: story.authorId,
-          author_uid: story.authorUid || null,
-          media_url: safeMedia,
-          caption: story.caption ? story.caption.slice(0, 300) : null,
-          location: story.location ? story.location.slice(0, 120) : null,
-          viewed_by: Array.isArray(story.viewedBy) ? story.viewedBy.slice(0, 2000) : [],
-          reactions: Array.isArray(story.reactions) ? story.reactions.slice(0, 500) : [],
-          created_at: new Date(createdAt).toISOString(),
-          expires_at: new Date(createdAt + 24 * 60 * 60 * 1000).toISOString(),
-        }),
+        body: JSON.stringify(fullBody),
         signal: AbortSignal.timeout(6000),
       }
     );
-    return res.ok;
+    if (res.ok) return true;
+    if (res.status === 400) {
+      const coreBody = {
+        id: fullBody.id,
+        author_id: fullBody.author_id,
+        media_url: fullBody.media_url,
+        caption: fullBody.caption,
+        viewed_by: fullBody.viewed_by,
+        reactions: fullBody.reactions,
+        created_at: fullBody.created_at,
+      };
+      const retry = await fetch(
+        new URL('/rest/v1/lumina_stories?on_conflict=id', origin).toString(),
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...buildSupabaseHeaders(keys.activeKey),
+            'Content-Profile': schema,
+            Prefer: 'resolution=merge-duplicates,return=minimal',
+          },
+          body: JSON.stringify(coreBody),
+          signal: AbortSignal.timeout(6000),
+        }
+      );
+      return retry.ok;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -1250,6 +1351,22 @@ export async function upsertMessageToSupabase(
   try {
     const origin = await resolveValidatedSupabaseOrigin(config.projectUrl);
     const schema = sanitizeSchemaName(config.schemaName);
+    const fullBody = {
+      id: msg.id,
+      thread_id: msg.threadId,
+      sender_id: msg.senderId,
+      recipient_id: msg.recipientId,
+      text: (msg.text || '').slice(0, 2000),
+      shared_post_id: msg.sharedPostId || null,
+      story_reply_url: compactAssetForDb(msg.storyReplyUrl, 160_000),
+      audio_url: compactAssetForDb(msg.audioUrl, 260_000),
+      audio_duration_sec: msg.audioDurationSec ?? null,
+      video_url: compactAssetForDb(msg.videoUrl, 260_000),
+      video_name: msg.videoName ? msg.videoName.slice(0, 120) : null,
+      reaction: msg.reaction || null,
+      read_by: Array.isArray(msg.readBy) ? msg.readBy.slice(0, 20) : [msg.senderId],
+      created_at: new Date(msg.createdAt || Date.now()).toISOString(),
+    };
     const res = await fetch(
       new URL('/rest/v1/lumina_messages?on_conflict=id', origin).toString(),
       {
@@ -1260,26 +1377,38 @@ export async function upsertMessageToSupabase(
           'Content-Profile': schema,
           Prefer: 'resolution=merge-duplicates,return=minimal',
         },
-        body: JSON.stringify({
-          id: msg.id,
-          thread_id: msg.threadId,
-          sender_id: msg.senderId,
-          recipient_id: msg.recipientId,
-          text: (msg.text || '').slice(0, 2000),
-          shared_post_id: msg.sharedPostId || null,
-          story_reply_url: compactAssetForDb(msg.storyReplyUrl, 160_000),
-          audio_url: compactAssetForDb(msg.audioUrl, 260_000),
-          audio_duration_sec: msg.audioDurationSec ?? null,
-          video_url: compactAssetForDb(msg.videoUrl, 260_000),
-          video_name: msg.videoName ? msg.videoName.slice(0, 120) : null,
-          reaction: msg.reaction || null,
-          read_by: Array.isArray(msg.readBy) ? msg.readBy.slice(0, 20) : [msg.senderId],
-          created_at: new Date(msg.createdAt || Date.now()).toISOString(),
-        }),
+        body: JSON.stringify(fullBody),
         signal: AbortSignal.timeout(6000),
       }
     );
-    return res.ok;
+    if (res.ok) return true;
+    if (res.status === 400) {
+      const coreBody = {
+        id: fullBody.id,
+        thread_id: fullBody.thread_id,
+        sender_id: fullBody.sender_id,
+        recipient_id: fullBody.recipient_id,
+        text: fullBody.text,
+        shared_post_id: fullBody.shared_post_id,
+        created_at: fullBody.created_at,
+      };
+      const retry = await fetch(
+        new URL('/rest/v1/lumina_messages?on_conflict=id', origin).toString(),
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...buildSupabaseHeaders(keys.activeKey),
+            'Content-Profile': schema,
+            Prefer: 'resolution=merge-duplicates,return=minimal',
+          },
+          body: JSON.stringify(coreBody),
+          signal: AbortSignal.timeout(6000),
+        }
+      );
+      return retry.ok;
+    }
+    return false;
   } catch {
     return false;
   }

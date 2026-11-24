@@ -30,6 +30,7 @@ import {
   reactToDirectMessageInSupabaseBrowser,
   setRuntimePublicSupabaseConfig,
   signupRealUserInSupabaseFromBrowser,
+  syncUsersToSupabaseFromBrowser,
   updateUserProfileInSupabaseBrowser,
   upsertDirectMessageToSupabaseBrowser,
   upsertPostToSupabaseBrowser,
@@ -679,34 +680,40 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // Fallback to local admin state on static hosting
     } finally {
+      try {
+        const raw = localStorage.getItem('lumina_admin_local_state_v1');
+        if (raw) {
+          const parsed = JSON.parse(raw) as {
+            site?: Partial<SiteMeta>;
+            supabase?: Partial<BrowserSupabaseConfig>;
+          };
+          if (parsed?.supabase) {
+            setRuntimePublicSupabaseConfig(parsed.supabase);
+          }
+          if (parsed?.site) {
+            setSiteMeta((prev) => ({
+              version: typeof parsed.site?.version === 'string' ? parsed.site.version : prev.version,
+              announcementBanner:
+                typeof parsed.site?.announcementBanner === 'string'
+                  ? parsed.site.announcementBanner
+                  : prev.announcementBanner,
+              maintenanceMode:
+                typeof parsed.site?.maintenanceMode === 'boolean'
+                  ? parsed.site.maintenanceMode
+                  : prev.maintenanceMode,
+              realUsersOnly:
+                typeof parsed.site?.realUsersOnly === 'boolean'
+                  ? parsed.site.realUsersOnly
+                  : prev.realUsersOnly,
+              videoRules: normalizeVideoRules(parsed.site?.videoRules || prev.videoRules),
+            }));
+          }
+        }
+      } catch {
+        // Ignore storage error
+      }
       setSiteMetaReady(true);
       setRuntimeConfigVersion((v) => v + 1);
-    }
-    try {
-      const raw = localStorage.getItem('lumina_admin_local_state_v1');
-      if (raw) {
-        const parsed = JSON.parse(raw) as { site?: Partial<SiteMeta> };
-        if (parsed?.site) {
-          setSiteMeta((prev) => ({
-            version: typeof parsed.site?.version === 'string' ? parsed.site.version : prev.version,
-            announcementBanner:
-              typeof parsed.site?.announcementBanner === 'string'
-                ? parsed.site.announcementBanner
-                : prev.announcementBanner,
-            maintenanceMode:
-              typeof parsed.site?.maintenanceMode === 'boolean'
-                ? parsed.site.maintenanceMode
-                : prev.maintenanceMode,
-            realUsersOnly:
-              typeof parsed.site?.realUsersOnly === 'boolean'
-                ? parsed.site.realUsersOnly
-                : prev.realUsersOnly,
-            videoRules: normalizeVideoRules(parsed.site?.videoRules || prev.videoRules),
-          }));
-        }
-      }
-    } catch {
-      // Ignore storage error
     }
   };
 
@@ -915,9 +922,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       if (isExclusiveAdmin) {
         await adminUpdateProfileFlagsInCloud(activeProfile, fbUser).catch(() => {});
       }
+      let serverSynced = false;
       try {
         const idToken = await fbUser.getIdToken();
-        await fetch('/api/supabase/sync-user', {
+        const syncRes = await fetch('/api/supabase/sync-user', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -931,8 +939,18 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             coverUrl: activeProfile.coverUrl,
           }),
         });
+        if (syncRes.ok && syncRes.headers.get('content-type')?.includes('application/json')) {
+          const data = (await syncRes.json()) as { synced?: boolean };
+          serverSynced = Boolean(data.synced);
+        }
       } catch {
         // Ignore if running on static hosting without Node backend
+      }
+      if (!serverSynced) {
+        const sbConfig = getBrowserSupabaseConfig();
+        if (sbConfig.autoSyncUsers && sbConfig.anonKey) {
+          await syncUsersToSupabaseFromBrowser(sbConfig, [activeProfile]).catch(() => {});
+        }
       }
     })();
 
@@ -1162,26 +1180,30 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     const cleanSlug = pendingProfileSlug.trim().toLowerCase().replace(/^@/, '');
-    const localMatches = state.users.filter(
+    const currentUsers = usersRef.current;
+    const localMatches = currentUsers.filter(
       (u) =>
         u.username.toLowerCase() === cleanSlug ||
         u.id.toLowerCase() === cleanSlug ||
         (u.uid && u.uid.toLowerCase() === cleanSlug)
     );
-    const localPreferred = localMatches.find((u) => !u.isDemoSeed) || localMatches[0];
-    if (localPreferred) {
-      setViewingProfileId(localPreferred.id);
+    const localReal = localMatches.find((u) => !u.isDemoSeed);
+    const localPreferred = localReal || localMatches[0];
+    if (localReal) {
+      setViewingProfileId(localReal.id);
       setProfileLookupLoading(false);
+    } else if (localPreferred && siteMetaReady && !getBrowserSupabaseConfig().anonKey) {
+      setViewingProfileId(localPreferred.id);
     }
 
     // Wait for /api/site/meta to hydrate public Supabase anonKey before declaring not found
-    if (!localPreferred && !siteMetaReady) {
+    if (!localReal && !siteMetaReady) {
       setProfileLookupLoading(true);
       return;
     }
 
     let cancelled = false;
-    if (!localPreferred) {
+    if (!localReal) {
       setProfileLookupLoading(true);
     }
     const lookupRemoteProfile = async () => {
@@ -1249,6 +1271,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         }
       }
       if (!cancelled) {
+        if (localPreferred) {
+          setViewingProfileId(localPreferred.id);
+        }
         setProfileLookupLoading(false);
       }
     };
@@ -1256,7 +1281,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [pendingProfileSlug, state.users, siteMetaReady, runtimeConfigVersion]);
+  }, [pendingProfileSlug, siteMetaReady, runtimeConfigVersion]);
 
   // Node server + Supabase cross-device sync (users, posts, active stories, and direct messages)
   useEffect(() => {
@@ -2612,7 +2637,16 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       if (!serverOk) {
         const sbConfig = getBrowserSupabaseConfig();
         if (sbConfig.anonKey) {
-          await upsertPostToSupabaseBrowser(sbConfig, post);
+          const ok = await upsertPostToSupabaseBrowser(sbConfig, post);
+          if (!ok) {
+            const author = usersRef.current.find(
+              (u) => !u.isDemoSeed && (u.id === post.authorId || (post.authorUid && u.uid === post.authorUid))
+            );
+            if (author) {
+              await syncUsersToSupabaseFromBrowser(sbConfig, [author]);
+              await upsertPostToSupabaseBrowser(sbConfig, post);
+            }
+          }
         }
       }
     })();
@@ -2654,7 +2688,16 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       if (!serverOk) {
         const sbConfig = getBrowserSupabaseConfig();
         if (sbConfig.anonKey) {
-          await upsertStoryToSupabaseBrowser(sbConfig, story);
+          const ok = await upsertStoryToSupabaseBrowser(sbConfig, story);
+          if (!ok) {
+            const author = usersRef.current.find(
+              (u) => !u.isDemoSeed && (u.id === story.authorId || (story.authorUid && u.uid === story.authorUid))
+            );
+            if (author) {
+              await syncUsersToSupabaseFromBrowser(sbConfig, [author]);
+              await upsertStoryToSupabaseBrowser(sbConfig, story);
+            }
+          }
         }
       }
     })();
@@ -2691,12 +2734,24 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       if (!serverOk) {
         const sbConfig = getBrowserSupabaseConfig();
         if (sbConfig.anonKey) {
-          await upsertDirectMessageToSupabaseBrowser(sbConfig, {
+          const msgPayload = {
             threadId: thread.id,
             senderId,
             recipientId,
             message,
-          });
+          };
+          const ok = await upsertDirectMessageToSupabaseBrowser(sbConfig, msgPayload);
+          if (!ok) {
+            const participants = [senderId, recipientId]
+              .map((pid) =>
+                usersRef.current.find((u) => !u.isDemoSeed && (u.id === pid || u.uid === pid))
+              )
+              .filter((u): u is UserProfile => Boolean(u));
+            if (participants.length > 0) {
+              await syncUsersToSupabaseFromBrowser(sbConfig, participants);
+              await upsertDirectMessageToSupabaseBrowser(sbConfig, msgPayload);
+            }
+          }
         }
       }
     })();

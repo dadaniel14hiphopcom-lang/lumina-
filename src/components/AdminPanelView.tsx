@@ -285,6 +285,7 @@ export function AdminPanelView() {
     openProfile,
     showToast,
     setSiteMeta,
+    refreshSiteMeta,
     invites,
     setInvites,
     createInvite,
@@ -958,6 +959,8 @@ export function AdminPanelView() {
           },
         };
       });
+      await refreshSiteMeta();
+      void refreshPublicUsersFromSupabase();
       showToast('Configurações do Supabase salvas neste domínio');
       return;
     }
@@ -985,28 +988,31 @@ export function AdminPanelView() {
     });
     if (res.ok) {
       const data = (await res.json()) as { state: ServerOverview['state'] };
-      setOverview((prev) =>
-        prev
-          ? {
-              ...prev,
-              state: {
-                ...data.state,
-                supabase: {
-                  ...data.state.supabase,
-                  anonKey: (data.state.supabase.anonKey || prev.state.supabase.anonKey || '').trim(),
-                },
-              },
-              envStatus: {
-                ...prev.envStatus,
-                supabaseKeysEnv: Boolean(
-                  prev.envStatus.supabaseKeysEnv ||
-                    data.state.supabase.anonKey?.trim() ||
-                    cleanAnonKey
-                ),
-              },
-            }
-          : prev
-      );
+      setOverview((prev) => {
+        if (!prev) return prev;
+        const mergedState: ServerOverview['state'] = {
+          ...data.state,
+          supabase: {
+            ...data.state.supabase,
+            anonKey: (data.state.supabase.anonKey || prev.state.supabase.anonKey || cleanAnonKey || '').trim(),
+          },
+        };
+        saveLocalAdminState(mergedState);
+        return {
+          ...prev,
+          state: mergedState,
+          envStatus: {
+            ...prev.envStatus,
+            supabaseKeysEnv: Boolean(
+              prev.envStatus.supabaseKeysEnv ||
+                data.state.supabase.anonKey?.trim() ||
+                cleanAnonKey
+            ),
+          },
+        };
+      });
+      await refreshSiteMeta();
+      void refreshPublicUsersFromSupabase();
       showToast('Configurações salvas no servidor');
     } else {
       const errData = (await res.json().catch(() => ({}))) as { error?: string };
@@ -1047,7 +1053,9 @@ export function AdminPanelView() {
                 anonKey: candidateAnon,
                 lastVerifiedAt: Date.now(),
                 lastStatus: result.tablesReady
-                  ? 'Conectado (Pronto)'
+                  ? result.schemaOutdated
+                    ? 'SQL desatualizado'
+                    : 'Conectado (Pronto)'
                   : result.hasKey
                   ? 'Chave OK · Falta SQL'
                   : 'Falta chave pública (anon)',
@@ -1063,9 +1071,15 @@ export function AdminPanelView() {
               },
             };
           });
+          await refreshSiteMeta();
+          if (result.tablesReady && !result.schemaOutdated) {
+            void refreshPublicUsersFromSupabase();
+          }
           showToast(
             result.tablesReady
-              ? 'Supabase conectado e tabela lumina_users pronta!'
+              ? result.schemaOutdated
+                ? 'Conectado! Copie e execute o SQL atualizado no Supabase.'
+                : 'Supabase conectado e tabela lumina_users pronta!'
               : !result.hasKey
               ? 'Supabase online! Cole a Chave Pública (anon) acima para ativar.'
               : result.reachable
@@ -1128,6 +1142,7 @@ export function AdminPanelView() {
         setWpTestStatus(data.statusLabel || 'Conectado');
         if (Array.isArray(data.posts)) setWpSyncedPosts(data.posts);
       }
+      await refreshSiteMeta();
       await loadOverview();
     } finally {
       setTestingKey(null);
@@ -1135,43 +1150,92 @@ export function AdminPanelView() {
   };
 
   const syncSupabaseNow = async () => {
+    const cleanSchema = sanitizeSupabaseSchemaName(overview?.state.supabase.schemaName);
+    const candidateAnon = (overview?.state.supabase.anonKey || '').trim();
+    if (candidateAnon && isServiceRoleOrSecretKey(candidateAnon)) {
+      const warn =
+        'Por segurança, nunca cole a chave secreta (service_role / sb_secret) no navegador. Use apenas a chave pública (anon / publishable).';
+      setSupabaseTestStatus(warn);
+      showToast(warn);
+      return;
+    }
+
+    const localRealUsers = allUsers.filter((u) => !u.isDemoSeed);
+    const realUserIds = new Set<string>();
+    for (const u of localRealUsers) {
+      realUserIds.add(u.id);
+      if (u.uid) realUserIds.add(u.uid);
+    }
+    const realPosts = allPosts.filter(
+      (p) => realUserIds.has(p.authorId) || Boolean(p.authorUid && realUserIds.has(p.authorUid))
+    );
+    const realStories = stories.filter(
+      (s) => realUserIds.has(s.authorId) || Boolean(s.authorUid && realUserIds.has(s.authorUid))
+    );
+
     if (!authStatus.serverAvailable) {
       setSyncingSupabase(true);
       try {
         const cfg = {
           projectUrl: overview?.state.supabase.projectUrl || DEFAULT_SUPABASE_URL,
-          schemaName: overview?.state.supabase.schemaName || 'public',
-          anonKey: (overview?.state.supabase.anonKey || '').trim(),
+          schemaName: cleanSchema,
+          anonKey: candidateAnon,
           autoSyncUsers: Boolean(overview?.state.supabase.autoSyncUsers ?? true),
         };
+        if (overview?.state) {
+          saveLocalAdminState({
+            ...overview.state,
+            supabase: {
+              ...overview.state.supabase,
+              projectUrl: cfg.projectUrl,
+              schemaName: cfg.schemaName,
+              anonKey: cfg.anonKey,
+            },
+          });
+          await refreshSiteMeta();
+        }
         const check = await testSupabaseFromBrowser(cfg);
         if (!check.hasKey || !check.tablesReady) {
           setSupabaseTestStatus(check.statusLabel);
-          showToast(check.hasKey ? 'Execute o SQL no Supabase antes de sincronizar' : 'Cole a Chave Pública (anon) do Supabase');
+          showToast(
+            check.hasKey
+              ? 'Execute o SQL no Supabase antes de sincronizar'
+              : 'Cole a Chave Pública (anon) do Supabase'
+          );
           return;
         }
-        const localRealUsers = allUsers.filter((u) => !u.isDemoSeed);
-        const realUserIds = new Set(localRealUsers.map((u) => u.id));
-        const pushRes = await syncUsersToSupabaseFromBrowser(cfg, localRealUsers);
-        const realPosts = allPosts.filter((p) => realUserIds.has(p.authorId));
-        const postRes = await syncPostsToSupabaseFromBrowser(cfg, realPosts);
-        const realStories = stories.filter((s) => realUserIds.has(s.authorId));
-        for (const s of realStories.slice(0, 40)) {
-          await upsertStoryToSupabaseBrowser(cfg, s);
+        if (check.schemaOutdated) {
+          setSupabaseTestStatus(check.statusLabel);
+          showToast('Estrutura antiga detectada: clique em Copiar SQL e execute no Supabase.');
         }
 
-        const remoteUsers = await fetchPublicUsersFromSupabaseBrowser(cfg);
-        const remotePosts = await fetchPublicPostsFromSupabaseBrowser(cfg);
-        const remoteStories = await fetchPublicStoriesFromSupabaseBrowser(cfg);
+        const pushRes = await syncUsersToSupabaseFromBrowser(cfg, localRealUsers);
+        const postRes =
+          overview?.state.supabase.autoSyncPosts !== false
+            ? await syncPostsToSupabaseFromBrowser(cfg, realPosts)
+            : { synced: 0, failed: 0 };
+        let syncedStoriesCount = 0;
+        if (overview?.state.supabase.autoSyncPosts !== false) {
+          for (const s of realStories.slice(0, 40)) {
+            const okStory = await upsertStoryToSupabaseBrowser(cfg, s);
+            if (okStory) syncedStoriesCount += 1;
+          }
+        }
+
+        const [remoteUsers, remotePosts, remoteStories] = await Promise.all([
+          fetchPublicUsersFromSupabaseBrowser(cfg),
+          fetchPublicPostsFromSupabaseBrowser(cfg),
+          fetchPublicStoriesFromSupabaseBrowser(cfg),
+        ]);
         if (remoteUsers.length > 0) {
           mergeExternalUsers(remoteUsers as unknown as typeof allUsers);
         }
         await refreshPublicUsersFromSupabase();
 
-        const msg =
-          pushRes.failed > 0 && pushRes.inserted === 0 && remoteUsers.length === 0
-            ? `Supabase conectado, mas bloqueou a gravação (${pushRes.lastError || 'RLS'}). Clique em "Copiar SQL" e execute no SQL Editor do Supabase.`
-            : `Sincronização concluída! ${remoteUsers.length} usuário(s), ${remotePosts.length} post(s) (${postRes.synced} enviado(s)) e ${remoteStories.length} story(ies) ativos em ${cfg.schemaName}.`;
+        const hasPushFailures = pushRes.failed > 0;
+        const msg = hasPushFailures
+          ? `Falha ao gravar ${pushRes.failed}/${pushRes.attempted} usuário(s) no Supabase (${pushRes.lastError || 'permissões/RLS'}). Clique em "Copiar SQL" e execute novamente no SQL Editor do Supabase. (${remoteUsers.length} usuário(s) lido(s) no banco).`
+          : `Sincronização concluída! ${remoteUsers.length} usuário(s), ${remotePosts.length} post(s) (${postRes.synced} enviado(s)) e ${remoteStories.length} story(ies) (${syncedStoriesCount} enviado(s)) ativos em ${cfg.schemaName}.`;
         setSupabaseTestStatus(msg);
         setOverview((prev) => {
           if (!prev) return prev;
@@ -1180,16 +1244,20 @@ export function AdminPanelView() {
             supabase: {
               ...prev.state.supabase,
               lastVerifiedAt: Date.now(),
-              lastStatus: `${remoteUsers.length} usuário(s) · ${remotePosts.length} post(s)`,
+              lastStatus: hasPushFailures
+                ? `Erro ao gravar (${pushRes.failed} falha(s))`
+                : `${remoteUsers.length} usuário(s) · ${remotePosts.length} post(s)`,
             },
           };
           saveLocalAdminState(nextState);
           return { ...prev, state: nextState };
         });
         showToast(
-          remoteUsers.length > 0
+          hasPushFailures
+            ? `Erro ao gravar usuário no Supabase — execute o SQL atualizado.`
+            : remoteUsers.length > 0
             ? `${remoteUsers.length} usuário(s) e ${remotePosts.length} post(s) sincronizado(s)!`
-            : 'Conexão confirmada! Execute o SQL atualizado se algum usuário não gravar.'
+            : 'Conexão confirmada! Nenhum usuário real cadastrado ainda.'
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Falha ao consultar Supabase.';
@@ -1200,17 +1268,18 @@ export function AdminPanelView() {
       }
       return;
     }
+
     setSyncingSupabase(true);
     try {
-      const realUsers = allUsers.filter((u) => !u.isDemoSeed);
-      const realUserIds = new Set(realUsers.map((u) => u.id));
-      const realPosts = allPosts.filter((p) => realUserIds.has(p.authorId));
-      const realStories = stories.filter((s) => realUserIds.has(s.authorId));
       const res = await authFetch('/api/admin/supabase/sync-now', {
         method: 'POST',
         body: JSON.stringify({
           projectUrl: overview?.state.supabase.projectUrl,
-          users: realUsers,
+          schemaName: cleanSchema,
+          anonKey: candidateAnon,
+          autoSyncUsers: Boolean(overview?.state.supabase.autoSyncUsers ?? true),
+          autoSyncPosts: Boolean(overview?.state.supabase.autoSyncPosts ?? true),
+          users: localRealUsers,
           posts: realPosts,
           stories: realStories,
         }),
@@ -1222,6 +1291,7 @@ export function AdminPanelView() {
       };
       const msg = data.statusLabel || data.error || 'Sincronização finalizada.';
       setSupabaseTestStatus(msg);
+      await refreshSiteMeta();
       await refreshPublicUsersFromSupabase();
       showToast(data.ok ? 'Usuários, posts e stories sincronizados no Supabase' : msg);
       await loadOverview();
@@ -1646,6 +1716,21 @@ alter table ${schema}.lumina_messages add column if not exists created_at timest
 create index if not exists idx_lumina_messages_thread on ${schema}.lumina_messages (thread_id, created_at);
 create index if not exists idx_lumina_messages_participants on ${schema}.lumina_messages (sender_id, recipient_id);
 
+update ${schema}.lumina_users
+set
+  is_real_user = coalesce(is_real_user, true),
+  restricted = coalesce(restricted, false),
+  verified = coalesce(verified, false),
+  boosted = coalesce(boosted, false),
+  followers = coalesce(followers, '[]'::jsonb),
+  following = coalesce(following, '[]'::jsonb)
+where is_real_user is null
+   or restricted is null
+   or verified is null
+   or boosted is null
+   or followers is null
+   or following is null;
+
 alter table ${schema}.lumina_users enable row level security;
 alter table ${schema}.lumina_posts enable row level security;
 alter table ${schema}.lumina_stories enable row level security;
@@ -1655,9 +1740,9 @@ alter table ${schema}.lumina_messages enable row level security;
 revoke all on table ${schema}.lumina_users from anon, authenticated;
 grant select (id, auth_uid, username, display_name, avatar_url, cover_url, bio, website, verified, boosted, restricted, is_real_user, auth_source, followers, following, created_at, updated_at)
   on table ${schema}.lumina_users to anon, authenticated;
-grant insert (id, auth_uid, username, display_name, email, avatar_url, cover_url, bio, website, is_real_user, auth_source, created_at, updated_at)
+grant insert (id, auth_uid, username, display_name, email, avatar_url, cover_url, bio, website, is_real_user, auth_source, followers, following, created_at, updated_at)
   on table ${schema}.lumina_users to anon, authenticated;
-grant update (username, display_name, avatar_url, cover_url, bio, website, followers, following, updated_at)
+grant update (auth_uid, username, display_name, avatar_url, cover_url, bio, website, is_real_user, auth_source, followers, following, updated_at)
   on table ${schema}.lumina_users to anon, authenticated;
 
 grant select, insert, update, delete on table ${schema}.lumina_posts to anon, authenticated;
@@ -3358,6 +3443,31 @@ ${itemsXml}
                     <Download className="h-3.5 w-3.5" />
                     <span>Baixar SQL + RLS</span>
                   </button>
+                  {hasAnonOrEnv && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const urlVal = (state.supabase.projectUrl || DEFAULT_SUPABASE_URL).trim();
+                        const anonVal = (state.supabase.anonKey || '').trim();
+                        const envLines = [
+                          `VITE_SUPABASE_URL=${urlVal}`,
+                          ...(anonVal && !isServiceRoleOrSecretKey(anonVal)
+                            ? [`VITE_SUPABASE_ANON_KEY=${anonVal}`]
+                            : []),
+                        ].join('\n');
+                        try {
+                          await navigator.clipboard.writeText(envLines);
+                          showToast('Variáveis VITE_SUPABASE_* copiadas para o build da hospedagem estática');
+                        } catch {
+                          setSupabaseTestStatus(envLines);
+                        }
+                      }}
+                      className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                      <span>Copiar .env estático</span>
+                    </button>
+                  )}
                 </div>
               </section>
             );
