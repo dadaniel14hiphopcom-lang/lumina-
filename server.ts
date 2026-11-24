@@ -3139,6 +3139,7 @@ async function startServer() {
           (await resolveSupabaseEmailByUsername(adminState.supabase, identifier)) ||
           '';
       }
+      let supabaseLoginError = '';
       if (resolvedEmail) {
         const sbLogin = await verifySupabasePasswordLogin(
           adminState.supabase.projectUrl,
@@ -3179,6 +3180,13 @@ async function startServer() {
           });
           return;
         }
+        if (sbLogin.emailNotConfirmed && sbLogin.error) {
+          supabaseLoginError = sbLogin.error;
+        }
+      }
+      if (supabaseLoginError) {
+        res.status(401).json({ error: supabaseLoginError });
+        return;
       }
     }
 

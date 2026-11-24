@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useMemo, useRef, useState 
 import {
   getRedirectResult,
   onAuthStateChanged,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signInWithRedirect,
   signOut,
@@ -2301,6 +2302,35 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     return { ok: true };
   };
 
+  const upsertLocalCredentialCache = async (params: {
+    userId: string;
+    username: string;
+    email?: string;
+    password: string;
+  }) => {
+    try {
+      const salt = generateSaltHex();
+      const hash = await derivePasswordHash(params.password, salt);
+      const next = loadLocalCredentials().filter(
+        (c) =>
+          c.userId !== params.userId &&
+          c.username.toLowerCase() !== params.username.toLowerCase()
+      );
+      next.unshift({
+        userId: params.userId,
+        username: params.username.toLowerCase(),
+        email: params.email?.toLowerCase(),
+        salt,
+        hash,
+        createdAt: Date.now(),
+      });
+      saveLocalCredentials(next);
+      setCredentialsVersion((v) => v + 1);
+    } catch {
+      // Ignore local credential cache errors
+    }
+  };
+
   const loginWithCredentials = async (
     identifier: string,
     password: string
@@ -2333,10 +2363,12 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           return { ok: true };
         }
       }
-      return { ok: false, error: 'Usuário/e-mail ou senha incorretos.' };
+      // Do not abort here: password may have been changed or registered on another browser/device.
     }
 
-    // Fallback to backend verification when available
+    // Fallback to Node backend verification when available
+    let usedBackendApi = false;
+    let backendError = '';
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
@@ -2345,6 +2377,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       });
       const contentType = res.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
+        usedBackendApi = true;
         const data = (await res.json()) as {
           ok?: boolean;
           userId?: string;
@@ -2397,6 +2430,12 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             ) || incomingProfile;
 
           if (targetUser) {
+            await upsertLocalCredentialCache({
+              userId: targetUser.id,
+              username: targetUser.username,
+              email: data.email || targetUser.email,
+              password,
+            });
             setState((prev) => ({
               ...prev,
               users: incomingProfile
@@ -2413,55 +2452,146 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             return { ok: true };
           }
         }
-        return { ok: false, error: data.error || 'Usuário/e-mail ou senha incorretos.' };
+        backendError = data.error || '';
       }
     } catch {
       // Static hosting without backend auth endpoint
     }
 
-    // Direct Supabase Auth fallback for static hosting (login across browsers/devices)
-    const knownUserEmail = state.users.find(
-      (u) => u.username.toLowerCase() === cleanHandle && u.email
-    )?.email;
-    const supabaseEmail = rawId.includes('@') ? rawId : knownUserEmail;
-    if (supabaseEmail) {
-      const sbConfig = getBrowserSupabaseConfig();
-      if (sbConfig.anonKey) {
-        const sbLogin = await loginSupabaseFromBrowser(sbConfig, supabaseEmail, password);
-        if (sbLogin.ok && sbLogin.userId && sbLogin.username) {
-          const fallbackProfile: UserProfile = sbLogin.userProfile || {
-            id: sbLogin.userId,
-            uid: sbLogin.authUid,
-            username: sbLogin.username,
-            displayName: sbLogin.displayName || sbLogin.username,
-            avatarUrl: SEED_USERS[0].avatarUrl,
-            coverUrl: SEED_USERS[0].coverUrl,
-            bio: 'Usuário conectado via Supabase Auth.',
-            email: sbLogin.email || supabaseEmail,
-            verified: false,
-            isOnline: true,
-            isDemoSeed: false,
-            followers: [],
-            following: [],
+    // Ensure runtime public Supabase config is hydrated if /api/site/meta is available
+    let sbConfig = getBrowserSupabaseConfig();
+    if (!sbConfig.anonKey) {
+      try {
+        const metaRes = await fetch('/api/site/meta');
+        if (metaRes.ok && metaRes.headers.get('content-type')?.includes('application/json')) {
+          const metaData = (await metaRes.json()) as {
+            supabase?: Partial<BrowserSupabaseConfig>;
           };
-          const existingSbUser = state.users.find(
-            (u) =>
-              u.id === fallbackProfile.id ||
-              u.username.toLowerCase() === fallbackProfile.username.toLowerCase()
-          );
-          const resolvedProfileId = existingSbUser ? existingSbUser.id : fallbackProfile.id;
-          setState((prev) => ({
-            ...prev,
-            users: mergeUsersSmart(prev.users, [fallbackProfile]),
-            currentUserId: resolvedProfileId,
-            isAuthenticated: true,
-          }));
-          setGuestBrowsing(false);
-          setViewingProfileId(null);
-          setIsInviteModalOpen(false);
-          showToast(`Conectado como @${fallbackProfile.username}`);
-          void refreshPublicUsersFromSupabase();
+          if (metaData.supabase) {
+            setRuntimePublicSupabaseConfig(metaData.supabase);
+            sbConfig = getBrowserSupabaseConfig();
+          }
+        }
+      } catch {
+        // Ignore on static hosts
+      }
+    }
+
+    // Direct Supabase Auth fallback for static hosting & cross-device login
+    const knownUserEmail =
+      state.users.find((u) => u.username.toLowerCase() === cleanHandle && u.email)?.email ||
+      localCred?.email;
+    const supabaseEmail = rawId.includes('@') ? rawId : knownUserEmail;
+    let supabaseAuthError = '';
+
+    if (supabaseEmail && sbConfig.anonKey) {
+      const sbLogin = await loginSupabaseFromBrowser(sbConfig, supabaseEmail, password);
+      if (sbLogin.ok && sbLogin.userId && sbLogin.username) {
+        const fallbackProfile: UserProfile = sbLogin.userProfile || {
+          id: sbLogin.userId,
+          uid: sbLogin.authUid,
+          username: sbLogin.username,
+          displayName: sbLogin.displayName || sbLogin.username,
+          avatarUrl: SEED_USERS[0].avatarUrl,
+          coverUrl: SEED_USERS[0].coverUrl,
+          bio: 'Usuário conectado via Supabase Auth.',
+          email: sbLogin.email || supabaseEmail,
+          verified: false,
+          isOnline: true,
+          isDemoSeed: false,
+          followers: [],
+          following: [],
+        };
+        const existingSbUser = state.users.find(
+          (u) =>
+            u.id === fallbackProfile.id ||
+            u.username.toLowerCase() === fallbackProfile.username.toLowerCase()
+        );
+        const resolvedProfileId = existingSbUser ? existingSbUser.id : fallbackProfile.id;
+        await upsertLocalCredentialCache({
+          userId: resolvedProfileId,
+          username: fallbackProfile.username,
+          email: sbLogin.email || supabaseEmail,
+          password,
+        });
+        setState((prev) => ({
+          ...prev,
+          users: mergeUsersSmart(prev.users, [fallbackProfile]),
+          currentUserId: resolvedProfileId,
+          isAuthenticated: true,
+        }));
+        setGuestBrowsing(false);
+        setViewingProfileId(null);
+        setIsInviteModalOpen(false);
+        showToast(`Conectado como @${fallbackProfile.username}`);
+        void refreshPublicUsersFromSupabase();
+        return { ok: true };
+      }
+      if (sbLogin.emailNotConfirmed && sbLogin.error) {
+        supabaseAuthError = sbLogin.error;
+      }
+    }
+
+    // Firebase Email/Password fallback (works across all browsers/devices when enabled in Firebase Console)
+    const firebaseCandidateEmail =
+      supabaseEmail || (cleanHandle === 'dadaniel14hiphop' ? ADMIN_EMAIL.toLowerCase() : '');
+    if (firebaseCandidateEmail && firebaseCandidateEmail.includes('@')) {
+      try {
+        const fbCred = await signInWithEmailAndPassword(auth, firebaseCandidateEmail, password);
+        if (fbCred.user) {
+          if (!fbCred.user.emailVerified) {
+            await signOut(auth).catch(() => {});
+            return {
+              ok: false,
+              error: 'Confirme seu e-mail no link enviado pelo Firebase antes de entrar.',
+            };
+          }
+          const isExclusiveAdmin =
+            fbCred.user.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+          if (isExclusiveAdmin) {
+            await ensureAdminDocIfMatched(fbCred.user).catch(() => {});
+            try {
+              const idToken = await fbCred.user.getIdToken();
+              const adminRes = await fetch('/api/admin/auth/firebase', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${idToken}`,
+                },
+              });
+              if (adminRes.ok && adminRes.headers.get('content-type')?.includes('application/json')) {
+                const adminData = (await adminRes.json()) as { token?: string };
+                if (adminData.token) {
+                  setAdminMemoryToken(adminData.token);
+                }
+              } else {
+                setAdminMemoryToken(`firebase_admin_${fbCred.user.uid}`);
+              }
+            } catch {
+              setAdminMemoryToken(`firebase_admin_${fbCred.user.uid}`);
+            }
+          }
+          const profile = await hydrateGoogleProfileSession(fbCred.user, {
+            openAdminIfEligible: false,
+          });
+          await upsertLocalCredentialCache({
+            userId: profile.id,
+            username: profile.username,
+            email: fbCred.user.email || firebaseCandidateEmail,
+            password,
+          });
           return { ok: true };
+        }
+      } catch (err) {
+        const code =
+          typeof err === 'object' && err !== null && 'code' in err
+            ? String((err as { code?: unknown }).code || '')
+            : '';
+        if (code === 'auth/too-many-requests') {
+          return {
+            ok: false,
+            error: 'Muitas tentativas seguidas. Aguarde alguns instantes e tente novamente.',
+          };
         }
       }
     }
@@ -2474,6 +2604,27 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         showToast('Administrador conectado: @dadaniel14hiphop');
         return { ok: true };
       }
+    }
+
+    if (supabaseAuthError) {
+      return { ok: false, error: supabaseAuthError };
+    }
+    if (backendError) {
+      return { ok: false, error: backendError };
+    }
+    if (!usedBackendApi && !sbConfig.anonKey && rawId.includes('@')) {
+      return {
+        ok: false,
+        error:
+          'Este navegador não possui a chave pública do Supabase (VITE_SUPABASE_ANON_KEY) configurada para validar e-mail e senha remotamente. Entre com Google ou publique o site com o .env estático do Painel Admin.',
+      };
+    }
+    if (!rawId.includes('@') && !knownUserEmail && !usedBackendApi) {
+      return {
+        ok: false,
+        error:
+          'Em outro navegador ou dispositivo, informe seu e-mail cadastrado e senha (em vez de apenas @usuário).',
+      };
     }
 
     return { ok: false, error: 'Usuário/e-mail ou senha incorretos.' };

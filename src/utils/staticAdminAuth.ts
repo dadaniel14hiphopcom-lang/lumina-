@@ -116,3 +116,11 @@ export async function verifyStaticAdminPasscode(passcode: string): Promise<boole
   const candidate = await deriveAdminHash(passcode.trim(), record.salt);
   return constantTimeHexEqual(candidate, record.hash);
 }
+
+export function clearStaticAdminPasscode(): void {
+  try {
+    localStorage.removeItem(STATIC_ADMIN_AUTH_KEY);
+  } catch {
+    // Ignore storage removal errors
+  }
+}

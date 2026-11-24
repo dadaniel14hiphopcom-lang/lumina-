@@ -771,6 +771,8 @@ export async function verifySupabasePasswordLogin(
   username?: string;
   displayName?: string;
   user?: Record<string, unknown>;
+  emailNotConfirmed?: boolean;
+  error?: string;
 }> {
   const keys = getSupabaseKeys(fallbackPublicAnonKey);
   const apiKey = keys.anonKey || keys.serviceRoleKey;
@@ -795,7 +797,25 @@ export async function verifySupabasePasswordLogin(
       body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
       signal: AbortSignal.timeout(6000),
     });
-    if (!res.ok) return { ok: false };
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => ({}))) as {
+        error_description?: string;
+        msg?: string;
+        message?: string;
+        error?: string;
+      };
+      const rawMsg =
+        errBody.error_description || errBody.msg || errBody.message || errBody.error || '';
+      if (/email not confirmed/i.test(rawMsg)) {
+        return {
+          ok: false,
+          emailNotConfirmed: true,
+          error:
+            'Seu e-mail ainda não foi confirmado no Supabase. Confirme pelo link recebido ou desative "Confirm email" em Authentication → Providers → Email no Supabase.',
+        };
+      }
+      return { ok: false, error: rawMsg || undefined };
+    }
     const data = (await res.json()) as {
       access_token?: string;
       user?: {
@@ -804,15 +824,19 @@ export async function verifySupabasePasswordLogin(
       };
     };
     const authUid = data.user?.id;
+    const meta = data.user?.user_metadata;
     let mappedUser: Record<string, unknown> | undefined;
 
-    if (authUid) {
+    const filters: string[] = [];
+    if (authUid) filters.push(`auth_uid=eq.${encodeURIComponent(authUid)}`);
+    if (meta?.lumina_id) filters.push(`id=eq.${encodeURIComponent(meta.lumina_id)}`);
+    if (meta?.username) filters.push(`username=ilike.${encodeURIComponent(meta.username.trim().toLowerCase())}`);
+
+    for (const filter of filters) {
+      if (mappedUser) break;
       for (const cols of [SELECT_USERS_EXTENDED, SELECT_USERS_CORE]) {
         const rowRes = await fetch(
-          new URL(
-            `/rest/v1/lumina_users?select=${cols}&auth_uid=eq.${encodeURIComponent(authUid)}&limit=1`,
-            origin
-          ).toString(),
+          new URL(`/rest/v1/lumina_users?select=${cols}&${filter}&limit=1`, origin).toString(),
           {
             method: 'GET',
             headers: {
@@ -837,9 +861,9 @@ export async function verifySupabasePasswordLogin(
     return {
       ok: true,
       authUid,
-      userId: mappedUser ? String(mappedUser.id) : data.user?.user_metadata?.lumina_id || authUid,
-      username: mappedUser ? String(mappedUser.username) : data.user?.user_metadata?.username,
-      displayName: mappedUser ? String(mappedUser.displayName) : data.user?.user_metadata?.display_name,
+      userId: mappedUser ? String(mappedUser.id) : meta?.lumina_id || authUid,
+      username: mappedUser ? String(mappedUser.username) : meta?.username,
+      displayName: mappedUser ? String(mappedUser.displayName) : meta?.display_name,
       user: mappedUser,
     };
   } catch {

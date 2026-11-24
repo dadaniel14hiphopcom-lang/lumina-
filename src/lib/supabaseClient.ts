@@ -809,6 +809,8 @@ export async function loginSupabaseFromBrowser(
   displayName?: string;
   email?: string;
   userProfile?: UserProfile;
+  emailNotConfirmed?: boolean;
+  error?: string;
 }> {
   if (!config.anonKey || isServiceRoleOrSecretKey(config.anonKey) || !email.includes('@')) {
     return { ok: false };
@@ -829,7 +831,25 @@ export async function loginSupabaseFromBrowser(
       }),
       signal: AbortSignal.timeout(7000),
     });
-    if (!res.ok) return { ok: false };
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => ({}))) as {
+        error_description?: string;
+        msg?: string;
+        message?: string;
+        error?: string;
+      };
+      const rawMsg =
+        errBody.error_description || errBody.msg || errBody.message || errBody.error || '';
+      if (/email not confirmed/i.test(rawMsg)) {
+        return {
+          ok: false,
+          emailNotConfirmed: true,
+          error:
+            'Seu e-mail ainda não foi confirmado no Supabase. Confirme pelo link recebido ou desative "Confirm email" em Authentication → Providers → Email no Supabase.',
+        };
+      }
+      return { ok: false, error: rawMsg || undefined };
+    }
     const data = (await res.json()) as {
       access_token?: string;
       user?: {
@@ -852,12 +872,18 @@ export async function loginSupabaseFromBrowser(
       });
     }
 
-    // Look up canonical lumina_users row by auth_uid or lumina_id
+    // Look up canonical lumina_users row by auth_uid, then lumina_id, then username
     let rowProfile: UserProfile | null = null;
-    if (authUid) {
+    const filters: string[] = [];
+    if (authUid) filters.push(`auth_uid=eq.${encodeURIComponent(authUid)}`);
+    if (meta?.lumina_id) filters.push(`id=eq.${encodeURIComponent(meta.lumina_id)}`);
+    if (meta?.username) filters.push(`username=ilike.${encodeURIComponent(meta.username.trim().toLowerCase())}`);
+
+    for (const filter of filters) {
+      if (rowProfile) break;
       const queries = [
-        `${origin}/rest/v1/lumina_users?select=${SELECT_USERS_EXTENDED}&auth_uid=eq.${encodeURIComponent(authUid)}&limit=1`,
-        `${origin}/rest/v1/lumina_users?select=${SELECT_USERS_CORE}&auth_uid=eq.${encodeURIComponent(authUid)}&limit=1`,
+        `${origin}/rest/v1/lumina_users?select=${SELECT_USERS_EXTENDED}&${filter}&limit=1`,
+        `${origin}/rest/v1/lumina_users?select=${SELECT_USERS_CORE}&${filter}&limit=1`,
       ];
       for (const qUrl of queries) {
         try {
@@ -874,6 +900,23 @@ export async function loginSupabaseFromBrowser(
             if (Array.isArray(rows) && rows.length > 0) {
               rowProfile = mapBrowserSupabaseUserRow(rows[0]);
               rowProfile.email = cleanEmail;
+              if (authUid && rows[0].auth_uid !== authUid && rowProfile.id) {
+                await fetch(
+                  `${origin}/rest/v1/lumina_users?id=eq.${encodeURIComponent(rowProfile.id)}`,
+                  {
+                    method: 'PATCH',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      ...buildBrowserSupabaseHeaders(config.anonKey, data.access_token),
+                      'Content-Profile': schema,
+                      Prefer: 'return=minimal',
+                    },
+                    body: JSON.stringify({ auth_uid: authUid, updated_at: new Date().toISOString() }),
+                    signal: AbortSignal.timeout(4000),
+                  }
+                ).catch(() => {});
+                rowProfile.uid = authUid;
+              }
               break;
             }
           } else if (rowRes.status !== 400) {
@@ -885,7 +928,39 @@ export async function loginSupabaseFromBrowser(
       }
     }
 
+    const fallbackHandle = (
+      meta?.username ||
+      cleanEmail.split('@')[0].replace(/[^a-z0-9._]/g, '') ||
+      `user.${(authUid || Date.now().toString(36)).slice(0, 6)}`
+    )
+      .toLowerCase()
+      .slice(0, 24);
     const resolvedId = rowProfile?.id || meta?.lumina_id || authUid || `sb_${Date.now()}`;
+
+    if (!rowProfile && data.access_token) {
+      await fetch(`${origin}/rest/v1/lumina_users`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildBrowserSupabaseHeaders(config.anonKey, data.access_token),
+          'Content-Profile': schema,
+          Prefer: 'resolution=ignore-duplicates,return=minimal',
+        },
+        body: JSON.stringify({
+          id: resolvedId,
+          auth_uid: authUid || null,
+          username: fallbackHandle,
+          display_name: (meta?.display_name || fallbackHandle).slice(0, 60),
+          email: cleanEmail,
+          bio: 'Usuário conectado via Supabase Auth.',
+          is_real_user: true,
+          auth_source: 'supabase-login',
+          updated_at: new Date().toISOString(),
+        }),
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => {});
+    }
+
     if (data.access_token) {
       setBrowserSupabaseSession({
         accessToken: data.access_token,
@@ -900,11 +975,8 @@ export async function loginSupabaseFromBrowser(
       ok: true,
       userId: resolvedId,
       authUid,
-      username:
-        rowProfile?.username ||
-        meta?.username ||
-        cleanEmail.split('@')[0].replace(/[^a-z0-9._]/g, '').slice(0, 24),
-      displayName: rowProfile?.displayName || meta?.display_name || meta?.username,
+      username: rowProfile?.username || fallbackHandle,
+      displayName: rowProfile?.displayName || meta?.display_name || fallbackHandle,
       email: cleanEmail,
       userProfile: rowProfile || undefined,
     };

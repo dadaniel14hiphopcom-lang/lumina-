@@ -30,9 +30,10 @@ import {
   Users,
   Video,
 } from 'lucide-react';
+import { signInWithEmailAndPassword } from 'firebase/auth';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_VIDEO_RULES, encodeInviteMeta, useSocial } from '../context/SocialContext';
-import { ADMIN_EMAIL, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
+import { ADMIN_EMAIL, auth, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
 import {
   DEFAULT_SUPABASE_URL,
   fetchPublicPostsFromSupabaseBrowser,
@@ -50,6 +51,7 @@ import {
 import { InviteRecord, VideoRulesConfig } from '../types';
 import {
   claimOrUpdateStaticAdminPasscode,
+  clearStaticAdminPasscode,
   hasStaticAdminPasscode,
   verifyStaticAdminPasscode,
 } from '../utils/staticAdminAuth';
@@ -614,6 +616,35 @@ export function AdminPanelView() {
         } else {
           const valid = await verifyStaticAdminPasscode(passcodeInput.trim());
           if (!valid) {
+            // Also verify against exclusive Firebase Email/Password for cross-device admin access
+            try {
+              const fbCred = await signInWithEmailAndPassword(auth, ADMIN_EMAIL, passcodeInput.trim());
+              if (
+                fbCred.user &&
+                fbCred.user.emailVerified &&
+                fbCred.user.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase()
+              ) {
+                await claimOrUpdateStaticAdminPasscode(passcodeInput.trim()).catch(() => {});
+                const fbToken = `firebase_admin_${fbCred.user.uid}`;
+                setManualLock(false);
+                setAdminToken(fbToken);
+                setAdminMemoryToken(fbToken);
+                activateAdminProfileSession(fbToken);
+                setPasscodeInput('');
+                setConfirmInput('');
+                setShowPasscode(false);
+                setAuthStatus((prev) => ({ ...prev, claimed: true }));
+                loadLocalOverview();
+                showToast(`Administrador conectado (${ADMIN_EMAIL}).`);
+                return;
+              }
+              if (fbCred.user && !fbCred.user.emailVerified) {
+                setAuthError(`Confirme o e-mail ${ADMIN_EMAIL} no Firebase antes de entrar.`);
+                return;
+              }
+            } catch {
+              // Fall through to local mismatch error
+            }
             setAuthError('Senha administrativa incorreta neste navegador.');
             return;
           }
@@ -661,6 +692,27 @@ export function AdminPanelView() {
       }
       const data = (await res.json()) as { token?: string; error?: string };
       if (!res.ok || !data.token) {
+        if (!isFirstRunClaim) {
+          try {
+            const fbCred = await signInWithEmailAndPassword(auth, ADMIN_EMAIL, passcodeInput.trim());
+            if (
+              fbCred.user &&
+              fbCred.user.emailVerified &&
+              fbCred.user.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase()
+            ) {
+              const unlocked = await authenticateExclusiveAdminWithFirebase(fbCred.user);
+              if (unlocked) {
+                setPasscodeInput('');
+                setConfirmInput('');
+                setShowPasscode(false);
+                showToast(`Bem-vindo, administrador (${ADMIN_EMAIL}).`);
+                return;
+              }
+            }
+          } catch {
+            // Keep server auth error
+          }
+        }
         setAuthError(data.error || 'Falha na autenticação.');
         return;
       }
@@ -2226,6 +2278,23 @@ ${itemsXml}
                       ? 'Salvar senha de ADM e entrar'
                       : 'Entrar com senha de ADM'}
                   </button>
+
+                  {!authStatus.serverAvailable && authStatus.claimed && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        clearStaticAdminPasscode();
+                        setAuthError(null);
+                        setPasscodeInput('');
+                        setConfirmInput('');
+                        setAuthStatus((prev) => ({ ...prev, claimed: false }));
+                        showToast('Senha local limpa. Crie ou gere uma nova senha de ADM para este navegador.');
+                      }}
+                      className="w-full text-center text-[11px] font-semibold text-sky-600 hover:underline dark:text-sky-400"
+                    >
+                      Esqueceu ou quer redefinir a senha de ADM neste navegador?
+                    </button>
+                  )}
                 </form>
               </div>
 
