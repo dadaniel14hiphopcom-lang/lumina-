@@ -653,6 +653,9 @@ export async function syncUsersToSupabaseFromBrowser(
     coverUrl?: string;
     followers?: string[];
     following?: string[];
+    verified?: boolean;
+    boosted?: boolean;
+    restricted?: boolean;
     isDemoSeed?: boolean;
   }>
 ): Promise<{ attempted: number; inserted: number; updated: number; failed: number; lastError?: string }> {
@@ -769,6 +772,19 @@ export async function syncUsersToSupabaseFromBrowser(
 
       if (existingRowId) {
         const patchRes = await patchExistingUser(`id=eq.${encodeURIComponent(existingRowId)}`, u);
+        if (
+          typeof u.verified === 'boolean' ||
+          typeof u.boosted === 'boolean' ||
+          typeof u.restricted === 'boolean'
+        ) {
+          await updateUserFlagsInSupabaseBrowser(config, {
+            userId: existingRowId,
+            username: cleanHandle,
+            verified: u.verified,
+            boosted: u.boosted,
+            restricted: u.restricted,
+          }).catch(() => false);
+        }
         if (patchRes.ok) {
           updated += 1;
         } else {
@@ -1255,6 +1271,51 @@ export async function updateUserProfileInSupabaseBrowser(
       }
     }
     return false;
+  } catch {
+    return false;
+  }
+}
+
+export async function updateUserFlagsInSupabaseBrowser(
+  config: BrowserSupabaseConfig,
+  payload: {
+    userId: string;
+    username?: string;
+    verified?: boolean;
+    boosted?: boolean;
+    restricted?: boolean;
+  }
+): Promise<boolean> {
+  if (!config.anonKey || isServiceRoleOrSecretKey(config.anonKey) || !payload.userId) {
+    return false;
+  }
+  const session = getBrowserSupabaseSession();
+  if (
+    !session?.accessToken ||
+    session.email?.trim().toLowerCase() !== 'dadaniel14hiphop.com@gmail.com'
+  ) {
+    return false;
+  }
+  try {
+    const origin = normalizeSupabaseOrigin(config.projectUrl);
+    const schema = sanitizeSupabaseSchemaName(config.schemaName);
+    const res = await fetch(`${origin}/rest/v1/rpc/lumina_admin_set_user_flags`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildBrowserSupabaseHeaders(config.anonKey, session.accessToken),
+        'Content-Profile': schema,
+      },
+      body: JSON.stringify({
+        p_user_id: payload.userId,
+        p_username: payload.username ? payload.username.trim().toLowerCase().replace(/^@/, '') : null,
+        p_verified: typeof payload.verified === 'boolean' ? payload.verified : null,
+        p_boosted: typeof payload.boosted === 'boolean' ? payload.boosted : null,
+        p_restricted: typeof payload.restricted === 'boolean' ? payload.restricted : null,
+      }),
+      signal: AbortSignal.timeout(6000),
+    });
+    return res.ok;
   } catch {
     return false;
   }

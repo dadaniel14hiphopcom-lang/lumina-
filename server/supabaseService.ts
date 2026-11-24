@@ -678,6 +678,7 @@ export async function updateUserInSupabase(
   patch: Partial<{
     displayName: string;
     username: string;
+    matchUsername: string;
     bio: string;
     website: string;
     avatarUrl: string;
@@ -720,8 +721,36 @@ export async function updateUserInSupabase(
     if (Array.isArray(patch.followers)) fullBody.followers = patch.followers.slice(0, 2000);
     if (Array.isArray(patch.following)) fullBody.following = patch.following.slice(0, 2000);
 
+    let targetFilter = `id=eq.${encodeURIComponent(userId)}`;
+    const cleanMatchHandle =
+      typeof patch.matchUsername === 'string'
+        ? patch.matchUsername.trim().toLowerCase().replace(/^@/, '')
+        : '';
+    if (cleanMatchHandle) {
+      const lookupRes = await fetch(
+        new URL(
+          `/rest/v1/lumina_users?select=id&or=(id.eq.${encodeURIComponent(userId)},username.ilike.${encodeURIComponent(cleanMatchHandle)})&limit=1`,
+          origin
+        ).toString(),
+        {
+          method: 'GET',
+          headers: {
+            ...buildSupabaseHeaders(keys.activeKey),
+            'Accept-Profile': schema,
+          },
+          signal: AbortSignal.timeout(4500),
+        }
+      ).catch(() => null);
+      if (lookupRes?.ok) {
+        const rows = (await lookupRes.json().catch(() => [])) as Array<{ id?: string }>;
+        if (Array.isArray(rows) && rows.length > 0 && rows[0]?.id) {
+          targetFilter = `id=eq.${encodeURIComponent(String(rows[0].id))}`;
+        }
+      }
+    }
+
     const res = await fetch(
-      new URL(`/rest/v1/lumina_users?id=eq.${encodeURIComponent(userId)}`, origin).toString(),
+      new URL(`/rest/v1/lumina_users?${targetFilter}`, origin).toString(),
       {
         method: 'PATCH',
         headers: {
@@ -741,7 +770,7 @@ export async function updateUserInSupabase(
       delete coreBody.followers;
       delete coreBody.following;
       const retry = await fetch(
-        new URL(`/rest/v1/lumina_users?id=eq.${encodeURIComponent(userId)}`, origin).toString(),
+        new URL(`/rest/v1/lumina_users?${targetFilter}`, origin).toString(),
         {
           method: 'PATCH',
           headers: {

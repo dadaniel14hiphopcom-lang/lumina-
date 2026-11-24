@@ -278,6 +278,17 @@ interface IntegrationState {
     expiresAt: number;
     acceptedByUserId?: string;
   }[];
+  userFlags?: Record<
+    string,
+    {
+      id?: string;
+      username?: string;
+      verified?: boolean;
+      boosted?: boolean;
+      restricted?: boolean;
+      updatedAt: number;
+    }
+  >;
 }
 
 const DEFAULT_ADMIN_STATE: IntegrationState = {
@@ -342,6 +353,7 @@ const DEFAULT_ADMIN_STATE: IntegrationState = {
     ],
   },
   invites: [],
+  userFlags: {},
 };
 
 function readAdminState(): IntegrationState {
@@ -389,6 +401,10 @@ function readAdminState(): IntegrationState {
           },
         },
         invites: Array.isArray(parsed.invites) ? parsed.invites : [],
+        userFlags:
+          parsed.userFlags && typeof parsed.userFlags === 'object' && !Array.isArray(parsed.userFlags)
+            ? parsed.userFlags
+            : {},
       };
     }
   } catch {
@@ -602,9 +618,10 @@ function mergeSharedUsersList(
         ...item,
         id: String(prev.id || item.id),
         uid: item.uid || prev.uid,
-        verified: Boolean(prev.verified || item.verified),
-        boosted: Boolean(prev.boosted || item.boosted),
-        restricted: Boolean(item.restricted !== undefined ? item.restricted : prev.restricted),
+        // Preserve existing moderation/verification flags against unauthenticated sync payloads
+        verified: prev.verified !== undefined ? Boolean(prev.verified) : Boolean(item.verified),
+        boosted: prev.boosted !== undefined ? Boolean(prev.boosted) : Boolean(item.boosted),
+        restricted: prev.restricted !== undefined ? Boolean(prev.restricted) : Boolean(item.restricted),
         avatarUrl:
           typeof item.avatarUrl === 'string' && item.avatarUrl.trim() && item.avatarUrl !== '/og-preview.jpg'
             ? item.avatarUrl
@@ -622,6 +639,30 @@ function mergeSharedUsersList(
     }
   }
   return list.slice(0, 250);
+}
+
+function applyAuthoritativeUserFlags(
+  users: Record<string, unknown>[],
+  userFlags?: IntegrationState['userFlags']
+): Record<string, unknown>[] {
+  if (!userFlags || Object.keys(userFlags).length === 0) return users;
+  return users.map((u) => {
+    const id = typeof u.id === 'string' ? u.id : '';
+    const uid = typeof u.uid === 'string' ? u.uid : '';
+    const handle = typeof u.username === 'string' ? u.username.trim().toLowerCase() : '';
+    const match =
+      (id && userFlags[id]) ||
+      (uid && userFlags[uid]) ||
+      (handle && userFlags[`handle:${handle}`]) ||
+      undefined;
+    if (!match) return u;
+    return {
+      ...u,
+      ...(typeof match.verified === 'boolean' ? { verified: match.verified } : {}),
+      ...(typeof match.boosted === 'boolean' ? { boosted: match.boosted } : {}),
+      ...(typeof match.restricted === 'boolean' ? { restricted: match.restricted } : {}),
+    };
+  });
 }
 
 function signSessionToken(): string {
@@ -2356,7 +2397,25 @@ async function startServer() {
     let tableMissing = false;
     let lastErrorMessage = '';
 
-    for (const u of userMap.values()) {
+    for (const rawUser of userMap.values()) {
+      const handleKey = `handle:${rawUser.username.trim().toLowerCase()}`;
+      const flagOverride =
+        state.userFlags?.[rawUser.id] ||
+        (rawUser.authUid ? state.userFlags?.[rawUser.authUid] : undefined) ||
+        state.userFlags?.[handleKey];
+      const u = flagOverride
+        ? {
+            ...rawUser,
+            verified:
+              typeof flagOverride.verified === 'boolean' ? flagOverride.verified : rawUser.verified,
+            boosted:
+              typeof flagOverride.boosted === 'boolean' ? flagOverride.boosted : rawUser.boosted,
+            restricted:
+              typeof flagOverride.restricted === 'boolean'
+                ? flagOverride.restricted
+                : rawUser.restricted,
+          }
+        : rawUser;
       const result = await registerOrSyncUserToSupabase(sbConfig, {
         ...u,
         source: 'admin-sync',
@@ -3302,7 +3361,8 @@ async function startServer() {
       return;
     }
 
-    const { email: _stripEmail, ...publicFields } = resolvedUser;
+    const flaggedUser = applyAuthoritativeUserFlags([resolvedUser], adminState.userFlags)[0] || resolvedUser;
+    const { email: _stripEmail, ...publicFields } = flaggedUser;
     const targetIds = new Set(
       [String(publicFields.id || ''), typeof publicFields.uid === 'string' ? publicFields.uid : ''].filter(Boolean)
     );
@@ -3392,7 +3452,10 @@ async function startServer() {
       notifications: [],
     };
 
-    const mergedUsers = mergeSharedUsersList(baseState.users, sbUsers);
+    const mergedUsers = applyAuthoritativeUserFlags(
+      mergeSharedUsersList(baseState.users, sbUsers),
+      adminState.userFlags
+    );
     const mergedPosts = mergeByIdRecords(baseState.posts, sbPosts, 200, 'createdAt').filter(
       (p) => !deletedPostIds.has(String(p.id || ''))
     );
@@ -3401,10 +3464,15 @@ async function startServer() {
     );
     const mergedThreads = mergeByIdRecords(baseState.threads, sbThreads, 150, 'updatedAt');
 
+    const latestFlagUpdate = Object.values(adminState.userFlags || {}).reduce(
+      (maxTs, entry) => Math.max(maxTs, Number(entry?.updatedAt || 0)),
+      0
+    );
     const effectiveUpdatedAt = Math.max(
       baseState.updatedAt || 0,
       supabaseUsersCache?.fetchedAt || 0,
-      supabaseContentCache?.fetchedAt || 0
+      supabaseContentCache?.fetchedAt || 0,
+      latestFlagUpdate
     );
 
     res.json({
@@ -3416,7 +3484,97 @@ async function startServer() {
         posts: mergedPosts,
         stories: mergedStories,
         threads: mergedThreads,
+        userFlagOverrides: adminState.userFlags || {},
       },
+    });
+  });
+
+  // Protected admin endpoint to persist verified, boosted, and restricted flags across devices and Supabase
+  app.patch('/api/admin/users/:id/flags', requireAdminAuth, async (req, res) => {
+    const userId = String(req.params.id || '').trim().slice(0, 128);
+    if (!userId) {
+      res.status(400).json({ error: 'ID de usuário inválido.' });
+      return;
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const verified = typeof body.verified === 'boolean' ? body.verified : undefined;
+    const boosted = typeof body.boosted === 'boolean' ? body.boosted : undefined;
+    const restricted = typeof body.restricted === 'boolean' ? body.restricted : undefined;
+    if (verified === undefined && boosted === undefined && restricted === undefined) {
+      res.status(400).json({ error: 'Informe ao menos um selo ou status para atualizar.' });
+      return;
+    }
+
+    const rawUsername =
+      typeof body.username === 'string'
+        ? body.username.trim().toLowerCase().replace(/^@/, '').slice(0, 40)
+        : '';
+    const rawUid = typeof body.uid === 'string' ? body.uid.trim().slice(0, 128) : '';
+    const now = Date.now();
+
+    const adminState = readAdminState();
+    const nextUserFlags = { ...(adminState.userFlags || {}) };
+    const prevEntry =
+      nextUserFlags[userId] ||
+      (rawUid ? nextUserFlags[rawUid] : undefined) ||
+      (rawUsername ? nextUserFlags[`handle:${rawUsername}`] : undefined) ||
+      { updatedAt: now };
+
+    const updatedEntry = {
+      ...prevEntry,
+      id: userId,
+      ...(rawUsername ? { username: rawUsername } : {}),
+      ...(verified !== undefined ? { verified } : {}),
+      ...(boosted !== undefined ? { boosted } : {}),
+      ...(restricted !== undefined ? { restricted } : {}),
+      updatedAt: now,
+    };
+
+    nextUserFlags[userId] = updatedEntry;
+    if (rawUid) nextUserFlags[rawUid] = updatedEntry;
+    if (rawUsername) nextUserFlags[`handle:${rawUsername}`] = updatedEntry;
+    adminState.userFlags = nextUserFlags;
+    writeAdminState(adminState);
+
+    const social = readSharedSocialState();
+    if (social) {
+      const updatedUsers = social.users.map((u) => {
+        const matchId =
+          String(u.id || '') === userId ||
+          (rawUid && String(u.uid || '') === rawUid) ||
+          (rawUsername && typeof u.username === 'string' && u.username.trim().toLowerCase() === rawUsername);
+        if (!matchId) return u;
+        return {
+          ...u,
+          ...(verified !== undefined ? { verified } : {}),
+          ...(boosted !== undefined ? { boosted } : {}),
+          ...(restricted !== undefined ? { restricted } : {}),
+        };
+      });
+      writeSharedSocialState({
+        ...social,
+        version: (social.version || 0) + 1,
+        updatedAt: now,
+        users: updatedUsers,
+      });
+    }
+    supabaseUsersCache = null;
+
+    let supabaseSynced = false;
+    if (adminState.supabase.projectUrl) {
+      supabaseSynced = await updateUserInSupabase(adminState.supabase, userId, {
+        verified,
+        boosted,
+        restricted,
+        matchUsername: rawUsername || undefined,
+      });
+    }
+
+    res.json({
+      ok: true,
+      supabaseSynced,
+      updatedAt: now,
+      userFlags: nextUserFlags,
     });
   });
 

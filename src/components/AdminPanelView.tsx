@@ -504,7 +504,9 @@ export function AdminPanelView() {
     setFirebaseAdminLoading(true);
     try {
       if (!authStatus.serverAvailable) {
-        setAdminToken(`firebase_admin_${userOverride.uid}`);
+        const staticFbToken = `firebase_admin_${userOverride.uid}`;
+        setAdminToken(staticFbToken);
+        setAdminMemoryToken(staticFbToken);
         loadLocalOverview();
         return true;
       }
@@ -520,7 +522,9 @@ export function AdminPanelView() {
       const ct = res.headers.get('content-type') || '';
       if (!ct.includes('application/json')) {
         setAuthStatus((prev) => ({ ...prev, serverAvailable: false }));
-        setAdminToken(`firebase_admin_${userOverride.uid}`);
+        const staticFbToken = `firebase_admin_${userOverride.uid}`;
+        setAdminToken(staticFbToken);
+        setAdminMemoryToken(staticFbToken);
         loadLocalOverview();
         return true;
       }
@@ -1944,6 +1948,38 @@ create policy "Atualização de reação/leitura em mensagens"
     exists (select 1 from ${schema}.lumina_users lu where lu.id = sender_id)
     and exists (select 1 from ${schema}.lumina_users lu where lu.id = recipient_id)
   );
+
+create or replace function ${schema}.lumina_admin_set_user_flags(
+  p_user_id text,
+  p_username text default null,
+  p_verified boolean default null,
+  p_boosted boolean default null,
+  p_restricted boolean default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ${schema}, public
+as $$
+declare
+  caller_email text := lower(coalesce(auth.jwt() ->> 'email', ''));
+begin
+  if caller_email <> 'dadaniel14hiphop.com@gmail.com' then
+    raise exception 'Acesso exclusivo do administrador';
+  end if;
+  update ${schema}.lumina_users
+  set
+    verified = coalesce(p_verified, verified),
+    boosted = coalesce(p_boosted, boosted),
+    restricted = coalesce(p_restricted, restricted),
+    updated_at = now()
+  where id = p_user_id
+     or (p_username is not null and lower(username) = lower(p_username));
+  return found;
+end;
+$$;
+revoke all on function ${schema}.lumina_admin_set_user_flags(text, text, boolean, boolean, boolean) from public;
+grant execute on function ${schema}.lumina_admin_set_user_flags(text, text, boolean, boolean, boolean) to authenticated;
 
 create or replace function ${schema}.handle_new_lumina_user()
 returns trigger

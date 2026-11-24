@@ -32,6 +32,7 @@ import {
   setRuntimePublicSupabaseConfig,
   signupRealUserInSupabaseFromBrowser,
   syncUsersToSupabaseFromBrowser,
+  updateUserFlagsInSupabaseBrowser,
   updateUserProfileInSupabaseBrowser,
   upsertDirectMessageToSupabaseBrowser,
   upsertPostToSupabaseBrowser,
@@ -95,7 +96,43 @@ export interface PendingInviteMeta {
 const STORAGE_KEY = 'lumina_social_v1';
 const INVITES_KEY = 'lumina_invites_v1';
 const CREDENTIALS_KEY = 'lumina_user_credentials_v1';
+const ADMIN_USER_FLAGS_KEY = 'lumina_admin_user_flags_v1';
 const REALTIME_CHANNEL = 'lumina_realtime_sync_v1';
+
+interface AdminUserFlagOverride {
+  id?: string;
+  username?: string;
+  verified?: boolean;
+  boosted?: boolean;
+  restricted?: boolean;
+  updatedAt: number;
+  expiresAt?: number;
+}
+
+type AdminUserFlagOverrideMap = Record<string, AdminUserFlagOverride>;
+
+function loadLocalAdminUserFlags(): AdminUserFlagOverrideMap {
+  try {
+    const raw = localStorage.getItem(ADMIN_USER_FLAGS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as AdminUserFlagOverrideMap;
+      }
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return {};
+}
+
+function saveLocalAdminUserFlags(flags: AdminUserFlagOverrideMap): void {
+  try {
+    localStorage.setItem(ADMIN_USER_FLAGS_KEY, JSON.stringify(flags));
+  } catch {
+    // Ignore storage write errors
+  }
+}
 
 interface LocalUserCredential {
   userId: string;
@@ -503,13 +540,43 @@ function extractInitialProfileParam(): string | null {
   return pathMatch ? pathMatch[1].toLowerCase() : null;
 }
 
-function mergeUsersSmart(localList: UserProfile[], remoteList: UserProfile[]): UserProfile[] {
-  const result: UserProfile[] = localList.map((u) => ({
-    ...u,
-    avatarUrl: u.avatarUrl || '/og-preview.jpg',
-    followers: Array.isArray(u.followers) ? u.followers : [],
-    following: Array.isArray(u.following) ? u.following : [],
-  }));
+function resolveFlagOverrideForUser(
+  user: { id?: string; uid?: string; username?: string },
+  flagOverrides?: AdminUserFlagOverrideMap
+): AdminUserFlagOverride | undefined {
+  if (!flagOverrides) return undefined;
+  const id = typeof user.id === 'string' ? user.id : '';
+  const uid = typeof user.uid === 'string' ? user.uid : '';
+  const handle = typeof user.username === 'string' ? user.username.trim().toLowerCase() : '';
+  const candidate =
+    (id && flagOverrides[id]) ||
+    (uid && flagOverrides[uid]) ||
+    (handle && flagOverrides[`handle:${handle}`]) ||
+    undefined;
+  if (!candidate) return undefined;
+  if (typeof candidate.expiresAt === 'number' && candidate.expiresAt < Date.now()) {
+    return undefined;
+  }
+  return candidate;
+}
+
+function mergeUsersSmart(
+  localList: UserProfile[],
+  remoteList: UserProfile[],
+  flagOverrides?: AdminUserFlagOverrideMap
+): UserProfile[] {
+  const result: UserProfile[] = localList.map((u) => {
+    const ov = resolveFlagOverrideForUser(u, flagOverrides);
+    return {
+      ...u,
+      avatarUrl: u.avatarUrl || '/og-preview.jpg',
+      followers: Array.isArray(u.followers) ? u.followers : [],
+      following: Array.isArray(u.following) ? u.following : [],
+      ...(ov && typeof ov.verified === 'boolean' ? { verified: ov.verified } : {}),
+      ...(ov && typeof ov.boosted === 'boolean' ? { boosted: ov.boosted } : {}),
+      ...(ov && typeof ov.restricted === 'boolean' ? { restricted: ov.restricted } : {}),
+    };
+  });
 
   for (const rawRemote of remoteList) {
     if (!rawRemote || !rawRemote.id || !rawRemote.username) continue;
@@ -529,14 +596,30 @@ function mergeUsersSmart(localList: UserProfile[], remoteList: UserProfile[]): U
           u.username.trim().toLowerCase() === rUsername)
     );
     if (matchIdx === -1) {
-      result.push(remote);
+      const ov = resolveFlagOverrideForUser(remote, flagOverrides);
+      result.push(
+        ov
+          ? {
+              ...remote,
+              ...(typeof ov.verified === 'boolean' ? { verified: ov.verified } : {}),
+              ...(typeof ov.boosted === 'boolean' ? { boosted: ov.boosted } : {}),
+              ...(typeof ov.restricted === 'boolean' ? { restricted: ov.restricted } : {}),
+            }
+          : remote
+      );
     } else {
       const existing = result[matchIdx];
+      const ov =
+        resolveFlagOverrideForUser(existing, flagOverrides) ||
+        resolveFlagOverrideForUser(remote, flagOverrides);
       result[matchIdx] = {
         ...existing,
         ...remote,
         id: existing.id,
         uid: remote.uid || existing.uid || (remote.id !== existing.id ? remote.id : undefined),
+        ...(ov && typeof ov.verified === 'boolean' ? { verified: ov.verified } : {}),
+        ...(ov && typeof ov.boosted === 'boolean' ? { boosted: ov.boosted } : {}),
+        ...(ov && typeof ov.restricted === 'boolean' ? { restricted: ov.restricted } : {}),
         followers:
           remote.followers.length >= existing.followers.length
             ? remote.followers
@@ -655,6 +738,27 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const skipNextInvitesBroadcastRef = useRef(false);
   const skipNextServerPushRef = useRef(false);
   const lastServerUpdatedAtRef = useRef(0);
+  const serverAdminFlagsRef = useRef<AdminUserFlagOverrideMap>({});
+  const pendingAdminFlagsRef = useRef<AdminUserFlagOverrideMap>({});
+
+  const getActiveAdminFlagOverrides = (): AdminUserFlagOverrideMap => {
+    const now = Date.now();
+    const combined: AdminUserFlagOverrideMap = {
+      ...(serverSyncAvailable ? {} : loadLocalAdminUserFlags()),
+      ...serverAdminFlagsRef.current,
+    };
+    for (const [key, entry] of Object.entries(pendingAdminFlagsRef.current)) {
+      if (!entry || (typeof entry.expiresAt === 'number' && entry.expiresAt < now)) {
+        delete pendingAdminFlagsRef.current[key];
+        continue;
+      }
+      combined[key] = {
+        ...(combined[key] || {}),
+        ...entry,
+      };
+    }
+    return combined;
+  };
 
   const refreshSiteMeta = async () => {
     try {
@@ -1019,8 +1123,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           if (cloudProfiles.length === 0) return;
           skipNextStateBroadcastRef.current = true;
           skipNextServerPushRef.current = true;
+          const activeFlags = getActiveAdminFlagOverrides();
           setState((prev) => {
-            const merged = mergeRecordsById(prev.users, cloudProfiles);
+            const merged = mergeUsersSmart(prev.users, cloudProfiles, activeFlags);
             return { ...prev, users: merged };
           });
         },
@@ -1076,9 +1181,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     if (!Array.isArray(incoming) || incoming.length === 0) return;
     skipNextServerPushRef.current = true;
     skipNextStateBroadcastRef.current = true;
+    const activeFlags = getActiveAdminFlagOverrides();
     setState((prev) => ({
       ...prev,
-      users: mergeUsersSmart(prev.users, incoming),
+      users: mergeUsersSmart(prev.users, incoming, activeFlags),
     }));
   };
 
@@ -1108,11 +1214,16 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             stories?: StoryItem[];
             threads?: DirectThread[];
             notifications?: NotificationItem[];
+            userFlagOverrides?: AdminUserFlagOverrideMap;
           } | null;
         };
         const remote = data.state;
+        if (remote?.userFlagOverrides && typeof remote.userFlagOverrides === 'object') {
+          serverAdminFlagsRef.current = remote.userFlagOverrides;
+        }
         if (remote && Array.isArray(remote.users) && Array.isArray(remote.posts)) {
-          collected = remote.users;
+          const activeFlags = getActiveAdminFlagOverrides();
+          collected = mergeUsersSmart([], remote.users, activeFlags);
           lastServerUpdatedAtRef.current = Math.max(
             lastServerUpdatedAtRef.current,
             remote.updatedAt || Date.now()
@@ -1121,7 +1232,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           skipNextStateBroadcastRef.current = true;
           setState((prev) => ({
             ...prev,
-            users: mergeUsersSmart(prev.users, remote.users!),
+            users: mergeUsersSmart(prev.users, remote.users!, activeFlags),
             posts: mergeRecordsById(prev.posts, remote.posts!).sort((a, b) => b.createdAt - a.createdAt),
             stories: Array.isArray(remote.stories)
               ? mergeRecordsById(prev.stories, remote.stories).sort((a, b) => b.createdAt - a.createdAt)
@@ -1150,12 +1261,13 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           : Promise.resolve([] as DirectThread[]),
       ]);
       if (sbUsers.length > 0 || sbPosts.length > 0 || sbStories.length > 0 || sbThreads.length > 0) {
-        collected = mergeUsersSmart(collected, sbUsers);
+        const activeFlags = getActiveAdminFlagOverrides();
+        collected = mergeUsersSmart(collected, sbUsers, activeFlags);
         skipNextServerPushRef.current = true;
         skipNextStateBroadcastRef.current = true;
         setState((prev) => ({
           ...prev,
-          users: sbUsers.length > 0 ? mergeUsersSmart(prev.users, sbUsers) : prev.users,
+          users: sbUsers.length > 0 ? mergeUsersSmart(prev.users, sbUsers, activeFlags) : prev.users,
           posts:
             sbPosts.length > 0
               ? mergeRecordsById(prev.posts, sbPosts).sort((a, b) => b.createdAt - a.createdAt)
@@ -1221,9 +1333,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           if (!cancelled && data.ok && data.user) {
             skipNextServerPushRef.current = true;
             skipNextStateBroadcastRef.current = true;
+            const activeFlags = getActiveAdminFlagOverrides();
             setState((prev) => ({
               ...prev,
-              users: mergeUsersSmart(prev.users, [data.user!]),
+              users: mergeUsersSmart(prev.users, [data.user!], activeFlags),
               posts:
                 Array.isArray(data.posts) && data.posts.length > 0
                   ? mergeRecordsById(prev.posts, data.posts).sort((a, b) => b.createdAt - a.createdAt)
@@ -1253,9 +1366,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           if (!cancelled) {
             skipNextServerPushRef.current = true;
             skipNextStateBroadcastRef.current = true;
+            const activeFlags = getActiveAdminFlagOverrides();
             setState((prev) => ({
               ...prev,
-              users: mergeUsersSmart(prev.users, [sbUser]),
+              users: mergeUsersSmart(prev.users, [sbUser], activeFlags),
               posts:
                 sbPosts.length > 0
                   ? mergeRecordsById(prev.posts, sbPosts).sort((a, b) => b.createdAt - a.createdAt)
@@ -1310,11 +1424,15 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             stories?: StoryItem[];
             threads?: DirectThread[];
             notifications?: NotificationItem[];
+            userFlagOverrides?: AdminUserFlagOverrideMap;
           } | null;
         };
         if (!active || !data.ok) return;
         setServerSyncAvailable(true);
         const remote = data.state;
+        if (remote?.userFlagOverrides && typeof remote.userFlagOverrides === 'object') {
+          serverAdminFlagsRef.current = remote.userFlagOverrides;
+        }
         if (remote && Array.isArray(remote.users) && Array.isArray(remote.posts)) {
           const isNewerTimestamp = !remote.updatedAt || remote.updatedAt > lastServerUpdatedAtRef.current;
           const hasUnseenUsers = remote.users.some(
@@ -1334,11 +1452,12 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
                 remote.updatedAt
               );
             }
+            const activeFlags = getActiveAdminFlagOverrides();
             skipNextServerPushRef.current = true;
             skipNextStateBroadcastRef.current = true;
             setState((prev) => ({
               ...prev,
-              users: mergeUsersSmart(prev.users, remote.users!),
+              users: mergeUsersSmart(prev.users, remote.users!, activeFlags),
               posts: mergeRecordsById(prev.posts, remote.posts!).sort((a, b) => b.createdAt - a.createdAt),
               stories: Array.isArray(remote.stories)
                 ? mergeRecordsById(prev.stories, remote.stories).sort((a, b) => b.createdAt - a.createdAt)
@@ -1370,11 +1489,12 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             : Promise.resolve([] as DirectThread[]),
         ]);
         if (active && (sbUsers.length > 0 || sbPosts.length > 0 || sbStories.length > 0 || sbThreads.length > 0)) {
+          const activeFlags = getActiveAdminFlagOverrides();
           skipNextServerPushRef.current = true;
           skipNextStateBroadcastRef.current = true;
           setState((prev) => ({
             ...prev,
-            users: sbUsers.length > 0 ? mergeUsersSmart(prev.users, sbUsers) : prev.users,
+            users: sbUsers.length > 0 ? mergeUsersSmart(prev.users, sbUsers, activeFlags) : prev.users,
             posts:
               sbPosts.length > 0
                 ? mergeRecordsById(prev.posts, sbPosts).sort((a, b) => b.createdAt - a.createdAt)
@@ -3483,6 +3603,137 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     showToast('Feed restaurado para os dados originais');
   };
 
+  const persistAdminFlagUpdate = (
+    userId: string,
+    target: UserProfile | undefined,
+    patch: Partial<{ verified: boolean; boosted: boolean; restricted: boolean }>
+  ) => {
+    const now = Date.now();
+    const cleanHandle = target?.username ? target.username.trim().toLowerCase() : '';
+    const keysToMark = [userId, target?.uid || '', cleanHandle ? `handle:${cleanHandle}` : ''].filter(
+      Boolean
+    );
+
+    const prevMerged =
+      pendingAdminFlagsRef.current[userId] ||
+      serverAdminFlagsRef.current[userId] ||
+      (cleanHandle
+        ? pendingAdminFlagsRef.current[`handle:${cleanHandle}`] ||
+          serverAdminFlagsRef.current[`handle:${cleanHandle}`]
+        : undefined);
+
+    const entry: AdminUserFlagOverride = {
+      ...(prevMerged || {}),
+      id: userId,
+      ...(cleanHandle ? { username: cleanHandle } : {}),
+      ...patch,
+      updatedAt: now,
+      expiresAt: now + 90_000,
+    };
+
+    for (const k of keysToMark) {
+      pendingAdminFlagsRef.current[k] = entry;
+      serverAdminFlagsRef.current[k] = {
+        id: entry.id,
+        username: entry.username,
+        verified: entry.verified,
+        boosted: entry.boosted,
+        restricted: entry.restricted,
+        updatedAt: now,
+      };
+    }
+
+    if (!serverSyncAvailable) {
+      const localMap = loadLocalAdminUserFlags();
+      const persistentEntry: AdminUserFlagOverride = {
+        id: entry.id,
+        username: entry.username,
+        verified: entry.verified,
+        boosted: entry.boosted,
+        restricted: entry.restricted,
+        updatedAt: now,
+      };
+      for (const k of keysToMark) {
+        localMap[k] = persistentEntry;
+      }
+      saveLocalAdminUserFlags(localMap);
+    }
+
+    if (target && auth.currentUser && auth.currentUser.emailVerified) {
+      void adminUpdateProfileFlagsInCloud({ ...target, ...patch }, auth.currentUser).catch(() => {});
+    }
+
+    const sbConfig = getBrowserSupabaseConfig();
+    if (sbConfig.anonKey) {
+      void updateUserFlagsInSupabaseBrowser(sbConfig, {
+        userId,
+        username: cleanHandle || undefined,
+        ...patch,
+      }).catch(() => {});
+    }
+
+    if (serverSyncAvailable) {
+      void (async () => {
+        let token = adminMemoryToken;
+        if ((!token || token.startsWith('firebase_admin_')) && isExclusiveAdminUser(auth.currentUser)) {
+          try {
+            const idToken = await auth.currentUser!.getIdToken();
+            const exRes = await fetch('/api/admin/auth/firebase', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${idToken}`,
+              },
+            });
+            if (exRes.ok && exRes.headers.get('content-type')?.includes('application/json')) {
+              const exData = (await exRes.json()) as { token?: string };
+              if (exData.token) {
+                token = exData.token;
+                setAdminMemoryToken(exData.token);
+              }
+            }
+          } catch {
+            // Keep existing token
+          }
+        }
+        if (!token || token.startsWith('firebase_admin_') || token === 'static_admin_local') {
+          return;
+        }
+        try {
+          const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/flags`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              ...patch,
+              username: cleanHandle || undefined,
+              uid: target?.uid || undefined,
+            }),
+          });
+          if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+            const data = (await res.json()) as {
+              updatedAt?: number;
+              userFlags?: AdminUserFlagOverrideMap;
+            };
+            if (data.userFlags) {
+              serverAdminFlagsRef.current = data.userFlags;
+            }
+            if (data.updatedAt) {
+              lastServerUpdatedAtRef.current = Math.max(
+                lastServerUpdatedAtRef.current,
+                data.updatedAt
+              );
+            }
+          }
+        } catch {
+          // Non-fatal: pendingAdminFlagsRef keeps UI consistent
+        }
+      })();
+    }
+  };
+
   const toggleRestrictUser = (userId: string) => {
     const target = state.users.find((u) => u.id === userId);
     const nextVal = !target?.restricted;
@@ -3492,10 +3743,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           ? `@${target.username} foi restringido`
           : `Restrição removida de @${target.username}`
       );
-      if (auth.currentUser && auth.currentUser.emailVerified) {
-        void adminUpdateProfileFlagsInCloud({ ...target, restricted: nextVal }, auth.currentUser).catch(() => {});
-      }
     }
+    persistAdminFlagUpdate(userId, target, { restricted: nextVal });
     setState((prev) => ({
       ...prev,
       users: prev.users.map((u) =>
@@ -3513,10 +3762,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           ? `Perfil @${target.username} impulsionado no feed`
           : `Impulsionamento desativado para @${target.username}`
       );
-      if (auth.currentUser && auth.currentUser.emailVerified) {
-        void adminUpdateProfileFlagsInCloud({ ...target, boosted: nextVal }, auth.currentUser).catch(() => {});
-      }
     }
+    persistAdminFlagUpdate(userId, target, { boosted: nextVal });
     setState((prev) => ({
       ...prev,
       users: prev.users.map((u) =>
@@ -3534,10 +3781,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           ? `Selo de verificação concedido a @${target.username}`
           : `Selo de verificação removido de @${target.username}`
       );
-      if (auth.currentUser && auth.currentUser.emailVerified) {
-        void adminUpdateProfileFlagsInCloud({ ...target, verified: nextVal }, auth.currentUser).catch(() => {});
-      }
     }
+    persistAdminFlagUpdate(userId, target, { verified: nextVal });
     setState((prev) => ({
       ...prev,
       users: prev.users.map((u) =>
