@@ -1285,9 +1285,14 @@ export function AdminPanelView() {
         await refreshPublicUsersFromSupabase();
 
         const hasPushFailures = pushRes.failed > 0;
+        const missingStaticBuildEnv = !import.meta.env.VITE_SUPABASE_ANON_KEY;
         const msg = hasPushFailures
-          ? `Falha ao gravar ${pushRes.failed}/${pushRes.attempted} usuário(s) no Supabase (${pushRes.lastError || 'permissões/RLS'}). Clique em "Copiar SQL" e execute novamente no SQL Editor do Supabase. (${remoteUsers.length} usuário(s) lido(s) no banco).`
-          : `Sincronização concluída! ${remoteUsers.length} usuário(s), ${remotePosts.length} post(s) (${postRes.synced} enviado(s)) e ${remoteStories.length} story(ies) (${syncedStoriesCount} enviado(s)) ativos em ${cfg.schemaName}.`;
+          ? `Falha ao gravar ${pushRes.failed}/${pushRes.attempted} usuário(s) no Supabase (${pushRes.lastError || 'permissões/RLS'}). (${remoteUsers.length} usuário(s) lido(s) no banco).`
+          : `Sincronização concluída! ${remoteUsers.length} usuário(s), ${remotePosts.length} post(s) (${postRes.synced} enviado(s)) e ${remoteStories.length} story(ies) (${syncedStoriesCount} enviado(s)) ativos em ${cfg.schemaName}.${
+              missingStaticBuildEnv
+                ? ' Para outros dispositivos encontrarem usuários na hospedagem estática, clique em "Copiar .env estático" e republique o site.'
+                : ''
+            }`;
         setSupabaseTestStatus(msg);
         setOverview((prev) => {
           if (!prev) return prev;
@@ -1306,7 +1311,7 @@ export function AdminPanelView() {
         });
         showToast(
           hasPushFailures
-            ? `Erro ao gravar usuário no Supabase — execute o SQL atualizado.`
+            ? `Erro ao gravar no Supabase: ${pushRes.lastError || 'verifique o SQL e permissões.'}`
             : remoteUsers.length > 0
             ? `${remoteUsers.length} usuário(s) e ${remotePosts.length} post(s) sincronizado(s)!`
             : 'Conexão confirmada! Nenhum usuário real cadastrado ainda.'
@@ -1800,6 +1805,18 @@ grant update (auth_uid, username, display_name, avatar_url, cover_url, bio, webs
 grant select, insert, update, delete on table ${schema}.lumina_posts to anon, authenticated;
 grant select, insert, update, delete on table ${schema}.lumina_stories to anon, authenticated;
 grant select, insert, update on table ${schema}.lumina_messages to anon, authenticated;
+
+do $$
+declare pol record;
+begin
+  for pol in
+    select policyname, tablename from pg_policies
+    where schemaname = '${schema}'
+      and tablename in ('lumina_users', 'lumina_posts', 'lumina_stories', 'lumina_messages')
+  loop
+    execute format('drop policy if exists %I on %I.%I', pol.policyname, '${schema}', pol.tablename);
+  end loop;
+end $$;
 
 drop policy if exists "Perfis públicos visíveis" on ${schema}.lumina_users;
 create policy "Perfis públicos visíveis"

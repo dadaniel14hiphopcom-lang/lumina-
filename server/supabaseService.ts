@@ -389,7 +389,9 @@ export async function registerOrSyncUserToSupabase(
   }
 
   const schema = sanitizeSchemaName(config.schemaName);
-  let resolvedAuthUid = user.authUid || null;
+  const isUuid = (val?: string | null): val is string =>
+    Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val.trim()));
+  let resolvedAuthUid: string | null = isUuid(user.authUid) ? user.authUid.trim() : null;
   let authCreated = false;
   let authJwtForPostgrest = isJwtLike(keys.activeKey) ? keys.activeKey : '';
 
@@ -464,11 +466,20 @@ export async function registerOrSyncUserToSupabase(
     }
   }
 
-  const cleanHandle = user.username.trim().toLowerCase().replace(/^@/, '');
+  const rawCleanHandle = user.username
+    .trim()
+    .toLowerCase()
+    .replace(/^@/, '')
+    .replace(/[^a-z0-9._]/g, '')
+    .slice(0, 32);
+  const cleanHandle =
+    rawCleanHandle.length >= 3
+      ? rawCleanHandle
+      : `user.${user.id.toLowerCase().replace(/[^a-z0-9._]/g, '').slice(0, 8) || 'lumina'}`.slice(0, 32);
   const nowIso = new Date().toISOString();
   const baseAnonRow: Record<string, unknown> = {
     id: user.id,
-    auth_uid: resolvedAuthUid,
+    auth_uid: isUuid(resolvedAuthUid) ? resolvedAuthUid.trim() : null,
     username: cleanHandle,
     display_name: (user.displayName || cleanHandle).slice(0, 80),
     email: user.email ? user.email.toLowerCase().slice(0, 140) : null,
@@ -509,8 +520,8 @@ export async function registerOrSyncUserToSupabase(
         ...buildSupabaseHeaders(effectiveKey, authJwtForPostgrest),
         'Content-Profile': schema,
         Prefer: canServiceMerge
-          ? 'resolution=merge-duplicates,return=representation'
-          : 'resolution=ignore-duplicates,return=representation',
+          ? 'resolution=merge-duplicates,return=minimal'
+          : 'resolution=ignore-duplicates,return=minimal',
       },
       body: JSON.stringify(bodyToSend),
       signal: AbortSignal.timeout(7000),
@@ -561,16 +572,43 @@ export async function registerOrSyncUserToSupabase(
   };
 
   try {
+    if (!canServiceMerge) {
+      const existingCheck = await fetch(
+        new URL(
+          `/rest/v1/lumina_users?select=id,username&or=(id.eq.${encodeURIComponent(user.id)},username.ilike.${encodeURIComponent(cleanHandle)})&limit=1`,
+          origin
+        ).toString(),
+        {
+          method: 'GET',
+          headers: {
+            ...buildSupabaseHeaders(effectiveKey),
+            'Accept-Profile': schema,
+          },
+          signal: AbortSignal.timeout(5000),
+        }
+      ).catch(() => null);
+      if (existingCheck?.ok) {
+        const existingRows = (await existingCheck.json().catch(() => [])) as Array<{ id?: string }>;
+        if (Array.isArray(existingRows) && existingRows.length > 0 && existingRows[0]?.id) {
+          const patched = await patchExistingAnonRow(`id=eq.${encodeURIComponent(existingRows[0].id)}`);
+          if (patched) {
+            return {
+              synced: true,
+              authCreated,
+              httpStatus: 200,
+              message: `Usuário @${cleanHandle} sincronizado no Supabase (${schema}.lumina_users).`,
+            };
+          }
+        }
+      }
+    }
+
     let restRes = await tryPostRow(extendedAnonRow);
     if (restRes.status === 400) {
       restRes = await tryPostRow(baseAnonRow);
     }
 
     if (restRes.ok) {
-      const createdRows = (await restRes.json().catch(() => [])) as Array<{ id?: string }>;
-      if (Array.isArray(createdRows) && createdRows.length === 0 && !canServiceMerge) {
-        await patchExistingAnonRow(`id=eq.${encodeURIComponent(user.id)}`).catch(() => false);
-      }
       return {
         synced: true,
         authCreated,

@@ -100,12 +100,32 @@ export function sanitizeSupabaseSchemaName(raw?: string): string {
   return cleaned;
 }
 
+function isJwtExpired(token: string): boolean {
+  const parts = token.trim().split('.');
+  if (parts.length !== 3) return false;
+  try {
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
+    const payload = JSON.parse(atob(b64 + pad)) as { exp?: number };
+    if (typeof payload?.exp === 'number' && payload.exp > 0) {
+      return payload.exp * 1000 <= Date.now() + 15_000;
+    }
+  } catch {
+    // Ignore decode failure
+  }
+  return false;
+}
+
 export function getBrowserSupabaseSession(): BrowserSupabaseSession | null {
   try {
     const raw = localStorage.getItem(SUPABASE_SESSION_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as BrowserSupabaseSession;
     if (parsed && typeof parsed.accessToken === 'string' && parsed.accessToken.trim()) {
+      if (isJwtExpired(parsed.accessToken)) {
+        localStorage.removeItem(SUPABASE_SESSION_KEY);
+        return null;
+      }
       return parsed;
     }
   } catch {
@@ -136,13 +156,14 @@ export function clearBrowserSupabaseSession(): void {
 
 function buildBrowserSupabaseHeaders(
   anonKey: string,
-  bearerOverride?: string
+  bearerOverride?: string,
+  publicRead = false
 ): Record<string, string> {
   const headers: Record<string, string> = {};
   const cleanKey = anonKey.trim();
   if (cleanKey) {
     headers.apikey = cleanKey;
-    const storedToken = getBrowserSupabaseSession()?.accessToken?.trim() || '';
+    const storedToken = publicRead ? '' : getBrowserSupabaseSession()?.accessToken?.trim() || '';
     const effectiveBearer =
       (bearerOverride || '').trim() ||
       storedToken ||
@@ -288,7 +309,7 @@ export async function testSupabaseFromBrowser(params: {
   const tableRes = await fetch(`${origin}/rest/v1/lumina_users?select=id&limit=1`, {
     method: 'GET',
     headers: {
-      ...buildBrowserSupabaseHeaders(anonKey),
+      ...buildBrowserSupabaseHeaders(anonKey, undefined, true),
       'Accept-Profile': schema,
     },
     signal: AbortSignal.timeout(6000),
@@ -302,7 +323,7 @@ export async function testSupabaseFromBrowser(params: {
         {
           method: 'GET',
           headers: {
-            ...buildBrowserSupabaseHeaders(anonKey),
+            ...buildBrowserSupabaseHeaders(anonKey, undefined, true),
             'Accept-Profile': schema,
           },
           signal: AbortSignal.timeout(5000),
@@ -402,7 +423,16 @@ export async function signupRealUserInSupabaseFromBrowser(
   }
 
   const schema = sanitizeSupabaseSchemaName(config.schemaName);
-  const cleanHandle = payload.username.trim().toLowerCase().replace(/^@/, '');
+  const rawCleanHandle = payload.username
+    .trim()
+    .toLowerCase()
+    .replace(/^@/, '')
+    .replace(/[^a-z0-9._]/g, '')
+    .slice(0, 32);
+  const cleanHandle =
+    rawCleanHandle.length >= 3
+      ? rawCleanHandle
+      : `user.${payload.id.toLowerCase().replace(/[^a-z0-9._]/g, '').slice(0, 8) || 'lumina'}`.slice(0, 32);
   const safeAvatar = compactBrowserMediaUrl(payload.avatarUrl, 220_000);
   const safeCover = compactBrowserMediaUrl(payload.coverUrl, 220_000);
 
@@ -413,7 +443,7 @@ export async function signupRealUserInSupabaseFromBrowser(
       {
         method: 'GET',
         headers: {
-          ...buildBrowserSupabaseHeaders(config.anonKey),
+          ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
           'Accept-Profile': schema,
         },
         signal: AbortSignal.timeout(5000),
@@ -497,9 +527,13 @@ export async function signupRealUserInSupabaseFromBrowser(
 
   try {
     // Do NOT send verified/boosted/restricted on anon/authenticated inserts: column-level GRANT restricts them and DB defaults set false.
+    const validAuthUid =
+      authUid && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(authUid.trim())
+        ? authUid.trim()
+        : null;
     const insertBody: Record<string, unknown> = {
       id: payload.id,
-      auth_uid: authUid || null,
+      auth_uid: validAuthUid,
       username: cleanHandle,
       display_name: payload.displayName.slice(0, 60),
       email: payload.email.trim().toLowerCase(),
@@ -511,45 +545,52 @@ export async function signupRealUserInSupabaseFromBrowser(
       updated_at: new Date().toISOString(),
     };
 
-    const restRes = await fetch(`${origin}/rest/v1/lumina_users`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...buildBrowserSupabaseHeaders(config.anonKey, signupAccessToken),
-        'Content-Profile': schema,
-        Prefer: 'resolution=ignore-duplicates,return=representation',
-      },
-      body: JSON.stringify(insertBody),
-      signal: AbortSignal.timeout(6000),
-    });
+    const postUserInsert = (useAnonOnly = false) =>
+      fetch(`${origin}/rest/v1/lumina_users`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildBrowserSupabaseHeaders(config.anonKey, useAnonOnly ? undefined : signupAccessToken, useAnonOnly),
+          'Content-Profile': schema,
+          // Never request return=representation here: RETURNING * fails with 42501 when email lacks SELECT grant
+          Prefer: 'resolution=ignore-duplicates,return=minimal',
+        },
+        body: JSON.stringify(insertBody),
+        signal: AbortSignal.timeout(6000),
+      });
+
+    let restRes = await postUserInsert(false);
+    if (restRes.status === 401 && signupAccessToken) {
+      restRes = await postUserInsert(true);
+    }
 
     if (restRes.ok) {
-      const createdRows = (await restRes.json().catch(() => [])) as Array<{ id?: string }>;
-      if (Array.isArray(createdRows) && createdRows.length > 0) {
+      tableSynced = true;
+    } else if (restRes.status === 409) {
+      const patchRes = await fetch(
+        `${origin}/rest/v1/lumina_users?username=ilike.${encodeURIComponent(cleanHandle)}`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            ...buildBrowserSupabaseHeaders(config.anonKey, signupAccessToken, !signupAccessToken),
+            'Content-Profile': schema,
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify({
+            display_name: payload.displayName.slice(0, 60),
+            bio: (payload.bio || '').slice(0, 160),
+            avatar_url: safeAvatar,
+            cover_url: safeCover,
+            updated_at: new Date().toISOString(),
+          }),
+          signal: AbortSignal.timeout(5000),
+        }
+      ).catch(() => null);
+      if (patchRes?.ok) {
         tableSynced = true;
       } else {
-        // Trigger or duplicate id already inserted row; update safe profile fields
-        await fetch(
-          `${origin}/rest/v1/lumina_users?username=ilike.${encodeURIComponent(cleanHandle)}`,
-          {
-            method: 'PATCH',
-            headers: {
-              'Content-Type': 'application/json',
-              ...buildBrowserSupabaseHeaders(config.anonKey, signupAccessToken),
-              'Content-Profile': schema,
-              Prefer: 'return=minimal',
-            },
-            body: JSON.stringify({
-              display_name: payload.displayName.slice(0, 60),
-              bio: (payload.bio || '').slice(0, 160),
-              avatar_url: safeAvatar,
-              cover_url: safeCover,
-              updated_at: new Date().toISOString(),
-            }),
-            signal: AbortSignal.timeout(5000),
-          }
-        ).catch(() => {});
-        tableSynced = true;
+        lastRestError = await restRes.text().catch(() => `HTTP ${restRes.status}`);
       }
     } else {
       lastRestError = await restRes.text().catch(() => `HTTP ${restRes.status}`);
@@ -565,7 +606,7 @@ export async function signupRealUserInSupabaseFromBrowser(
         {
           method: 'GET',
           headers: {
-            ...buildBrowserSupabaseHeaders(config.anonKey),
+            ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
             'Accept-Profile': schema,
           },
           signal: AbortSignal.timeout(5000),
@@ -642,6 +683,13 @@ export async function syncUsersToSupabaseFromBrowser(
   let failed = 0;
   let lastError = '';
 
+  const sanitizeHandleForRls = (rawHandle: string, fallbackId: string): string => {
+    const cleaned = rawHandle.trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9._]/g, '').slice(0, 32);
+    if (cleaned.length >= 3) return cleaned;
+    const suffix = fallbackId.toLowerCase().replace(/[^a-z0-9._]/g, '').slice(0, 8) || 'user';
+    return `user.${suffix}`.slice(0, 32);
+  };
+
   const patchExistingUser = async (
     targetFilter: string,
     u: (typeof realUsers)[number]
@@ -661,7 +709,7 @@ export async function syncUsersToSupabaseFromBrowser(
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
-        ...buildBrowserSupabaseHeaders(config.anonKey),
+        ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
         'Content-Profile': schema,
         Prefer: 'return=minimal',
       },
@@ -677,7 +725,7 @@ export async function syncUsersToSupabaseFromBrowser(
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
-          ...buildBrowserSupabaseHeaders(config.anonKey),
+          ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
           'Content-Profile': schema,
           Prefer: 'return=minimal',
         },
@@ -691,12 +739,48 @@ export async function syncUsersToSupabaseFromBrowser(
   };
 
   for (const u of realUsers) {
-    const cleanHandle = u.username.trim().toLowerCase().replace(/^@/, '');
+    const cleanHandle = sanitizeHandleForRls(u.username || '', u.id);
     if (!cleanHandle) continue;
     try {
+      const authUidValue =
+        u.uid && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(u.uid.trim())
+          ? u.uid.trim()
+          : null;
+
+      // Pre-check if row already exists by id or username to avoid blind RETURNING *
+      let existingRowId: string | null = null;
+      const preCheck = await fetch(
+        `${origin}/rest/v1/lumina_users?select=id,username&or=(id.eq.${encodeURIComponent(u.id)},username.ilike.${encodeURIComponent(cleanHandle)})&limit=1`,
+        {
+          method: 'GET',
+          headers: {
+            ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
+            'Accept-Profile': schema,
+          },
+          signal: AbortSignal.timeout(5000),
+        }
+      ).catch(() => null);
+      if (preCheck?.ok) {
+        const preRows = (await preCheck.json().catch(() => [])) as Array<{ id?: string }>;
+        if (Array.isArray(preRows) && preRows.length > 0 && preRows[0]?.id) {
+          existingRowId = String(preRows[0].id);
+        }
+      }
+
+      if (existingRowId) {
+        const patchRes = await patchExistingUser(`id=eq.${encodeURIComponent(existingRowId)}`, u);
+        if (patchRes.ok) {
+          updated += 1;
+        } else {
+          failed += 1;
+          lastError = patchRes.err || 'Falha ao atualizar usuário existente';
+        }
+        continue;
+      }
+
       const coreInsert: Record<string, unknown> = {
         id: u.id,
-        auth_uid: u.uid || null,
+        auth_uid: authUidValue,
         username: cleanHandle,
         display_name: (u.displayName || cleanHandle).slice(0, 80),
         email: u.email ? u.email.trim().toLowerCase().slice(0, 140) : null,
@@ -719,9 +803,10 @@ export async function syncUsersToSupabaseFromBrowser(
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            ...buildBrowserSupabaseHeaders(config.anonKey),
+            ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
             'Content-Profile': schema,
-            Prefer: 'resolution=ignore-duplicates,return=representation',
+            // Never request return=representation: RETURNING * requires SELECT grant on every column (blocked on email)
+            Prefer: 'resolution=ignore-duplicates,return=minimal',
           },
           body: JSON.stringify(body),
           signal: AbortSignal.timeout(6000),
@@ -733,30 +818,14 @@ export async function syncUsersToSupabaseFromBrowser(
       }
 
       if (res.ok) {
-        const rows = (await res.json().catch(() => [])) as Array<{ id?: string }>;
-        if (Array.isArray(rows) && rows.length > 0) {
-          inserted += 1;
-        } else {
-          // Already existed by id or unique username: update allowed mutable profile columns
-          let patchRes = await patchExistingUser(`id=eq.${encodeURIComponent(u.id)}`, u);
-          if (!patchRes.ok) {
-            patchRes = await patchExistingUser(`username=ilike.${encodeURIComponent(cleanHandle)}`, u);
-          }
-          if (patchRes.ok) {
-            updated += 1;
-          } else {
-            failed += 1;
-            lastError = patchRes.err || 'Falha ao atualizar usuário existente';
-          }
-        }
+        inserted += 1;
       } else if (res.status === 409) {
-        // Unique constraint on username or auth_uid: merge into existing row
         const lookupRes = await fetch(
           `${origin}/rest/v1/lumina_users?select=id,username&username=ilike.${encodeURIComponent(cleanHandle)}&limit=1`,
           {
             method: 'GET',
             headers: {
-              ...buildBrowserSupabaseHeaders(config.anonKey),
+              ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
               'Accept-Profile': schema,
             },
             signal: AbortSignal.timeout(5000),
@@ -1033,7 +1102,7 @@ export async function fetchPublicUsersFromSupabaseBrowser(
       const res = await fetch(url, {
         method: 'GET',
         headers: {
-          ...buildBrowserSupabaseHeaders(config.anonKey),
+          ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
           'Accept-Profile': schema,
         },
         signal: AbortSignal.timeout(6000),
@@ -1077,7 +1146,7 @@ export async function fetchPublicUserByUsernameFromSupabaseBrowser(
           {
             method: 'GET',
             headers: {
-              ...buildBrowserSupabaseHeaders(config.anonKey),
+              ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
               'Accept-Profile': schema,
             },
             signal: AbortSignal.timeout(5000),
@@ -1280,7 +1349,7 @@ export async function fetchPublicPostsFromSupabaseBrowser(
       const res = await fetch(url, {
         method: 'GET',
         headers: {
-          ...buildBrowserSupabaseHeaders(config.anonKey),
+          ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
           'Accept-Profile': schema,
         },
         signal: AbortSignal.timeout(6000),
@@ -1475,7 +1544,7 @@ export async function fetchPublicStoriesFromSupabaseBrowser(
       {
         method: 'GET',
         headers: {
-          ...buildBrowserSupabaseHeaders(config.anonKey),
+          ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
           'Accept-Profile': schema,
         },
         signal: AbortSignal.timeout(5000),
