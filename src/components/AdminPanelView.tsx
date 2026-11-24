@@ -2146,9 +2146,25 @@ ${itemsXml}
               )}
 
               {authError && (
-                <p className="rounded-lg bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700 dark:bg-rose-950/40 dark:text-rose-300">
-                  {authError}
-                </p>
+                <div className="space-y-2.5 rounded-xl border border-rose-500/30 bg-rose-50 px-3.5 py-3 text-xs font-medium text-rose-700 dark:bg-rose-950/40 dark:text-rose-300">
+                  <p>{authError}</p>
+                  {!authStatus.serverAvailable && authStatus.claimed && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        clearStaticAdminPasscode();
+                        setAuthError(null);
+                        setPasscodeInput('');
+                        setConfirmInput('');
+                        setAuthStatus((prev) => ({ ...prev, claimed: false }));
+                        showToast('Senha local removida. Crie ou gere uma nova senha de ADM abaixo.');
+                      }}
+                      className="inline-flex h-9 w-full items-center justify-center rounded-lg bg-rose-600 px-3 text-xs font-semibold text-white hover:bg-rose-700"
+                    >
+                      Limpar senha antiga e redefinir neste navegador
+                    </button>
+                  )}
+                </div>
               )}
 
               <button
@@ -2290,9 +2306,20 @@ ${itemsXml}
                         setAuthStatus((prev) => ({ ...prev, claimed: false }));
                         showToast('Senha local limpa. Crie ou gere uma nova senha de ADM para este navegador.');
                       }}
-                      className="w-full text-center text-[11px] font-semibold text-sky-600 hover:underline dark:text-sky-400"
+                      className="h-9 w-full rounded-xl border border-sky-300 bg-sky-50 text-xs font-semibold text-sky-800 hover:bg-sky-100 dark:border-sky-800/70 dark:bg-sky-950/40 dark:text-sky-300 dark:hover:bg-sky-900/50"
                     >
-                      Esqueceu ou quer redefinir a senha de ADM neste navegador?
+                      Esqueci — redefinir senha de ADM neste navegador
+                    </button>
+                  )}
+
+                  {authStatus.serverAvailable && authStatus.claimed && !authStatus.envConfigured && (
+                    <button
+                      type="button"
+                      disabled={firebaseAdminLoading}
+                      onClick={() => void handleExclusiveGoogleAdminLogin()}
+                      className="h-9 w-full rounded-xl border border-zinc-200 bg-zinc-50 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                    >
+                      Esqueci a senha — entrar com Google ({ADMIN_EMAIL}) para redefinir
                     </button>
                   )}
                 </form>

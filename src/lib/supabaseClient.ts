@@ -1756,3 +1756,40 @@ export async function reactToDirectMessageInSupabaseBrowser(
     return false;
   }
 }
+
+export async function sendSupabasePasswordResetFromBrowser(
+  config: BrowserSupabaseConfig,
+  email: string
+): Promise<{ ok: boolean; error?: string }> {
+  const cleanEmail = email.trim().toLowerCase();
+  if (!cleanEmail.includes('@')) {
+    return { ok: false, error: 'Informe um e-mail válido para recuperação.' };
+  }
+  if (!config.anonKey || isServiceRoleOrSecretKey(config.anonKey)) {
+    return { ok: false, error: 'Chave pública do Supabase não configurada neste navegador.' };
+  }
+  try {
+    const origin = normalizeSupabaseOrigin(config.projectUrl);
+    const res = await fetch(`${origin}/auth/v1/recover`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: config.anonKey,
+      },
+      body: JSON.stringify({ email: cleanEmail }),
+      signal: AbortSignal.timeout(7000),
+    });
+    if (res.ok) return { ok: true };
+    const errBody = (await res.json().catch(() => ({}))) as {
+      msg?: string;
+      error_description?: string;
+      message?: string;
+    };
+    return {
+      ok: false,
+      error: errBody.msg || errBody.error_description || errBody.message || `HTTP ${res.status}`,
+    };
+  } catch {
+    return { ok: false, error: 'Não foi possível contatar o servidor de recuperação.' };
+  }
+}

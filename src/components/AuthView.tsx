@@ -12,8 +12,14 @@ import {
   Sun,
   UserPlus,
 } from 'lucide-react';
+import { sendPasswordResetEmail } from 'firebase/auth';
 import React, { useMemo, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
+import { ADMIN_EMAIL, auth } from '../lib/firebase';
+import {
+  getBrowserSupabaseConfig,
+  sendSupabasePasswordResetFromBrowser,
+} from '../lib/supabaseClient';
 import { AvatarRing } from './AvatarRing';
 
 export function AuthView() {
@@ -86,6 +92,43 @@ export function AuthView() {
     setPassword('');
     setHint(`Digite a senha cadastrada para @${username} para entrar.`);
     window.setTimeout(() => passwordInputRef.current?.focus(), 40);
+  };
+
+  const handleForgotPassword = async () => {
+    setError(null);
+    setHint(null);
+    const cleanId = identifier.trim().toLowerCase();
+    const cleanHandle = cleanId.replace(/^@/, '');
+    if (cleanId === ADMIN_EMAIL.toLowerCase() || cleanHandle === 'dadaniel14hiphop') {
+      setActiveNav('admin');
+      showToast('Use o botão "Esqueci — redefinir senha de ADM neste navegador" ou entre com Google.');
+      return;
+    }
+    if (!cleanId.includes('@')) {
+      setError('Digite seu e-mail cadastrado acima e clique em "Esqueci minha senha".');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const sbConfig = getBrowserSupabaseConfig();
+      const sbRes = sbConfig.anonKey
+        ? await sendSupabasePasswordResetFromBrowser(sbConfig, cleanId)
+        : { ok: false };
+      let fbOk = false;
+      try {
+        await sendPasswordResetEmail(auth, cleanId);
+        fbOk = true;
+      } catch {
+        // Ignore if Firebase Email/Password is not enabled or user not in Firebase
+      }
+      if (sbRes.ok || fbOk) {
+        setHint(`Enviamos um link de redefinição de senha para ${cleanId}. Verifique sua caixa de entrada e spam.`);
+      } else {
+        setError(sbRes.error || 'Não foi possível enviar o e-mail de redefinição para este endereço.');
+      }
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -218,9 +261,19 @@ export function AuthView() {
             </label>
 
             <label className="block space-y-1.5">
-              <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
-                Senha de acesso
-              </span>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Senha de acesso
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void handleForgotPassword()}
+                  disabled={submitting}
+                  className="text-[11px] font-semibold text-sky-600 hover:underline disabled:opacity-50 dark:text-sky-400"
+                >
+                  Esqueci minha senha
+                </button>
+              </div>
               <div className="flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3.5 dark:border-zinc-800 dark:bg-zinc-900">
                 <Lock className="h-4 w-4 shrink-0 text-zinc-400" />
                 <input
