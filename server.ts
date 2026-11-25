@@ -20,6 +20,9 @@ import {
   isSafeS3ObjectKey,
   resolveAwsS3Config,
   resolveReelPlaybackUrl,
+  sanitizeAwsRegion,
+  sanitizeCloudFrontDomain,
+  sanitizeS3Bucket,
   uploadReelToS3,
 } from './server/s3Service.ts';
 import { normalizeVideoFileForWeb } from './server/videoTranscoder.ts';
@@ -2359,8 +2362,58 @@ async function startServer() {
     const state = readAdminState();
 
     if (provider === 'aws') {
+      const awsInput =
+        req.body?.aws && typeof req.body.aws === 'object'
+          ? (req.body.aws as Record<string, unknown>)
+          : null;
+
+      if (awsInput && typeof awsInput.region === 'string' && awsInput.region.trim()) {
+        if (sanitizeAwsRegion(awsInput.region, '__INVALID__') === '__INVALID__') {
+          res.status(400).json({
+            ok: false,
+            error: 'Região AWS inválida (ex.: sa-east-1, us-east-1).',
+          });
+          return;
+        }
+      }
+      if (awsInput && typeof awsInput.bucket === 'string' && awsInput.bucket.trim()) {
+        if (sanitizeS3Bucket(awsInput.bucket, '__INVALID__') === '__INVALID__') {
+          res.status(400).json({
+            ok: false,
+            error:
+              'Nome do bucket S3 inválido. Use 3 a 63 caracteres minúsculos, números, pontos ou hífens.',
+          });
+          return;
+        }
+      }
+
+      const effectiveState: IntegrationState = awsInput
+        ? {
+            ...state,
+            aws: {
+              ...state.aws,
+              region:
+                typeof awsInput.region === 'string'
+                  ? sanitizeAwsRegion(awsInput.region, state.aws.region)
+                  : state.aws.region,
+              bucket:
+                typeof awsInput.bucket === 'string'
+                  ? sanitizeS3Bucket(awsInput.bucket, state.aws.bucket)
+                  : state.aws.bucket,
+              cloudFrontDomain:
+                typeof awsInput.cloudFrontDomain === 'string'
+                  ? sanitizeCloudFrontDomain(awsInput.cloudFrontDomain)
+                  : state.aws.cloudFrontDomain,
+              cloudFrontEnabled:
+                typeof awsInput.cloudFrontEnabled === 'boolean'
+                  ? awsInput.cloudFrontEnabled
+                  : state.aws.cloudFrontEnabled,
+            },
+          }
+        : state;
+
       const awsCreds = getAwsCredentialsFromEnv();
-      const target = resolveAwsMediaTarget(state);
+      const target = resolveAwsMediaTarget(effectiveState);
       state.aws.lastVerifiedAt = Date.now();
       writeAdminState(state);
 
@@ -2368,7 +2421,7 @@ async function startServer() {
         res.json({
           ok: true,
           reachable: false,
-          statusLabel: `Modo local ativo (${target.region} · s3://${target.bucket}). Defina AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY nos Segredos do servidor para hospedar vídeos diretamente na Amazon S3.`,
+          statusLabel: `Servidor conectado, mas as chaves AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY não estão nos Segredos do servidor (${target.region} · s3://${target.bucket}). Modo local de disco permanece ativo.`,
         });
         return;
       }

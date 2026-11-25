@@ -386,49 +386,63 @@ export function AdminPanelView() {
   const [downloadingCode, setDownloadingCode] = useState(false);
   const updateFileRef = useRef<HTMLInputElement | null>(null);
 
+  const probeServerAuth = async (): Promise<{
+    serverAvailable: boolean;
+    claimed: boolean;
+    envConfigured: boolean;
+  }> => {
+    try {
+      const res = await fetch('/api/admin/auth/status', { cache: 'no-store' });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) {
+        throw new Error('Backend indisponível');
+      }
+      const data = (await res.json()) as { claimed?: boolean; envConfigured?: boolean };
+      if (typeof data.claimed !== 'boolean') {
+        throw new Error('Resposta inválida');
+      }
+      const next = {
+        loading: false,
+        claimed: data.claimed,
+        envConfigured: Boolean(data.envConfigured),
+        serverAvailable: true,
+      };
+      setAuthStatus(next);
+      return next;
+    } catch {
+      const next = {
+        loading: false,
+        claimed: hasStaticAdminPasscode(),
+        envConfigured: false,
+        serverAvailable: false,
+      };
+      setAuthStatus(next);
+      return next;
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     const detectServerAuth = async () => {
-      try {
-        const res = await fetch('/api/admin/auth/status');
-        const contentType = res.headers.get('content-type') || '';
-        if (!res.ok || !contentType.includes('application/json')) {
-          throw new Error('Backend indisponível');
-        }
-        const data = (await res.json()) as { claimed?: boolean; envConfigured?: boolean };
-        if (typeof data.claimed !== 'boolean') {
-          throw new Error('Resposta inválida');
-        }
-        if (!cancelled) {
-          setAuthStatus({
-            loading: false,
-            claimed: data.claimed,
-            envConfigured: Boolean(data.envConfigured),
-            serverAvailable: true,
-          });
-        }
-      } catch {
-        // Static / SPA hosting fallback: support both Google Admin & PBKDF2 local ADM passcode
-        if (!cancelled) {
-          setAuthStatus({
-            loading: false,
-            claimed: hasStaticAdminPasscode(),
-            envConfigured: false,
-            serverAvailable: false,
-          });
-        }
-      }
+      const status = await probeServerAuth();
+      if (cancelled) return;
+      setAuthStatus({ loading: false, ...status });
     };
-    detectServerAuth();
+    void detectServerAuth();
     return () => {
       cancelled = true;
     };
   }, []);
 
-  const authFetch = async (url: string, init?: RequestInit) => {
+  const authFetch = async (
+    url: string,
+    init?: RequestInit,
+    tokenOverride?: string | null
+  ) => {
+    const activeToken = tokenOverride ?? adminToken;
     const headers = new Headers(init?.headers || {});
-    if (adminToken) {
-      headers.set('Authorization', `Bearer ${adminToken}`);
+    if (activeToken) {
+      headers.set('Authorization', `Bearer ${activeToken}`);
     }
     if (init?.body && !headers.has('Content-Type')) {
       headers.set('Content-Type', 'application/json');
@@ -436,7 +450,8 @@ export function AdminPanelView() {
     const res = await fetch(url, { ...init, headers });
     if (res.status === 401) {
       setAdminToken(null);
-      setAuthError('Sessão expirada. Entre novamente.');
+      setAdminMemoryToken(null);
+      setAuthError('Sessão expirada ou apenas local. Entre novamente para conectar ao servidor.');
     }
     return res;
   };
@@ -510,21 +525,25 @@ export function AdminPanelView() {
     }
   };
 
+  const isLocalOnlyAdminToken = (token: string | null | undefined) =>
+    !token || token === 'static_admin_local' || token.startsWith('firebase_admin_');
+
   const authenticateExclusiveAdminWithFirebase = async (
-    userOverride = firebaseUser
-  ): Promise<boolean> => {
+    userOverride = firebaseUser,
+    forceServer = false
+  ): Promise<string | null> => {
     if (!userOverride || !isExclusiveAdminUser(userOverride)) {
-      return false;
+      return null;
     }
     setAuthError(null);
     setFirebaseAdminLoading(true);
     try {
-      if (!authStatus.serverAvailable) {
+      if (!forceServer && !authStatus.serverAvailable) {
         const staticFbToken = `firebase_admin_${userOverride.uid}`;
         setAdminToken(staticFbToken);
         setAdminMemoryToken(staticFbToken);
         loadLocalOverview();
-        return true;
+        return staticFbToken;
       }
 
       const idToken = await userOverride.getIdToken();
@@ -542,28 +561,56 @@ export function AdminPanelView() {
         setAdminToken(staticFbToken);
         setAdminMemoryToken(staticFbToken);
         loadLocalOverview();
-        return true;
+        return staticFbToken;
       }
       const data = (await res.json()) as { token?: string; error?: string };
       if (!res.ok || !data.token) {
         setAuthError(data.error || 'Acesso administrativo negado.');
-        return false;
+        return null;
       }
+      setAuthStatus((prev) => ({ ...prev, serverAvailable: true }));
       setAdminToken(data.token);
       setAdminMemoryToken(data.token);
       await loadOverview(data.token, true);
-      return true;
+      return data.token;
     } catch {
       setAuthError('Não foi possível validar a sessão administrativa.');
-      return false;
+      return null;
     } finally {
       setFirebaseAdminLoading(false);
     }
   };
 
+  const ensureServerAdminToken = async (): Promise<string | null> => {
+    if (!isLocalOnlyAdminToken(adminToken)) {
+      return adminToken;
+    }
+    if (isExclusiveAdminUser(firebaseUser)) {
+      const upgraded = await authenticateExclusiveAdminWithFirebase(firebaseUser, true);
+      if (upgraded && !isLocalOnlyAdminToken(upgraded)) {
+        return upgraded;
+      }
+    }
+    setAdminToken(null);
+    setAdminMemoryToken(null);
+    setAuthError(
+      'Sessão local detectada. Confirme sua senha administrativa ou entre com Google Admin para autenticar no servidor.'
+    );
+    showToast('Autentique-se no painel administrativo para testar no servidor');
+    return null;
+  };
+
   // Sync admin token if authenticated from AuthView or active exclusive Google Admin session
   useEffect(() => {
     if (authStatus.loading || manualLock) return;
+    if (
+      authStatus.serverAvailable &&
+      isExclusiveAdminUser(firebaseUser) &&
+      isLocalOnlyAdminToken(adminToken)
+    ) {
+      void authenticateExclusiveAdminWithFirebase(firebaseUser, true);
+      return;
+    }
     if (!adminToken && adminMemoryToken) {
       setAdminToken(adminMemoryToken);
       void loadOverview(adminMemoryToken, authStatus.serverAvailable);
@@ -997,7 +1044,11 @@ export function AdminPanelView() {
       });
     }
 
-    if (!authStatus.serverAvailable) {
+    const serverLive = authStatus.serverAvailable
+      ? true
+      : (await probeServerAuth()).serverAvailable;
+
+    if (!serverLive) {
       setOverview((prev) => {
         if (!prev) return prev;
         const nextAnon = (
@@ -1033,7 +1084,18 @@ export function AdminPanelView() {
       });
       await refreshSiteMeta();
       void refreshPublicUsersFromSupabase();
-      showToast('Configurações do Supabase salvas neste domínio');
+      showToast(
+        normalizedPatch.aws
+          ? 'Configurações da AWS salvas localmente neste domínio'
+          : normalizedPatch.wordpress
+          ? 'Configurações do WordPress salvas localmente neste domínio'
+          : 'Configurações do Supabase salvas neste domínio'
+      );
+      return;
+    }
+
+    const serverToken = await ensureServerAdminToken();
+    if (!serverToken) {
       return;
     }
 
@@ -1054,10 +1116,14 @@ export function AdminPanelView() {
         }
       : normalizedPatch;
 
-    const res = await authFetch('/api/admin/integrations', {
-      method: 'PUT',
-      body: JSON.stringify(serverPatch),
-    });
+    const res = await authFetch(
+      '/api/admin/integrations',
+      {
+        method: 'PUT',
+        body: JSON.stringify(serverPatch),
+      },
+      serverToken
+    );
     if (res.ok) {
       const data = (await res.json()) as { state: ServerOverview['state'] };
       setOverview((prev) => {
@@ -1096,7 +1162,11 @@ export function AdminPanelView() {
     provider: 'aws' | 'supabase' | 'wordpress',
     url?: string
   ) => {
-    if (!authStatus.serverAvailable) {
+    const serverLive = authStatus.serverAvailable
+      ? true
+      : (await probeServerAuth()).serverAvailable;
+
+    if (!serverLive) {
       if (provider === 'supabase') {
         const candidateAnon = (overview?.state.supabase.anonKey || '').trim();
         if (candidateAnon && isServiceRoleOrSecretKey(candidateAnon)) {
@@ -1171,11 +1241,30 @@ export function AdminPanelView() {
         return;
       }
 
+      if (provider === 'aws') {
+        const rawRegion = (overview?.state.aws.region || 'sa-east-1').trim();
+        const rawBucket = (overview?.state.aws.bucket || 'lumina-media-prod').trim().toLowerCase();
+        const validBucket =
+          rawBucket.length >= 3 &&
+          rawBucket.length <= 63 &&
+          /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(rawBucket) &&
+          !rawBucket.includes('..');
+        const msg = !validBucket
+          ? `Nome de bucket S3 inválido ("${rawBucket}"). Use 3 a 63 caracteres minúsculos, números, pontos ou hífens.`
+          : `Configuração S3 validada localmente (${rawRegion} · s3://${rawBucket}), mas o servidor Node.js (/api) não está respondendo neste endereço. Execute o app com servidor ativo (npm start) e defina AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY nos Segredos para testar a conexão real.`;
+        setAwsTestStatus(msg);
+        showToast(
+          validBucket
+            ? 'Servidor Node (/api) indisponível neste endereço — requer npm start para testar AWS S3'
+            : 'Nome de bucket S3 inválido'
+        );
+        return;
+      }
+
       const msg =
-        'Teste de rede via proxy exige o servidor Node.js ativo (npm start). Em hospedagem estática, exporte os arquivos SQL/IAM/Kit WP normalmente.';
-      if (provider === 'aws') setAwsTestStatus(msg);
-      if (provider === 'wordpress') setWpTestStatus(msg);
-      showToast('Modo estático: use os exportadores locais');
+        'Teste de rede via proxy exige o servidor Node.js ativo (npm start). Em hospedagem estática, exporte o Kit WP normalmente.';
+      setWpTestStatus(msg);
+      showToast('Servidor Node (/api) indisponível neste endereço');
       return;
     }
 
@@ -1191,31 +1280,65 @@ export function AdminPanelView() {
         return;
       }
 
-      const res = await authFetch('/api/admin/integrations/test', {
-        method: 'POST',
-        body: JSON.stringify({ provider, url, anonKey: candidateAnon }),
-      });
-      const data = (await res.json()) as {
+      const serverToken = await ensureServerAdminToken();
+      if (!serverToken) {
+        return;
+      }
+
+      const res = await authFetch(
+        '/api/admin/integrations/test',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            provider,
+            url,
+            anonKey: candidateAnon,
+            aws: provider === 'aws' ? overview?.state.aws : undefined,
+          }),
+        },
+        serverToken
+      );
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        setAuthStatus((prev) => ({ ...prev, serverAvailable: false }));
+        const fallbackMsg =
+          'O endpoint /api não respondeu JSON neste endereço. Confirme que o servidor Node.js (npm start) está ativo.';
+        if (provider === 'aws') setAwsTestStatus(fallbackMsg);
+        if (provider === 'supabase') setSupabaseTestStatus(fallbackMsg);
+        if (provider === 'wordpress') setWpTestStatus(fallbackMsg);
+        showToast('Servidor /api indisponível neste endereço');
+        return;
+      }
+      const data = (await res.json().catch(() => ({}))) as {
         ok?: boolean;
+        reachable?: boolean;
         statusLabel?: string;
         error?: string;
         posts?: WordPressPostPreview[];
       };
       if (!res.ok) {
         const msg = data.error || 'Falha no teste de conexão';
+        if (provider === 'aws') setAwsTestStatus(msg);
         if (provider === 'supabase') setSupabaseTestStatus(msg);
         if (provider === 'wordpress') setWpTestStatus(msg);
         showToast(msg);
         return;
       }
-      if (provider === 'aws') setAwsTestStatus(data.statusLabel || 'Conectado');
+      if (provider === 'aws') {
+        setAwsTestStatus(data.statusLabel || 'Conectado');
+        showToast(
+          data.reachable
+            ? 'Amazon S3 conectado!'
+            : 'Verificação AWS concluída — confira os detalhes no card'
+        );
+      }
       if (provider === 'supabase') setSupabaseTestStatus(data.statusLabel || 'Conectado');
       if (provider === 'wordpress') {
         setWpTestStatus(data.statusLabel || 'Conectado');
         if (Array.isArray(data.posts)) setWpSyncedPosts(data.posts);
       }
       await refreshSiteMeta();
-      await loadOverview();
+      await loadOverview(serverToken, true);
     } finally {
       setTestingKey(null);
     }
