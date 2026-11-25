@@ -240,7 +240,7 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
       </aside>
 
       {/* Mobile Compact Top Header (<= 52px) */}
-      <header className="sticky top-0 z-30 flex h-13 items-center justify-between border-b border-zinc-200 bg-white/95 px-4 backdrop-blur-md dark:border-zinc-800/80 dark:bg-[#050505]/95 lg:hidden">
+      <header className="sticky top-0 z-30 flex h-13 shrink-0 items-center justify-between border-b border-zinc-200 bg-white/95 px-4 backdrop-blur-md dark:border-zinc-800/80 dark:bg-[#050505]/95 lg:hidden">
         <button
           type="button"
           onClick={() => setActiveNav('feed')}

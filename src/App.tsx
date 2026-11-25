@@ -2,6 +2,7 @@ import { AlertTriangle, Shield } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { AdminPanelView } from './components/AdminPanelView';
 import { AuthView } from './components/AuthView';
+import { CallOverlay } from './components/CallOverlay';
 import { CreateModal } from './components/CreateModal';
 import { ExploreView } from './components/ExploreView';
 import { InviteRegisterModal } from './components/InviteRegisterModal';
@@ -153,12 +154,20 @@ function LuminaShell() {
     );
   }
 
+  const isMessagesView = activeNav === 'messages';
+
   return (
-    <div className="min-h-screen bg-zinc-50/40 pb-16 text-zinc-950 dark:bg-[#050505] dark:text-zinc-100 lg:pb-0 lg:pl-20 xl:pl-64">
+    <div
+      className={`bg-zinc-50/40 text-zinc-950 dark:bg-[#050505] dark:text-zinc-100 lg:pl-20 xl:pl-64 ${
+        isMessagesView
+          ? 'flex h-[100dvh] flex-col overflow-hidden pb-14 lg:block lg:h-auto lg:min-h-screen lg:overflow-visible lg:pb-0'
+          : 'min-h-screen pb-16 lg:pb-0'
+      }`}
+    >
       <Navigation onOpenCreate={() => openCreateWithMode('post')} />
 
       {siteMeta.announcementBanner.trim().length > 0 && (
-        <div className="border-b border-zinc-200 bg-white px-4 py-2 text-center text-xs font-medium text-zinc-700 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300">
+        <div className="shrink-0 border-b border-zinc-200 bg-white px-4 py-2 text-center text-xs font-medium text-zinc-700 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300">
           <span>{siteMeta.announcementBanner}</span>
           <span className="mx-2 text-zinc-400" aria-hidden="true">·</span>
           <span className="font-mono text-[11px] text-zinc-500">v{siteMeta.version}</span>
@@ -166,7 +175,7 @@ function LuminaShell() {
       )}
 
       {siteMeta.maintenanceMode && activeNav !== 'admin' && (
-        <div className="border-b border-amber-200 bg-amber-50 px-4 py-2.5 dark:border-amber-900/50 dark:bg-amber-950/30">
+        <div className="shrink-0 border-b border-amber-200 bg-amber-50 px-4 py-2.5 dark:border-amber-900/50 dark:bg-amber-950/30">
           <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-2 text-xs text-amber-900 dark:text-amber-200">
             <div className="flex items-center gap-2">
               <AlertTriangle className="h-4 w-4 shrink-0" />
@@ -188,7 +197,7 @@ function LuminaShell() {
         </div>
       )}
 
-      <main className="min-h-screen">
+      <main className={isMessagesView ? 'min-h-0 flex-1 overflow-hidden lg:min-h-screen lg:overflow-visible' : 'min-h-screen'}>
         {activeNav === 'feed' && (
           <FeedStage onAddStory={() => openCreateWithMode('story')} />
         )}
@@ -200,7 +209,8 @@ function LuminaShell() {
         {activeNav === 'admin' && <AdminPanelView />}
       </main>
 
-      {/* Modals */}
+      {/* Modals & Real-time Call Overlay */}
+      <CallOverlay />
       <StoryViewer />
       <PostDetailModal />
       <ShareSheetModal />

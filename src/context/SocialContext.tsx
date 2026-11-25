@@ -64,6 +64,16 @@ import {
   upsertCachedProfiles,
 } from '../lib/userProfileCache';
 import {
+  connectRealtimeSocket,
+  createCallPeerConnection,
+  type RealtimeSocketHandle,
+  startCallRingtone,
+  stopCallRingtone,
+} from '../lib/realtimeCalls';
+import {
+  ActiveCallSession,
+  CallSignalPayload,
+  CallType,
   DirectThread,
   InviteRecord,
   NavSection,
@@ -109,7 +119,50 @@ const CREDENTIALS_KEY = 'lumina_user_credentials_v1';
 const ADMIN_USER_FLAGS_KEY = 'lumina_admin_user_flags_v1';
 const THREAD_READ_WATERMARK_KEY = 'lumina_thread_read_v1';
 const NOTIF_READ_IDS_KEY = 'lumina_notif_read_ids_v1';
+const CHAT_PREFS_KEY = 'lumina_chat_prefs_v1';
 const REALTIME_CHANNEL = 'lumina_realtime_sync_v1';
+
+interface ChatPrefsStore {
+  blockedByUser: Record<string, string[]>;
+  mutedByUser: Record<string, string[]>;
+  pinnedByUser: Record<string, string[]>;
+}
+
+function loadChatPrefs(): ChatPrefsStore {
+  try {
+    const raw = localStorage.getItem(CHAT_PREFS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<ChatPrefsStore>;
+      if (parsed && typeof parsed === 'object') {
+        return {
+          blockedByUser:
+            parsed.blockedByUser && typeof parsed.blockedByUser === 'object'
+              ? parsed.blockedByUser
+              : {},
+          mutedByUser:
+            parsed.mutedByUser && typeof parsed.mutedByUser === 'object'
+              ? parsed.mutedByUser
+              : {},
+          pinnedByUser:
+            parsed.pinnedByUser && typeof parsed.pinnedByUser === 'object'
+              ? parsed.pinnedByUser
+              : {},
+        };
+      }
+    }
+  } catch {
+    // Ignore storage read error
+  }
+  return { blockedByUser: {}, mutedByUser: {}, pinnedByUser: {} };
+}
+
+function saveChatPrefs(prefs: ChatPrefsStore): void {
+  try {
+    localStorage.setItem(CHAT_PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    // Ignore storage quota error
+  }
+}
 
 function loadThreadReadWatermarks(): Record<string, number> {
   try {
@@ -607,12 +660,44 @@ interface SocialContextValue {
       replyToId?: string;
       replyToSenderId?: string;
       replyToText?: string;
+      isCallLog?: boolean;
+      callType?: CallType;
+      callStatus?: 'completed' | 'missed' | 'rejected';
+      callDurationSec?: number;
     }
   ) => void;
   markThreadRead: (threadId: string) => void;
   reactToMessage: (threadId: string, messageId: string, emoji: string) => void;
   typingByUserId: Record<string, number>;
   setTypingStatus: (recipientId: string, isTyping: boolean, threadId?: string) => void;
+
+  // Chat advanced options & blocking
+  blockedUserIds: string[];
+  mutedThreadIds: string[];
+  pinnedThreadIds: string[];
+  isUserBlocked: (userId: string) => boolean;
+  blockUser: (userId: string) => void;
+  unblockUser: (userId: string) => void;
+  toggleMuteThread: (threadId: string) => void;
+  togglePinThread: (threadId: string) => void;
+  clearThreadMessages: (threadId: string) => void;
+  deleteThread: (threadId: string) => void;
+
+  // Real-time WebRTC audio & video calls
+  activeCall: ActiveCallSession | null;
+  localCallStream: MediaStream | null;
+  remoteCallStream: MediaStream | null;
+  isCallMicMuted: boolean;
+  isCallCameraOff: boolean;
+  callFacingMode: 'user' | 'environment';
+  startCall: (peerId: string, callType: CallType) => Promise<void>;
+  acceptIncomingCall: () => Promise<void>;
+  rejectIncomingCall: () => void;
+  endActiveCall: (reasonStatus?: 'completed' | 'missed' | 'rejected') => void;
+  toggleCallMic: () => void;
+  toggleCallCamera: () => Promise<void>;
+  switchCallCamera: () => Promise<void>;
+  toggleMinimizeCall: () => void;
 
   markNotificationsRead: () => void;
   addRecentSearch: (term: string) => void;
@@ -946,6 +1031,32 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const readNotifIdsRef = useRef<Set<string>>(loadReadNotifIds());
   const [typingByUserId, setTypingByUserId] = useState<Record<string, number>>({});
   const lastTypingEmitRef = useRef<Record<string, number>>({});
+  const [chatPrefs, setChatPrefs] = useState<ChatPrefsStore>(loadChatPrefs);
+  const chatPrefsRef = useRef(chatPrefs);
+  chatPrefsRef.current = chatPrefs;
+
+  // WebSocket + WebRTC Call refs & states
+  const wsHandleRef = useRef<RealtimeSocketHandle | null>(null);
+  const wsConnectedRef = useRef(false);
+  const pullMessagesNowRef = useRef<(() => Promise<void>) | null>(null);
+  const handleCallSignalRef = useRef<((sig: CallSignalPayload) => void) | null>(null);
+  const seenCallSignalsRef = useRef<Set<string>>(new Set());
+
+  const [activeCall, setActiveCall] = useState<ActiveCallSession | null>(null);
+  const activeCallRef = useRef<ActiveCallSession | null>(null);
+  activeCallRef.current = activeCall;
+  const [localCallStream, setLocalCallStream] = useState<MediaStream | null>(null);
+  const localCallStreamRef = useRef<MediaStream | null>(null);
+  localCallStreamRef.current = localCallStream;
+  const [remoteCallStream, setRemoteCallStream] = useState<MediaStream | null>(null);
+  const [isCallMicMuted, setIsCallMicMuted] = useState(false);
+  const [isCallCameraOff, setIsCallCameraOff] = useState(false);
+  const [callFacingMode, setCallFacingMode] = useState<'user' | 'environment'>('user');
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const pendingIncomingOfferRef = useRef<CallSignalPayload | null>(null);
+  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const callRingTimeoutRef = useRef<number | null>(null);
+
   const currentUserIdRef = useRef(state.currentUserId);
   currentUserIdRef.current = state.currentUserId;
 
@@ -1983,15 +2094,123 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       });
     };
 
+    pullMessagesNowRef.current = pullMessagesAndTyping;
     void pullMessagesAndTyping();
     const timer = window.setInterval(() => {
       void pullMessagesAndTyping();
     }, intervalMs);
     return () => {
       active = false;
+      pullMessagesNowRef.current = null;
       window.clearInterval(timer);
     };
   }, [activeNav, state.isAuthenticated, state.currentUserId, serverSyncAvailable, runtimeConfigVersion]);
+
+  // Real-time WebSocket signaling + HTTP polling fallback for instant DM & WebRTC Calls
+  useEffect(() => {
+    if (!state.isAuthenticated) {
+      wsHandleRef.current?.close();
+      wsHandleRef.current = null;
+      wsConnectedRef.current = false;
+      return;
+    }
+    const activeUser = usersRef.current.find((u) => u.id === currentUserIdRef.current);
+    if (!activeUser || activeUser.isDemoSeed) {
+      wsHandleRef.current?.close();
+      wsHandleRef.current = null;
+      wsConnectedRef.current = false;
+      return;
+    }
+    const activeIds = Array.from(new Set([activeUser.id, activeUser.uid || ''].filter(Boolean)));
+    if (activeIds.length === 0) return;
+
+    let active = true;
+    const handle = connectRealtimeSocket(
+      activeIds,
+      (event) => {
+        if (!active) return;
+        if (event.type === 'call_signal' && event.signal) {
+          handleCallSignalRef.current?.(event.signal);
+        } else if (event.type === 'chat_message' || event.type === 'chat_read') {
+          void pullMessagesNowRef.current?.();
+        } else if (event.type === 'chat_typing' && event.fromUserId) {
+          setTypingByUserId((prev) => {
+            const next = { ...prev };
+            if (event.isTyping) {
+              next[event.fromUserId] = Date.now();
+            } else {
+              delete next[event.fromUserId];
+            }
+            return next;
+          });
+        }
+      },
+      (connected) => {
+        wsConnectedRef.current = connected;
+      }
+    );
+    wsHandleRef.current = handle;
+
+    // Pull server-persisted blocked list for current user
+    void (async () => {
+      try {
+        const res = await fetch(
+          `/api/social/blocks?userId=${encodeURIComponent(activeUser.id)}`
+        );
+        if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+          const data = (await res.json()) as { ok?: boolean; blockedIds?: string[] };
+          if (active && data.ok && Array.isArray(data.blockedIds)) {
+            setChatPrefs((prev) => {
+              const existing = prev.blockedByUser[activeUser.id] || [];
+              const merged = Array.from(new Set([...existing, ...data.blockedIds!]));
+              const nextStore = {
+                ...prev,
+                blockedByUser: { ...prev.blockedByUser, [activeUser.id]: merged },
+              };
+              saveChatPrefs(nextStore);
+              return nextStore;
+            });
+          }
+        }
+      } catch {
+        // Ignore on static hosting
+      }
+    })();
+
+    // HTTP REST polling fallback for call signals when WS is unavailable or ringing
+    const pollCallSignals = async () => {
+      if (!active) return;
+      if (wsConnectedRef.current && !activeCallRef.current) return;
+      try {
+        const res = await fetch(
+          `/api/social/calls/poll?userIds=${encodeURIComponent(activeIds.join(','))}`
+        );
+        if (!res.ok || !res.headers.get('content-type')?.includes('application/json')) return;
+        const data = (await res.json()) as { ok?: boolean; signals?: CallSignalPayload[] };
+        if (active && data.ok && Array.isArray(data.signals)) {
+          for (const sig of data.signals) {
+            handleCallSignalRef.current?.(sig);
+          }
+        }
+      } catch {
+        // Ignore on static hosting
+      }
+    };
+
+    const callPollTimer = window.setInterval(() => {
+      void pollCallSignals();
+    }, 1800);
+
+    return () => {
+      active = false;
+      window.clearInterval(callPollTimer);
+      handle.close();
+      if (wsHandleRef.current === handle) {
+        wsHandleRef.current = null;
+      }
+      wsConnectedRef.current = false;
+    };
+  }, [state.isAuthenticated, state.currentUserId, runtimeConfigVersion]);
 
   // Cross-tab real-time synchronization for real user messages, posts, and profiles
   useEffect(() => {
@@ -2013,8 +2232,13 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           fromUid?: string;
           toUserId?: string;
           isTyping?: boolean;
+          signal?: CallSignalPayload;
         };
         if (!payload || payload.senderTabId === tabIdRef.current) return;
+        if (payload.type === 'call_signal' && payload.signal) {
+          handleCallSignalRef.current?.(payload.signal);
+          return;
+        }
         if (payload.type === 'typing_sync' && payload.fromUserId) {
           const me = usersRef.current.find((u) => u.id === currentUserIdRef.current);
           const myIds = new Set([currentUserIdRef.current, me?.uid || ''].filter(Boolean));
@@ -4137,6 +4361,196 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   };
 
   // Direct messages for real users (cross-device via Node server + Supabase + Firestore)
+  const blockedUserIds = useMemo(() => {
+    const raw = chatPrefs.blockedByUser[currentUser.id] || [];
+    const uidRaw = currentUser.uid ? chatPrefs.blockedByUser[currentUser.uid] || [] : [];
+    return Array.from(new Set([...raw, ...uidRaw]));
+  }, [chatPrefs.blockedByUser, currentUser.id, currentUser.uid]);
+
+  const mutedThreadIds = useMemo(() => {
+    const raw = chatPrefs.mutedByUser[currentUser.id] || [];
+    const uidRaw = currentUser.uid ? chatPrefs.mutedByUser[currentUser.uid] || [] : [];
+    return Array.from(new Set([...raw, ...uidRaw]));
+  }, [chatPrefs.mutedByUser, currentUser.id, currentUser.uid]);
+
+  const pinnedThreadIds = useMemo(() => {
+    const raw = chatPrefs.pinnedByUser[currentUser.id] || [];
+    const uidRaw = currentUser.uid ? chatPrefs.pinnedByUser[currentUser.uid] || [] : [];
+    return Array.from(new Set([...raw, ...uidRaw]));
+  }, [chatPrefs.pinnedByUser, currentUser.id, currentUser.uid]);
+
+  const isUserBlocked = (userId: string): boolean => {
+    if (!userId) return false;
+    const target = getUserById(userId);
+    const candidates = [userId, target?.id || '', target?.uid || ''].filter(Boolean);
+    return candidates.some((id) => blockedUserIds.includes(id));
+  };
+
+  const blockUser = (userId: string) => {
+    if (!requireAuthForAction()) return;
+    const target = getUserById(userId);
+    const canonicalId = target?.id || userId;
+    if (!canonicalId || canonicalId === currentUser.id) return;
+
+    let nextBlockedForMe: string[] = [];
+    setChatPrefs((prev) => {
+      const existing = prev.blockedByUser[currentUser.id] || [];
+      nextBlockedForMe = Array.from(new Set([...existing, canonicalId]));
+      const nextStore: ChatPrefsStore = {
+        ...prev,
+        blockedByUser: {
+          ...prev.blockedByUser,
+          [currentUser.id]: nextBlockedForMe,
+        },
+      };
+      saveChatPrefs(nextStore);
+      return nextStore;
+    });
+
+    // Clear unread badge for conversations with blocked user
+    setState((prev) => ({
+      ...prev,
+      threads: prev.threads.map((t) => {
+        if (!t.participantIds.includes(canonicalId) && !(target?.uid && t.participantIds.includes(target.uid))) {
+          return t;
+        }
+        return {
+          ...t,
+          unreadBy: t.unreadBy.filter(
+            (id) => id !== currentUser.id && id !== currentUser.uid
+          ),
+        };
+      }),
+    }));
+
+    if (activeCallRef.current && (activeCallRef.current.peerId === canonicalId || activeCallRef.current.peerId === target?.uid)) {
+      endActiveCall('rejected');
+    }
+
+    if (serverSyncAvailable && !currentUser.isDemoSeed) {
+      void fetch('/api/social/blocks', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.id,
+          blockedIds: nextBlockedForMe,
+        }),
+      }).catch(() => {});
+    }
+    showToast(
+      target ? `@${target.username} bloqueado(a)` : 'Usuário bloqueado'
+    );
+  };
+
+  const unblockUser = (userId: string) => {
+    if (!requireAuthForAction()) return;
+    const target = getUserById(userId);
+    const removeSet = new Set([userId, target?.id || '', target?.uid || ''].filter(Boolean));
+    let nextBlockedForMe: string[] = [];
+
+    setChatPrefs((prev) => {
+      const existing = prev.blockedByUser[currentUser.id] || [];
+      nextBlockedForMe = existing.filter((id) => !removeSet.has(id));
+      const nextStore: ChatPrefsStore = {
+        ...prev,
+        blockedByUser: {
+          ...prev.blockedByUser,
+          [currentUser.id]: nextBlockedForMe,
+        },
+      };
+      saveChatPrefs(nextStore);
+      return nextStore;
+    });
+
+    if (serverSyncAvailable && !currentUser.isDemoSeed) {
+      void fetch('/api/social/blocks', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.id,
+          blockedIds: nextBlockedForMe,
+        }),
+      }).catch(() => {});
+    }
+    showToast(
+      target ? `@${target.username} desbloqueado(a)` : 'Usuário desbloqueado'
+    );
+  };
+
+  const toggleMuteThread = (threadId: string) => {
+    if (!threadId) return;
+    const willMute = !mutedThreadIds.includes(threadId);
+    setChatPrefs((prev) => {
+      const existing = prev.mutedByUser[currentUser.id] || [];
+      const nextList = willMute
+        ? Array.from(new Set([...existing, threadId]))
+        : existing.filter((id) => id !== threadId);
+      const nextStore: ChatPrefsStore = {
+        ...prev,
+        mutedByUser: {
+          ...prev.mutedByUser,
+          [currentUser.id]: nextList,
+        },
+      };
+      saveChatPrefs(nextStore);
+      return nextStore;
+    });
+    showToast(willMute ? 'Conversa silenciada' : 'Notificações da conversa reativadas');
+  };
+
+  const togglePinThread = (threadId: string) => {
+    if (!threadId) return;
+    const willPin = !pinnedThreadIds.includes(threadId);
+    setChatPrefs((prev) => {
+      const existing = prev.pinnedByUser[currentUser.id] || [];
+      const nextList = willPin
+        ? Array.from(new Set([threadId, ...existing]))
+        : existing.filter((id) => id !== threadId);
+      const nextStore: ChatPrefsStore = {
+        ...prev,
+        pinnedByUser: {
+          ...prev.pinnedByUser,
+          [currentUser.id]: nextList,
+        },
+      };
+      saveChatPrefs(nextStore);
+      return nextStore;
+    });
+    showToast(willPin ? 'Conversa fixada no topo' : 'Conversa desafixada');
+  };
+
+  const clearThreadMessages = (threadId: string) => {
+    if (!threadId) return;
+    const now = Date.now();
+    threadReadWatermarkRef.current = {
+      ...threadReadWatermarkRef.current,
+      [threadId]: now,
+    };
+    saveThreadReadWatermarks(threadReadWatermarkRef.current);
+    setState((prev) => ({
+      ...prev,
+      threads: prev.threads.map((t) =>
+        t.id === threadId ? { ...t, messages: [], unreadBy: [], updatedAt: now } : t
+      ),
+    }));
+    showToast('Histórico da conversa limpo neste dispositivo');
+  };
+
+  const deleteThread = (threadId: string) => {
+    if (!threadId) return;
+    const now = Date.now();
+    threadReadWatermarkRef.current = {
+      ...threadReadWatermarkRef.current,
+      [threadId]: now,
+    };
+    saveThreadReadWatermarks(threadReadWatermarkRef.current);
+    setState((prev) => ({
+      ...prev,
+      threads: prev.threads.filter((t) => t.id !== threadId),
+    }));
+    showToast('Conversa removida da lista');
+  };
+
   const sendMessage = (
     recipientId: string,
     text: string,
@@ -4154,25 +4568,39 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       replyToId?: string;
       replyToSenderId?: string;
       replyToText?: string;
+      isCallLog?: boolean;
+      callType?: CallType;
+      callStatus?: 'completed' | 'missed' | 'rejected';
+      callDurationSec?: number;
     }
   ) => {
     if (!requireAuthForAction()) return;
+    const resolvedRecipient = getUserById(recipientId);
+    const canonicalRecipientId = resolvedRecipient?.id || recipientId;
+    if (!options?.isCallLog && isUserBlocked(canonicalRecipientId)) {
+      showToast('Desbloqueie este usuário para enviar mensagens.');
+      return;
+    }
+
     const trimmed = text.trim();
     if (
       !trimmed &&
       !options?.sharedPostId &&
       !options?.audioUrl &&
       !options?.videoUrl &&
-      !options?.fileUrl
+      !options?.fileUrl &&
+      !options?.isCallLog
     ) {
       return;
     }
 
-    const resolvedRecipient = getUserById(recipientId);
-    const canonicalRecipientId = resolvedRecipient?.id || recipientId;
     const now = Date.now();
     const msgId = `dm_${now}_${Math.random().toString(36).slice(2, 6)}`;
-    const fallbackLabel = options?.audioUrl
+    const fallbackLabel = options?.isCallLog
+      ? options.callType === 'video'
+        ? 'Chamada de vídeo'
+        : 'Chamada de áudio'
+      : options?.audioUrl
       ? 'Mensagem de voz'
       : options?.videoUrl
       ? 'Vídeo'
@@ -4182,7 +4610,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       ? 'Compartilhou uma publicação'
       : '';
 
-    const newMsg = {
+    const newMsg: DirectThread['messages'][number] = {
       id: msgId,
       senderId: currentUser.id,
       text: trimmed || fallbackLabel,
@@ -4199,6 +4627,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       replyToId: options?.replyToId,
       replyToSenderId: options?.replyToSenderId,
       replyToText: options?.replyToText,
+      isCallLog: options?.isCallLog,
+      callType: options?.callType,
+      callStatus: options?.callStatus,
+      callDurationSec: options?.callDurationSec,
       readBy: [currentUser.id],
       createdAt: now,
     };
@@ -4463,6 +4895,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     if (!state.isAuthenticated || !recipientId || currentUser.isDemoSeed) return;
     const resolved = getUserById(recipientId);
     const canonicalRecipientId = resolved?.id || recipientId;
+    if (isUserBlocked(canonicalRecipientId)) return;
+
     const now = Date.now();
     const emitKey = `${canonicalRecipientId}:${isTyping ? '1' : '0'}`;
     if (isTyping && now - (lastTypingEmitRef.current[emitKey] || 0) < 1600) {
@@ -4475,6 +4909,13 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       type: 'typing_sync',
       fromUserId: currentUser.id,
       fromUid: currentUser.uid,
+      toUserId: canonicalRecipientId,
+      isTyping,
+    });
+
+    wsHandleRef.current?.send({
+      type: 'chat_typing',
+      fromUserId: currentUser.id,
       toUserId: canonicalRecipientId,
       isTyping,
     });
@@ -4492,6 +4933,643 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       }).catch(() => {});
     }
   };
+
+  // --- Real-Time Audio & Video Calls (WebRTC + WebSocket/REST/BroadcastChannel) ---
+  const sendCallSignal = (signal: CallSignalPayload) => {
+    channelRef.current?.postMessage({
+      senderTabId: tabIdRef.current,
+      type: 'call_signal',
+      signal,
+    });
+    const sentViaWs = wsHandleRef.current?.send({
+      type: 'call_signal',
+      signal,
+    });
+    if (!sentViaWs && serverSyncAvailable) {
+      void fetch('/api/social/calls/signal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ signal }),
+      }).catch(() => {});
+    }
+  };
+
+  const cleanupCallResources = () => {
+    stopCallRingtone();
+    if (callRingTimeoutRef.current !== null) {
+      window.clearTimeout(callRingTimeoutRef.current);
+      callRingTimeoutRef.current = null;
+    }
+    if (pcRef.current) {
+      try {
+        pcRef.current.onicecandidate = null;
+        pcRef.current.ontrack = null;
+        pcRef.current.onconnectionstatechange = null;
+        pcRef.current.close();
+      } catch {
+        // Ignore close error
+      }
+      pcRef.current = null;
+    }
+    if (localCallStreamRef.current) {
+      localCallStreamRef.current.getTracks().forEach((t) => t.stop());
+      localCallStreamRef.current = null;
+    }
+    pendingIncomingOfferRef.current = null;
+    pendingIceCandidatesRef.current = [];
+    setLocalCallStream(null);
+    setRemoteCallStream(null);
+    setIsCallMicMuted(false);
+    setIsCallCameraOff(false);
+    setActiveCall(null);
+  };
+
+  const acquireCallMedia = async (callType: CallType, facing: 'user' | 'environment'): Promise<{ stream: MediaStream; cameraUnavailable: boolean }> => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Navegador sem suporte a chamadas de áudio/vídeo.');
+    }
+    if (callType === 'video') {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+        });
+        return { stream, cameraUnavailable: false };
+      } catch {
+        // Fallback to audio-only if camera hardware/permission is unavailable
+        const audioOnly = await navigator.mediaDevices.getUserMedia({ audio: true });
+        return { stream: audioOnly, cameraUnavailable: true };
+      }
+    }
+    const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    return { stream: audioStream, cameraUnavailable: false };
+  };
+
+  const logCallInChat = (
+    peerId: string,
+    callType: CallType,
+    callStatus: 'completed' | 'missed' | 'rejected',
+    durationSec?: number
+  ) => {
+    const label =
+      callStatus === 'completed'
+        ? `${callType === 'video' ? 'Chamada de vídeo' : 'Chamada de áudio'} encerrada`
+        : callStatus === 'rejected'
+        ? `${callType === 'video' ? 'Chamada de vídeo' : 'Chamada de áudio'} recusada`
+        : `${callType === 'video' ? 'Chamada de vídeo' : 'Chamada de áudio'} perdida`;
+    sendMessage(peerId, label, {
+      isCallLog: true,
+      callType,
+      callStatus,
+      callDurationSec: durationSec,
+    });
+  };
+
+  const endActiveCall = (reasonStatus?: 'completed' | 'missed' | 'rejected') => {
+    const session = activeCallRef.current;
+    if (!session) {
+      cleanupCallResources();
+      return;
+    }
+    const peer = getUserById(session.peerId);
+    const durationSec =
+      session.startedAt && session.status === 'connected'
+        ? Math.max(1, Math.round((Date.now() - session.startedAt) / 1000))
+        : undefined;
+
+    if (session.direction === 'incoming' && session.status === 'ringing') {
+      sendCallSignal({
+        callId: session.callId,
+        type: 'call:reject',
+        fromUserId: currentUser.id,
+        fromUid: currentUser.uid,
+        toUserId: session.peerId,
+        toUid: session.peerUid || peer?.uid,
+        reason: 'rejected',
+        createdAt: Date.now(),
+      });
+    } else {
+      sendCallSignal({
+        callId: session.callId,
+        type: 'call:end',
+        fromUserId: currentUser.id,
+        fromUid: currentUser.uid,
+        toUserId: session.peerId,
+        toUid: session.peerUid || peer?.uid,
+        reason: reasonStatus || 'completed',
+        createdAt: Date.now(),
+      });
+
+      const resolvedStatus: 'completed' | 'missed' | 'rejected' =
+        reasonStatus || (session.status === 'connected' ? 'completed' : 'missed');
+      if (session.direction === 'outgoing' || session.status === 'connected') {
+        logCallInChat(session.peerId, session.callType, resolvedStatus, durationSec);
+      }
+    }
+
+    cleanupCallResources();
+  };
+
+  const startCall = async (peerId: string, callType: CallType) => {
+    if (!requireAuthForAction()) return;
+    if (activeCallRef.current) {
+      showToast('Você já está em uma chamada ativa.');
+      return;
+    }
+    const target = getUserById(peerId);
+    const canonicalPeerId = target?.id || peerId;
+    if (!canonicalPeerId || canonicalPeerId === currentUser.id) return;
+    if (isUserBlocked(canonicalPeerId)) {
+      showToast('Desbloqueie este usuário antes de iniciar uma chamada.');
+      return;
+    }
+
+    try {
+      const { stream, cameraUnavailable } = await acquireCallMedia(callType, callFacingMode);
+      if (cameraUnavailable) {
+        showToast('Câmera indisponível — chamada iniciada apenas com áudio');
+        setIsCallCameraOff(true);
+      } else {
+        setIsCallCameraOff(callType === 'audio');
+      }
+      setIsCallMicMuted(false);
+      localCallStreamRef.current = stream;
+      setLocalCallStream(stream);
+
+      const callId = `call_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const threadId = canonicalThreadIdForPair(currentUser.id, canonicalPeerId);
+
+      const pc = createCallPeerConnection({
+        onIceCandidate: (candidate) => {
+          sendCallSignal({
+            callId,
+            type: 'call:ice',
+            fromUserId: currentUser.id,
+            fromUid: currentUser.uid,
+            toUserId: canonicalPeerId,
+            toUid: target?.uid,
+            candidate,
+            createdAt: Date.now(),
+          });
+        },
+        onRemoteTrack: (remoteStream) => {
+          setRemoteCallStream(remoteStream);
+        },
+        onConnectionStateChange: (connState) => {
+          if (connState === 'connected') {
+            stopCallRingtone();
+            if (callRingTimeoutRef.current !== null) {
+              window.clearTimeout(callRingTimeoutRef.current);
+              callRingTimeoutRef.current = null;
+            }
+            setActiveCall((prev) =>
+              prev && prev.callId === callId
+                ? { ...prev, status: 'connected', startedAt: prev.startedAt || Date.now() }
+                : prev
+            );
+          } else if (connState === 'failed') {
+            showToast('Falha de conexão na chamada');
+            endActiveCall('missed');
+          }
+        },
+      });
+      pcRef.current = pc;
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: callType === 'video',
+      });
+      await pc.setLocalDescription(offer);
+
+      setActiveCall({
+        callId,
+        threadId,
+        peerId: canonicalPeerId,
+        peerUid: target?.uid,
+        direction: 'outgoing',
+        callType,
+        status: 'ringing',
+        minimized: false,
+      });
+
+      startCallRingtone('outgoing');
+      sendCallSignal({
+        callId,
+        type: 'call:invite',
+        fromUserId: currentUser.id,
+        fromUid: currentUser.uid,
+        fromUsername: currentUser.username,
+        fromDisplayName: currentUser.displayName,
+        fromAvatarUrl: currentUser.avatarUrl,
+        toUserId: canonicalPeerId,
+        toUid: target?.uid,
+        callType,
+        threadId,
+        sdp: offer,
+        createdAt: Date.now(),
+      });
+
+      callRingTimeoutRef.current = window.setTimeout(() => {
+        if (activeCallRef.current?.callId === callId && activeCallRef.current.status === 'ringing') {
+          showToast('Chamada não atendida');
+          endActiveCall('missed');
+        }
+      }, 45_000);
+    } catch {
+      cleanupCallResources();
+      showToast('Permita acesso ao microfone/câmera para iniciar chamadas.');
+    }
+  };
+
+  const acceptIncomingCall = async () => {
+    const session = activeCallRef.current;
+    const offerSignal = pendingIncomingOfferRef.current;
+    if (!session || session.direction !== 'incoming' || !offerSignal?.sdp) return;
+
+    stopCallRingtone();
+    if (callRingTimeoutRef.current !== null) {
+      window.clearTimeout(callRingTimeoutRef.current);
+      callRingTimeoutRef.current = null;
+    }
+
+    try {
+      const { stream, cameraUnavailable } = await acquireCallMedia(session.callType, callFacingMode);
+      if (cameraUnavailable && session.callType === 'video') {
+        showToast('Câmera indisponível — atendendo com áudio');
+        setIsCallCameraOff(true);
+      } else {
+        setIsCallCameraOff(session.callType === 'audio');
+      }
+      setIsCallMicMuted(false);
+      localCallStreamRef.current = stream;
+      setLocalCallStream(stream);
+
+      const peer = getUserById(session.peerId);
+      const pc = createCallPeerConnection({
+        onIceCandidate: (candidate) => {
+          sendCallSignal({
+            callId: session.callId,
+            type: 'call:ice',
+            fromUserId: currentUser.id,
+            fromUid: currentUser.uid,
+            toUserId: session.peerId,
+            toUid: session.peerUid || peer?.uid,
+            candidate,
+            createdAt: Date.now(),
+          });
+        },
+        onRemoteTrack: (remoteStream) => {
+          setRemoteCallStream(remoteStream);
+        },
+        onConnectionStateChange: (connState) => {
+          if (connState === 'connected') {
+            setActiveCall((prev) =>
+              prev && prev.callId === session.callId
+                ? { ...prev, status: 'connected', startedAt: prev.startedAt || Date.now() }
+                : prev
+            );
+          } else if (connState === 'failed') {
+            showToast('Conexão de chamada interrompida');
+            endActiveCall('completed');
+          }
+        },
+      });
+      pcRef.current = pc;
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      await pc.setRemoteDescription(new RTCSessionDescription(offerSignal.sdp));
+      for (const ice of pendingIceCandidatesRef.current) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(ice));
+        } catch {
+          // Ignore stale ICE
+        }
+      }
+      pendingIceCandidatesRef.current = [];
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      setActiveCall((prev) =>
+        prev && prev.callId === session.callId
+          ? { ...prev, status: 'connecting', startedAt: Date.now() }
+          : prev
+      );
+
+      sendCallSignal({
+        callId: session.callId,
+        type: 'call:answer',
+        fromUserId: currentUser.id,
+        fromUid: currentUser.uid,
+        toUserId: session.peerId,
+        toUid: session.peerUid || peer?.uid,
+        callType: session.callType,
+        sdp: answer,
+        createdAt: Date.now(),
+      });
+    } catch {
+      rejectIncomingCall();
+      showToast('Não foi possível acessar microfone/câmera para atender.');
+    }
+  };
+
+  const rejectIncomingCall = () => {
+    endActiveCall('rejected');
+  };
+
+  const toggleCallMic = () => {
+    const stream = localCallStreamRef.current;
+    const nextMuted = !isCallMicMuted;
+    if (stream) {
+      stream.getAudioTracks().forEach((t) => {
+        t.enabled = !nextMuted;
+      });
+    }
+    setIsCallMicMuted(nextMuted);
+    const session = activeCallRef.current;
+    if (session) {
+      sendCallSignal({
+        callId: session.callId,
+        type: 'call:media-state',
+        fromUserId: currentUser.id,
+        fromUid: currentUser.uid,
+        toUserId: session.peerId,
+        toUid: session.peerUid,
+        micMuted: nextMuted,
+        camOff: isCallCameraOff,
+        createdAt: Date.now(),
+      });
+    }
+  };
+
+  const toggleCallCamera = async () => {
+    const stream = localCallStreamRef.current;
+    const session = activeCallRef.current;
+    if (!stream || !session) return;
+    const nextOff = !isCallCameraOff;
+    const videoTracks = stream.getVideoTracks();
+    if (videoTracks.length > 0) {
+      videoTracks.forEach((t) => {
+        t.enabled = !nextOff;
+      });
+      setIsCallCameraOff(nextOff);
+    } else if (!nextOff) {
+      try {
+        const camStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: callFacingMode },
+        });
+        const newTrack = camStream.getVideoTracks()[0];
+        if (newTrack) {
+          stream.addTrack(newTrack);
+          const sender = pcRef.current?.getSenders().find((s) => s.track?.kind === 'video');
+          if (sender) {
+            await sender.replaceTrack(newTrack);
+          } else {
+            pcRef.current?.addTrack(newTrack, stream);
+          }
+          setLocalCallStream(new MediaStream(stream.getTracks()));
+          setIsCallCameraOff(false);
+        }
+      } catch {
+        showToast('Câmera indisponível neste dispositivo');
+        return;
+      }
+    }
+    sendCallSignal({
+      callId: session.callId,
+      type: 'call:media-state',
+      fromUserId: currentUser.id,
+      fromUid: currentUser.uid,
+      toUserId: session.peerId,
+      toUid: session.peerUid,
+      micMuted: isCallMicMuted,
+      camOff: nextOff,
+      createdAt: Date.now(),
+    });
+  };
+
+  const switchCallCamera = async () => {
+    const stream = localCallStreamRef.current;
+    const session = activeCallRef.current;
+    if (!stream || !session) return;
+    const nextFacing = callFacingMode === 'user' ? 'environment' : 'user';
+    try {
+      const nextCam = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: nextFacing },
+      });
+      const newTrack = nextCam.getVideoTracks()[0];
+      if (!newTrack) return;
+      const oldTrack = stream.getVideoTracks()[0];
+      const sender = pcRef.current?.getSenders().find((s) => s.track?.kind === 'video');
+      if (sender) {
+        await sender.replaceTrack(newTrack);
+      }
+      if (oldTrack) {
+        stream.removeTrack(oldTrack);
+        oldTrack.stop();
+      }
+      stream.addTrack(newTrack);
+      setLocalCallStream(new MediaStream(stream.getTracks()));
+      setCallFacingMode(nextFacing);
+      setIsCallCameraOff(false);
+    } catch {
+      showToast('Não foi possível alternar a câmera neste dispositivo');
+    }
+  };
+
+  const toggleMinimizeCall = () => {
+    setActiveCall((prev) => (prev ? { ...prev, minimized: !prev.minimized } : null));
+  };
+
+  // Keep incoming WebRTC signal handler always pointing to latest closures
+  handleCallSignalRef.current = (sig: CallSignalPayload) => {
+    if (!sig?.callId || !sig?.type) return;
+    const dedupeKey = `${sig.callId}:${sig.type}:${sig.createdAt}:${sig.candidate ? sig.candidate.candidate?.slice(0, 18) : ''}`;
+    if (seenCallSignalsRef.current.has(dedupeKey)) return;
+    seenCallSignalsRef.current.add(dedupeKey);
+    if (seenCallSignalsRef.current.size > 200) {
+      const first = seenCallSignalsRef.current.values().next().value;
+      if (first) seenCallSignalsRef.current.delete(first);
+    }
+
+    const myIds = new Set([currentUser.id, currentUser.uid || ''].filter(Boolean));
+    if (myIds.has(sig.fromUserId) || (sig.fromUid && myIds.has(sig.fromUid))) return;
+    if (!myIds.has(sig.toUserId) && !(sig.toUid && myIds.has(sig.toUid))) return;
+
+    // Ignore calls from blocked users
+    if (isUserBlocked(sig.fromUserId) || (sig.fromUid && isUserBlocked(sig.fromUid))) {
+      if (sig.type === 'call:invite') {
+        sendCallSignal({
+          callId: sig.callId,
+          type: 'call:busy',
+          fromUserId: currentUser.id,
+          fromUid: currentUser.uid,
+          toUserId: sig.fromUserId,
+          toUid: sig.fromUid,
+          reason: 'blocked',
+          createdAt: Date.now(),
+        });
+      }
+      return;
+    }
+
+    if (sig.type === 'call:invite') {
+      if (activeCallRef.current && activeCallRef.current.callId !== sig.callId) {
+        sendCallSignal({
+          callId: sig.callId,
+          type: 'call:busy',
+          fromUserId: currentUser.id,
+          fromUid: currentUser.uid,
+          toUserId: sig.fromUserId,
+          toUid: sig.fromUid,
+          reason: 'busy',
+          createdAt: Date.now(),
+        });
+        return;
+      }
+
+      // Ensure caller profile exists locally so UI renders their name/avatar
+      if (!getUserById(sig.fromUserId) && sig.fromUsername) {
+        mergeExternalUsers([
+          {
+            id: sig.fromUserId,
+            uid: sig.fromUid,
+            username: sig.fromUsername,
+            displayName: sig.fromDisplayName || sig.fromUsername,
+            avatarUrl: sig.fromAvatarUrl || '/og-preview.jpg',
+            bio: '',
+            followers: [],
+            following: [],
+            isOnline: true,
+            isDemoSeed: false,
+          },
+        ]);
+      }
+
+      pendingIncomingOfferRef.current = sig;
+      pendingIceCandidatesRef.current = [];
+      const threadId = sig.threadId || canonicalThreadIdForPair(currentUser.id, sig.fromUserId);
+      setActiveCall({
+        callId: sig.callId,
+        threadId,
+        peerId: sig.fromUserId,
+        peerUid: sig.fromUid,
+        direction: 'incoming',
+        callType: sig.callType || 'audio',
+        status: 'ringing',
+        minimized: false,
+      });
+
+      const mutedList = chatPrefsRef.current.mutedByUser[currentUser.id] || [];
+      if (!mutedList.includes(threadId)) {
+        startCallRingtone('incoming');
+      }
+
+      if (callRingTimeoutRef.current !== null) {
+        window.clearTimeout(callRingTimeoutRef.current);
+      }
+      callRingTimeoutRef.current = window.setTimeout(() => {
+        if (activeCallRef.current?.callId === sig.callId && activeCallRef.current.status === 'ringing') {
+          cleanupCallResources();
+        }
+      }, 45_000);
+      return;
+    }
+
+    const currentSession = activeCallRef.current;
+    if (!currentSession || currentSession.callId !== sig.callId) return;
+
+    if (sig.type === 'call:answer' && sig.sdp && pcRef.current) {
+      stopCallRingtone();
+      if (callRingTimeoutRef.current !== null) {
+        window.clearTimeout(callRingTimeoutRef.current);
+        callRingTimeoutRef.current = null;
+      }
+      void (async () => {
+        try {
+          await pcRef.current?.setRemoteDescription(new RTCSessionDescription(sig.sdp!));
+          for (const ice of pendingIceCandidatesRef.current) {
+            try {
+              await pcRef.current?.addIceCandidate(new RTCIceCandidate(ice));
+            } catch {
+              // Ignore stale ICE
+            }
+          }
+          pendingIceCandidatesRef.current = [];
+          setActiveCall((prev) =>
+            prev && prev.callId === sig.callId
+              ? { ...prev, status: 'connecting', startedAt: prev.startedAt || Date.now() }
+              : prev
+          );
+        } catch {
+          endActiveCall('missed');
+        }
+      })();
+      return;
+    }
+
+    if (sig.type === 'call:ice' && sig.candidate) {
+      if (pcRef.current && pcRef.current.remoteDescription) {
+        void pcRef.current.addIceCandidate(new RTCIceCandidate(sig.candidate)).catch(() => {});
+      } else {
+        pendingIceCandidatesRef.current.push(sig.candidate);
+      }
+      return;
+    }
+
+    if (sig.type === 'call:media-state') {
+      setActiveCall((prev) =>
+        prev && prev.callId === sig.callId
+          ? {
+              ...prev,
+              remoteMicMuted: sig.micMuted,
+              remoteCamOff: sig.camOff,
+            }
+          : prev
+      );
+      return;
+    }
+
+    if (sig.type === 'call:reject') {
+      showToast('Chamada recusada');
+      if (currentSession.direction === 'outgoing') {
+        logCallInChat(currentSession.peerId, currentSession.callType, 'rejected');
+      }
+      cleanupCallResources();
+      return;
+    }
+
+    if (sig.type === 'call:busy') {
+      showToast(
+        sig.reason === 'blocked'
+          ? 'Não foi possível completar a chamada.'
+          : 'Usuário ocupado em outra chamada.'
+      );
+      if (currentSession.direction === 'outgoing') {
+        logCallInChat(currentSession.peerId, currentSession.callType, 'missed');
+      }
+      cleanupCallResources();
+      return;
+    }
+
+    if (sig.type === 'call:end') {
+      showToast('Chamada encerrada');
+      cleanupCallResources();
+    }
+  };
+
+  useEffect(() => {
+    if (!state.isAuthenticated && activeCallRef.current) {
+      cleanupCallResources();
+    }
+  }, [state.isAuthenticated, state.currentUserId]);
+
+  useEffect(() => {
+    return () => {
+      cleanupCallResources();
+    };
+  }, []);
 
   const markNotificationsRead = () => {
     const myIdSet = new Set([currentUser.id, currentUser.uid || ''].filter(Boolean));
@@ -4855,6 +5933,30 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         reactToMessage,
         typingByUserId,
         setTypingStatus,
+        blockedUserIds,
+        mutedThreadIds,
+        pinnedThreadIds,
+        isUserBlocked,
+        blockUser,
+        unblockUser,
+        toggleMuteThread,
+        togglePinThread,
+        clearThreadMessages,
+        deleteThread,
+        activeCall,
+        localCallStream,
+        remoteCallStream,
+        isCallMicMuted,
+        isCallCameraOff,
+        callFacingMode,
+        startCall,
+        acceptIncomingCall,
+        rejectIncomingCall,
+        endActiveCall,
+        toggleCallMic,
+        toggleCallCamera,
+        switchCallCamera,
+        toggleMinimizeCall,
         markNotificationsRead,
         addRecentSearch,
         clearRecentSearches,

@@ -1,15 +1,29 @@
 import {
   ArrowLeft,
+  Ban,
+  Bell,
+  BellOff,
   Camera,
   Check,
   CheckCheck,
+  ChevronDown,
+  ChevronUp,
   Download,
+  ExternalLink,
   FileAudio,
   FileText,
+  FolderOpen,
   Mic,
+  MoreVertical,
   Paperclip,
   Pause,
+  Phone,
+  PhoneCall,
+  PhoneMissed,
+  Pin,
+  PinOff,
   Play,
+  Plus,
   Reply,
   Search,
   Send,
@@ -18,6 +32,8 @@ import {
   SwitchCamera,
   Trash2,
   Upload,
+  UserCheck,
+  UserX,
   Video,
   X,
 } from 'lucide-react';
@@ -39,6 +55,13 @@ function formatTimer(seconds: number): string {
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
+function formatCallLogDuration(seconds?: number): string {
+  if (!seconds || seconds <= 0) return '';
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
 function formatBytes(bytes?: number): string {
   if (!bytes || bytes <= 0) return '';
   if (bytes < 1024) return `${bytes} B`;
@@ -47,7 +70,7 @@ function formatBytes(bytes?: number): string {
 }
 
 const WAVEFORM_BARS = [
-  38, 65, 90, 50, 75, 100, 62, 44, 85, 95, 54, 70, 88, 42, 68, 92, 58, 76, 48, 60,
+  38, 65, 90, 50, 75, 100, 62, 44, 85, 95, 54, 70, 88, 42, 68, 92, 58, 76,
 ];
 
 function VoiceNoteBubble({
@@ -77,7 +100,7 @@ function VoiceNoteBubble({
 
   return (
     <div
-      className={`flex min-w-[220px] items-center gap-3 rounded-2xl px-3.5 py-2.5 sm:min-w-[250px] ${
+      className={`flex w-[196px] max-w-full items-center gap-2.5 rounded-2xl px-3 py-2 sm:w-[248px] sm:gap-3 sm:px-3.5 sm:py-2.5 ${
         isMine
           ? 'bg-sky-600 text-white'
           : 'bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100'
@@ -124,15 +147,15 @@ function VoiceNoteBubble({
         )}
       </button>
 
-      <div className="flex flex-1 flex-col gap-1">
-        <div className="flex h-6 items-center gap-[3px]">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <div className="flex h-6 items-center gap-[2.5px] sm:gap-[3px]">
           {WAVEFORM_BARS.map((height, idx) => {
             const barPercent = ((idx + 1) / WAVEFORM_BARS.length) * 100;
             const active = barPercent <= progress;
             return (
               <span
                 key={idx}
-                className={`w-[3px] rounded-full transition-colors ${
+                className={`w-[2.5px] rounded-full transition-colors sm:w-[3px] ${
                   active
                     ? isMine
                       ? 'bg-white'
@@ -151,7 +174,7 @@ function VoiceNoteBubble({
             isMine ? 'text-white/80' : 'text-zinc-500 dark:text-zinc-400'
           }`}
         >
-          <span>Áudio de voz</span>
+          <span className="truncate">Áudio de voz</span>
           <span>{playing ? formatTimer(currentTime) : formatTimer(totalDuration)}</span>
         </div>
       </div>
@@ -199,10 +222,17 @@ async function compressImageFileToDataUrl(file: File): Promise<string> {
 }
 
 function summarizeMessageForQuote(msg: DirectMessage): string {
+  if (msg.isCallLog) {
+    return msg.callType === 'video' ? 'Chamada de vídeo' : 'Chamada de áudio';
+  }
   if (msg.audioUrl) return 'Mensagem de voz';
   if (msg.videoUrl) return msg.videoName ? `Vídeo: ${msg.videoName}` : 'Vídeo enviado';
   if (msg.fileUrl) {
-    if (msg.fileMime?.startsWith('image/')) return msg.text && msg.text !== `Arquivo: ${msg.fileName || 'anexo'}` ? msg.text : 'Foto enviada';
+    if (msg.fileMime?.startsWith('image/')) {
+      return msg.text && msg.text !== `Arquivo: ${msg.fileName || 'anexo'}`
+        ? msg.text
+        : 'Foto enviada';
+    }
     return `Arquivo: ${msg.fileName || 'anexo'}`;
   }
   return msg.text || 'Mensagem';
@@ -231,6 +261,18 @@ export function MessagesView() {
     reactToMessage,
     typingByUserId,
     setTypingStatus,
+    blockedUserIds,
+    mutedThreadIds,
+    pinnedThreadIds,
+    isUserBlocked,
+    blockUser,
+    unblockUser,
+    toggleMuteThread,
+    togglePinThread,
+    clearThreadMessages,
+    deleteThread,
+    startCall,
+    activeCall,
     setSelectedPostId,
     openProfile,
     showToast,
@@ -277,12 +319,23 @@ export function MessagesView() {
   }, [pendingChatUserId, currentUser.id, currentUser.uid, getUserById, setPendingChatUserId]);
 
   const [search, setSearch] = useState('');
+  const [contactTab, setContactTab] = useState<'all' | 'unread' | 'blocked'>('all');
   const [draft, setDraft] = useState('');
   const [replyingTo, setReplyingTo] = useState<DirectMessage | null>(null);
   const [reactionPickerMsgId, setReactionPickerMsgId] = useState<string | null>(null);
   const [pendingAttachment, setPendingAttachment] = useState<PendingAttachment | null>(null);
   const [lightboxImageUrl, setLightboxImageUrl] = useState<string | null>(null);
   const [typingClock, setTypingClock] = useState(() => Date.now());
+  const [mobileTrayOpen, setMobileTrayOpen] = useState(false);
+
+  // Advanced Chat Options & In-Thread Search
+  const [optionsOpen, setOptionsOpen] = useState(false);
+  const [optionsSubView, setOptionsSubView] = useState<'main' | 'media' | 'blocked'>('main');
+  const [confirmAction, setConfirmAction] = useState<'clear' | 'delete' | 'block' | null>(null);
+  const [threadSearchOpen, setThreadSearchOpen] = useState(false);
+  const [threadSearchQuery, setThreadSearchQuery] = useState('');
+  const [threadSearchIdx, setThreadSearchIdx] = useState(0);
+
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const draftInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -326,7 +379,7 @@ export function MessagesView() {
   }, [typingByUserId]);
 
   const isUserActivelyTyping = (u?: { id: string; uid?: string } | null) => {
-    if (!u) return false;
+    if (!u || isUserBlocked(u.id) || (u.uid && isUserBlocked(u.uid))) return false;
     const tsMain = typingByUserId[u.id] || 0;
     const tsUid = u.uid ? typingByUserId[u.uid] || 0 : 0;
     const newest = Math.max(tsMain, tsUid);
@@ -336,15 +389,32 @@ export function MessagesView() {
   const contacts = useMemo(() => {
     const cleanSearch = search.trim().toLowerCase().replace(/^@/, '');
     const pool = users.length > 0 ? users : allUsers;
-    const filtered = pool
-      .filter((u) => !u.restricted && !isCurrentUserRef(u.id) && (!u.uid || !isCurrentUserRef(u.uid)))
-      .filter(
-        (u) =>
-          !cleanSearch ||
-          u.username.toLowerCase().includes(cleanSearch) ||
-          u.displayName.toLowerCase().includes(cleanSearch) ||
-          (u.bio && u.bio.toLowerCase().includes(cleanSearch))
-      );
+    const base = pool.filter(
+      (u) => !u.restricted && !isCurrentUserRef(u.id) && (!u.uid || !isCurrentUserRef(u.uid))
+    );
+
+    const byTab = base.filter((u) => {
+      const blocked = isUserBlocked(u.id) || Boolean(u.uid && isUserBlocked(u.uid));
+      if (contactTab === 'blocked') return blocked;
+      if (contactTab === 'unread') {
+        if (blocked) return false;
+        const thread = threads.find(
+          (t) =>
+            threadHasUser(t.participantIds, currentUser) &&
+            threadHasUser(t.participantIds, u)
+        );
+        return Boolean(thread?.unreadBy.some((id) => isCurrentUserRef(id)));
+      }
+      return !blocked;
+    });
+
+    const filtered = byTab.filter(
+      (u) =>
+        !cleanSearch ||
+        u.username.toLowerCase().includes(cleanSearch) ||
+        u.displayName.toLowerCase().includes(cleanSearch) ||
+        (u.bio && u.bio.toLowerCase().includes(cleanSearch))
+    );
 
     return [...filtered].sort((a, b) => {
       const threadA = threads.find(
@@ -353,6 +423,10 @@ export function MessagesView() {
       const threadB = threads.find(
         (t) => threadHasUser(t.participantIds, currentUser) && threadHasUser(t.participantIds, b)
       );
+      const pinA = threadA && pinnedThreadIds.includes(threadA.id) ? 1 : 0;
+      const pinB = threadB && pinnedThreadIds.includes(threadB.id) ? 1 : 0;
+      if (pinA !== pinB) return pinB - pinA;
+
       const timeA = threadA?.updatedAt || 0;
       const timeB = threadB?.updatedAt || 0;
       if (timeA !== timeB) return timeB - timeA;
@@ -360,7 +434,16 @@ export function MessagesView() {
       const bReal = b.isDemoSeed ? 0 : 1;
       return bReal - aReal;
     });
-  }, [users, allUsers, threads, currentUser, search]);
+  }, [
+    users,
+    allUsers,
+    threads,
+    currentUser,
+    search,
+    contactTab,
+    blockedUserIds,
+    pinnedThreadIds,
+  ]);
 
   const recipient = useMemo(() => {
     if (!selectedRecipientId) return undefined;
@@ -375,6 +458,10 @@ export function MessagesView() {
     );
   }, [selectedRecipientId, getUserById, allUsers]);
 
+  const recipientBlocked = Boolean(
+    recipient && (isUserBlocked(recipient.id) || (recipient.uid && isUserBlocked(recipient.uid)))
+  );
+
   const activeThread = useMemo(() => {
     if (!selectedRecipientId) return undefined;
     return threads.find(
@@ -384,6 +471,42 @@ export function MessagesView() {
           t.participantIds.includes(selectedRecipientId))
     );
   }, [threads, currentUser, recipient, selectedRecipientId]);
+
+  const activeThreadMuted = Boolean(activeThread && mutedThreadIds.includes(activeThread.id));
+  const activeThreadPinned = Boolean(activeThread && pinnedThreadIds.includes(activeThread.id));
+
+  const sharedMediaStats = useMemo(() => {
+    const msgs = activeThread?.messages || [];
+    const photos: DirectMessage[] = [];
+    const videos: DirectMessage[] = [];
+    const files: DirectMessage[] = [];
+    let audioCount = 0;
+
+    for (const m of msgs) {
+      if (m.audioUrl) audioCount += 1;
+      if (m.videoUrl) videos.push(m);
+      if (m.fileUrl) {
+        const isImg =
+          Boolean(m.fileMime?.startsWith('image/')) ||
+          Boolean(m.fileUrl.startsWith('data:image/'));
+        if (isImg) photos.push(m);
+        else files.push(m);
+      }
+    }
+    return { photos: photos.reverse(), videos: videos.reverse(), files: files.reverse(), audioCount };
+  }, [activeThread?.messages]);
+
+  const searchMatches = useMemo(() => {
+    const q = threadSearchQuery.trim().toLowerCase();
+    if (!q || !activeThread) return [] as string[];
+    return activeThread.messages
+      .filter((m) => {
+        const text = m.text?.toLowerCase() || '';
+        const fname = m.fileName?.toLowerCase() || '';
+        return text.includes(q) || fname.includes(q);
+      })
+      .map((m) => m.id);
+  }, [threadSearchQuery, activeThread]);
 
   const activeThreadHasUnread = useMemo(() => {
     if (!activeThread) return false;
@@ -403,11 +526,19 @@ export function MessagesView() {
     }
   }, [activeThread?.id, activeThread?.messages.length, activeThreadHasUnread, markThreadRead]);
 
-  // Clear typing & reply box when switching recipients
+  // Reset contextual popovers & search when switching recipients
   useEffect(() => {
     setReplyingTo(null);
     setReactionPickerMsgId(null);
     setPendingAttachment(null);
+    setMobileTrayOpen(false);
+    setVideoMenuOpen(false);
+    setOptionsOpen(false);
+    setOptionsSubView('main');
+    setConfirmAction(null);
+    setThreadSearchOpen(false);
+    setThreadSearchQuery('');
+    setThreadSearchIdx(0);
     return () => {
       if (selectedRecipientId) {
         setTypingStatus(selectedRecipientId, false);
@@ -416,8 +547,10 @@ export function MessagesView() {
   }, [selectedRecipientId]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeThread?.messages.length]);
+    if (!threadSearchOpen) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [activeThread?.messages.length, threadSearchOpen]);
 
   useEffect(() => {
     if (
@@ -473,14 +606,14 @@ export function MessagesView() {
 
   const handleDraftChange = (val: string) => {
     setDraft(val);
-    if (selectedRecipientId) {
+    if (selectedRecipientId && !recipientBlocked) {
       setTypingStatus(selectedRecipientId, val.trim().length > 0, activeThread?.id);
     }
   };
 
   const handleSend = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedRecipientId) return;
+    if (!selectedRecipientId || recipientBlocked) return;
     if (!draft.trim() && !pendingAttachment) return;
 
     sendMessage(selectedRecipientId, draft, {
@@ -490,12 +623,15 @@ export function MessagesView() {
     setDraft('');
     setReplyingTo(null);
     setPendingAttachment(null);
+    setMobileTrayOpen(false);
     setTypingStatus(selectedRecipientId, false, activeThread?.id);
   };
 
   // Start Voice Recording
   const startAudioRecording = async () => {
-    if (!selectedRecipientId) return;
+    if (!selectedRecipientId || recipientBlocked) return;
+    setMobileTrayOpen(false);
+    setVideoMenuOpen(false);
     setAudioFallbackOpen(false);
     try {
       if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
@@ -566,7 +702,7 @@ export function MessagesView() {
   const handleAudioFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
-    if (!file || !selectedRecipientId) return;
+    if (!file || !selectedRecipientId || recipientBlocked) return;
     const url = file.size <= 2_500_000 ? await readBlobAsDataUrl(file) : URL.createObjectURL(file);
     sendMessage(selectedRecipientId, file.name, {
       audioUrl: url,
@@ -574,6 +710,7 @@ export function MessagesView() {
     });
     setReplyingTo(null);
     setAudioFallbackOpen(false);
+    setMobileTrayOpen(false);
     showToast('Áudio enviado no bate-papo');
   };
 
@@ -581,7 +718,8 @@ export function MessagesView() {
   const handleAttachmentFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
-    if (!file || !selectedRecipientId) return;
+    setMobileTrayOpen(false);
+    if (!file || !selectedRecipientId || recipientBlocked) return;
 
     const mime = (file.type || 'application/octet-stream').toLowerCase();
     if (BLOCKED_ATTACHMENT_MIME_RE.test(mime) || BLOCKED_ATTACHMENT_EXT_RE.test(file.name)) {
@@ -645,7 +783,8 @@ export function MessagesView() {
     const file = e.target.files?.[0];
     e.target.value = '';
     setVideoMenuOpen(false);
-    if (!file || !selectedRecipientId) return;
+    setMobileTrayOpen(false);
+    if (!file || !selectedRecipientId || recipientBlocked) return;
 
     const maxBytes = siteMeta.videoRules.maxVideoSizeMB * 1024 * 1024;
     if (file.size > maxBytes) {
@@ -692,7 +831,9 @@ export function MessagesView() {
   };
 
   const openCameraModal = async (initialMode: 'photo' | 'video' = 'photo') => {
+    if (recipientBlocked) return;
     setVideoMenuOpen(false);
+    setMobileTrayOpen(false);
     setCameraMode(initialMode);
     setCameraModalOpen(true);
     setPreviewVideoUrl(null);
@@ -869,27 +1010,107 @@ export function MessagesView() {
     }
   };
 
+  const jumpSearchMatch = (delta: number) => {
+    if (searchMatches.length === 0) return;
+    const nextIdx =
+      (threadSearchIdx + delta + searchMatches.length) % searchMatches.length;
+    setThreadSearchIdx(nextIdx);
+    scrollToMessage(searchMatches[nextIdx]);
+  };
+
+  const openOptionsSheet = (tab: 'main' | 'media' | 'blocked' = 'main') => {
+    setConfirmAction(null);
+    setOptionsSubView(tab);
+    setOptionsOpen(true);
+  };
+
+  const resolvedBlockedUsers = useMemo(() => {
+    return blockedUserIds
+      .map((id) => getUserById(id))
+      .filter((u): u is NonNullable<typeof u> => Boolean(u));
+  }, [blockedUserIds, getUserById]);
+
   return (
-    <div className="mx-auto flex h-[calc(100vh-7rem)] w-full max-w-5xl overflow-hidden bg-white dark:bg-[#050505] lg:my-6 lg:h-[calc(100vh-3rem)] lg:rounded-2xl lg:border lg:border-zinc-200 dark:lg:border-zinc-800">
+    <div className="mx-auto flex h-full w-full max-w-5xl min-w-0 overflow-hidden bg-white dark:bg-[#050505] lg:my-6 lg:h-[calc(100dvh-3rem)] lg:rounded-2xl lg:border lg:border-zinc-200 dark:lg:border-zinc-800">
       {/* Left: Thread / Contacts List */}
       <div
-        className={`flex w-full flex-col border-r border-zinc-200 dark:border-zinc-800 md:w-80 ${
+        className={`flex min-w-0 w-full flex-col border-r border-zinc-200 dark:border-zinc-800 md:w-76 lg:w-80 ${
           selectedRecipientId ? 'hidden md:flex' : 'flex'
         }`}
       >
-        <div className="border-b border-zinc-200 p-4 dark:border-zinc-800">
-          <h1 className="text-lg font-bold text-zinc-950 dark:text-zinc-100">
-            Mensagens
-          </h1>
-          <div className="mt-3 flex items-center gap-2 rounded-xl bg-zinc-100 px-3 dark:bg-zinc-900">
-            <Search className="h-4 w-4 text-zinc-400" />
+        <div className="border-b border-zinc-200 p-3.5 sm:p-4 dark:border-zinc-800">
+          <div className="flex items-center justify-between gap-2">
+            <h1 className="text-base font-bold text-zinc-950 sm:text-lg dark:text-zinc-100">
+              Mensagens
+            </h1>
+            {blockedUserIds.length > 0 && (
+              <button
+                type="button"
+                onClick={() => openOptionsSheet('blocked')}
+                className="inline-flex h-8 items-center gap-1 rounded-lg bg-zinc-100 px-2.5 text-[11px] font-semibold text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                <Ban className="h-3 w-3 text-rose-500" />
+                <span className="tabular-nums">{blockedUserIds.length}</span>
+              </button>
+            )}
+          </div>
+
+          <div className="mt-2.5 flex items-center gap-2 rounded-xl bg-zinc-100 px-3 dark:bg-zinc-900">
+            <Search className="h-4 w-4 shrink-0 text-zinc-400" />
             <input
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Buscar conversa..."
-              className="h-9 flex-1 bg-transparent text-sm text-zinc-900 placeholder:text-zinc-400 focus:outline-none dark:text-zinc-100"
+              className="h-9 min-w-0 flex-1 bg-transparent text-sm text-zinc-900 placeholder:text-zinc-400 focus:outline-none dark:text-zinc-100"
             />
+            {search && (
+              <button
+                type="button"
+                onClick={() => setSearch('')}
+                aria-label="Limpar busca"
+                className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+
+          {/* Segmented Tabs: Todas / Não lidas / Bloqueados */}
+          <div className="mt-2.5 grid grid-cols-3 gap-1 rounded-xl bg-zinc-100 p-1 dark:bg-zinc-900">
+            <button
+              type="button"
+              onClick={() => setContactTab('all')}
+              className={`rounded-lg py-1.5 text-xs font-semibold transition-colors ${
+                contactTab === 'all'
+                  ? 'bg-white text-zinc-950 shadow-xs dark:bg-zinc-800 dark:text-white'
+                  : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200'
+              }`}
+            >
+              Todas
+            </button>
+            <button
+              type="button"
+              onClick={() => setContactTab('unread')}
+              className={`rounded-lg py-1.5 text-xs font-semibold transition-colors ${
+                contactTab === 'unread'
+                  ? 'bg-white text-zinc-950 shadow-xs dark:bg-zinc-800 dark:text-white'
+                  : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200'
+              }`}
+            >
+              Não lidas
+            </button>
+            <button
+              type="button"
+              onClick={() => setContactTab('blocked')}
+              className={`rounded-lg py-1.5 text-xs font-semibold transition-colors ${
+                contactTab === 'blocked'
+                  ? 'bg-white text-zinc-950 shadow-xs dark:bg-zinc-800 dark:text-white'
+                  : 'text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200'
+              }`}
+            >
+              Bloqueados
+            </button>
           </div>
         </div>
 
@@ -902,7 +1123,7 @@ export function MessagesView() {
               <button
                 type="button"
                 onClick={() => openAuthModal('login')}
-                className="mt-2 h-8 w-full rounded-lg bg-sky-600 text-xs font-semibold text-white hover:bg-sky-700"
+                className="mt-2 h-9 w-full rounded-lg bg-sky-600 text-xs font-semibold text-white hover:bg-sky-700"
               >
                 Entrar na conta
               </button>
@@ -910,8 +1131,12 @@ export function MessagesView() {
           )}
 
           {contacts.length === 0 ? (
-            <p className="px-4 py-8 text-center text-xs text-zinc-500 dark:text-zinc-400">
-              Nenhum usuário encontrado para conversar.
+            <p className="px-4 py-10 text-center text-xs text-zinc-500 dark:text-zinc-400">
+              {contactTab === 'blocked'
+                ? 'Nenhuma pessoa bloqueada no momento.'
+                : contactTab === 'unread'
+                ? 'Nenhuma conversa não lida.'
+                : 'Nenhum usuário encontrado para conversar.'}
             </p>
           ) : (
             contacts.map((contact) => {
@@ -922,6 +1147,10 @@ export function MessagesView() {
               );
               const lastMsg = thread?.messages[thread.messages.length - 1];
               const isUnread = thread?.unreadBy.some((id) => isCurrentUserRef(id));
+              const isMuted = Boolean(thread && mutedThreadIds.includes(thread.id));
+              const isPinned = Boolean(thread && pinnedThreadIds.includes(thread.id));
+              const contactBlocked =
+                isUserBlocked(contact.id) || Boolean(contact.uid && isUserBlocked(contact.uid));
               const isTypingContact = isUserActivelyTyping(contact);
               const isSelected = Boolean(
                 selectedRecipientId &&
@@ -934,7 +1163,7 @@ export function MessagesView() {
                   key={contact.id}
                   type="button"
                   onClick={() => setSelectedRecipientId(contact.id)}
-                  className={`flex w-full items-center gap-3 px-4 py-3 text-left transition-colors ${
+                  className={`flex min-h-[64px] w-full items-center gap-3 px-3.5 py-2.5 text-left transition-colors sm:px-4 sm:py-3 ${
                     isSelected
                       ? 'bg-zinc-100 dark:bg-zinc-900'
                       : 'hover:bg-zinc-50 dark:hover:bg-zinc-900/50'
@@ -944,20 +1173,33 @@ export function MessagesView() {
                     src={contact.avatarUrl}
                     alt={contact.username}
                     size="md"
-                    showOnlineIndicator={Boolean(contact.isOnline)}
+                    showOnlineIndicator={Boolean(contact.isOnline && !contactBlocked)}
                   />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
-                      <span className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
-                        {contact.displayName}
-                      </span>
+                      <div className="flex min-w-0 items-center gap-1">
+                        <span className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
+                          {contact.displayName}
+                        </span>
+                        {isPinned && (
+                          <Pin className="h-3 w-3 shrink-0 text-sky-600 dark:text-sky-400" />
+                        )}
+                        {isMuted && (
+                          <BellOff className="h-3 w-3 shrink-0 text-zinc-400" />
+                        )}
+                      </div>
                       {lastMsg && (
                         <span className="shrink-0 text-[11px] text-zinc-400">
                           {formatRelativeTime(lastMsg.createdAt)}
                         </span>
                       )}
                     </div>
-                    {isTypingContact ? (
+
+                    {contactBlocked ? (
+                      <p className="truncate text-xs font-medium text-rose-600 dark:text-rose-400">
+                        Bloqueado · toque para gerenciar
+                      </p>
+                    ) : isTypingContact ? (
                       <p className="truncate text-xs font-medium text-sky-600 dark:text-sky-400">
                         Digitando...
                       </p>
@@ -975,7 +1217,7 @@ export function MessagesView() {
                       </p>
                     )}
                   </div>
-                  {isUnread && (
+                  {isUnread && !contactBlocked && (
                     <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-sky-600" />
                   )}
                 </button>
@@ -987,61 +1229,158 @@ export function MessagesView() {
 
       {/* Right: Active Conversation */}
       <div
-        className={`flex flex-1 flex-col ${
+        className={`flex min-w-0 flex-1 flex-col ${
           selectedRecipientId ? 'flex' : 'hidden md:flex'
         }`}
       >
         {recipient ? (
           <>
-            {/* Thread Header */}
-            <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
-              <div className="flex items-center gap-3">
+            {/* Thread Header (Compact Mobile + Audio/Video Call + Options) */}
+            <div className="flex shrink-0 items-center justify-between gap-2 border-b border-zinc-200 px-2.5 py-2 sm:px-4 sm:py-3 dark:border-zinc-800">
+              <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
                 <button
                   type="button"
                   onClick={() => setSelectedRecipientId(null)}
                   aria-label="Voltar às conversas"
-                  className="flex h-9 w-9 items-center justify-center rounded-full text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900 md:hidden"
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900 md:hidden"
                 >
                   <ArrowLeft className="h-5 w-5" />
                 </button>
                 <button
                   type="button"
                   onClick={() => openProfile(recipient.id)}
-                  className="flex items-center gap-3 text-left"
+                  className="flex min-w-0 items-center gap-2.5 text-left"
                 >
                   <AvatarRing
                     src={recipient.avatarUrl}
                     alt={recipient.username}
                     size="sm"
-                    showOnlineIndicator={Boolean(recipient.isOnline)}
+                    showOnlineIndicator={Boolean(recipient.isOnline && !recipientBlocked)}
                   />
-                  <div>
-                    <p className="text-sm font-semibold text-zinc-950 dark:text-zinc-100">
-                      {recipient.displayName}
-                    </p>
-                    {recipientTyping ? (
-                      <p className="text-xs font-medium text-sky-600 dark:text-sky-400">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <p className="truncate text-sm font-semibold text-zinc-950 dark:text-zinc-100">
+                        {recipient.displayName}
+                      </p>
+                      {activeThreadMuted && (
+                        <BellOff className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+                      )}
+                    </div>
+                    {recipientBlocked ? (
+                      <p className="truncate text-[11px] font-medium text-rose-600 dark:text-rose-400">
+                        Usuário bloqueado
+                      </p>
+                    ) : recipientTyping ? (
+                      <p className="truncate text-[11px] font-medium text-sky-600 dark:text-sky-400">
                         Digitando...
                       </p>
                     ) : (
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                      <p className="truncate text-[11px] text-zinc-500 dark:text-zinc-400">
                         {recipient.isOnline ? 'Ativo agora' : `@${recipient.username}`}
                       </p>
                     )}
                   </div>
                 </button>
               </div>
+
+              {/* Call & Chat Options Actions */}
+              <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
+                <button
+                  type="button"
+                  disabled={recipientBlocked || Boolean(activeCall)}
+                  onClick={() => void startCall(recipient.id, 'audio')}
+                  aria-label="Ligação de áudio"
+                  title={recipientBlocked ? 'Desbloqueie para ligar' : 'Chamada de áudio'}
+                  className="flex h-10 w-10 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-40 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                >
+                  <Phone className="h-[19px] w-[19px]" />
+                </button>
+                <button
+                  type="button"
+                  disabled={recipientBlocked || Boolean(activeCall)}
+                  onClick={() => void startCall(recipient.id, 'video')}
+                  aria-label="Chamada de vídeo"
+                  title={recipientBlocked ? 'Desbloqueie para ligar' : 'Chamada de vídeo'}
+                  className="flex h-10 w-10 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-40 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                >
+                  <Video className="h-5 w-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openOptionsSheet('main')}
+                  aria-label="Opções da conversa"
+                  title="Opções da conversa"
+                  className="flex h-10 w-10 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                >
+                  <MoreVertical className="h-5 w-5" />
+                </button>
+              </div>
             </div>
+
+            {/* Inline In-Conversation Search Bar */}
+            {threadSearchOpen && (
+              <div className="flex shrink-0 items-center gap-2 border-b border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-900/70">
+                <Search className="h-4 w-4 shrink-0 text-zinc-400" />
+                <input
+                  type="text"
+                  autoFocus
+                  value={threadSearchQuery}
+                  onChange={(e) => {
+                    setThreadSearchQuery(e.target.value);
+                    setThreadSearchIdx(0);
+                  }}
+                  placeholder="Buscar nesta conversa..."
+                  className="h-8 min-w-0 flex-1 bg-transparent text-xs text-zinc-900 placeholder:text-zinc-400 focus:outline-none dark:text-zinc-100"
+                />
+                {threadSearchQuery.trim() && (
+                  <span className="shrink-0 text-[11px] font-medium text-zinc-500 tabular-nums">
+                    {searchMatches.length > 0
+                      ? `${Math.min(threadSearchIdx + 1, searchMatches.length)}/${searchMatches.length}`
+                      : '0/0'}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  disabled={searchMatches.length === 0}
+                  onClick={() => jumpSearchMatch(-1)}
+                  aria-label="Resultado anterior"
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-600 hover:bg-zinc-200 disabled:opacity-35 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <ChevronUp className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  disabled={searchMatches.length === 0}
+                  onClick={() => jumpSearchMatch(1)}
+                  aria-label="Próximo resultado"
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-600 hover:bg-zinc-200 disabled:opacity-35 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <ChevronDown className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setThreadSearchOpen(false);
+                    setThreadSearchQuery('');
+                  }}
+                  aria-label="Fechar busca"
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            )}
 
             {/* Messages Scroll */}
             <div
-              className="flex-1 space-y-3 overflow-y-auto p-4"
+              className="min-h-0 flex-1 space-y-2.5 overflow-y-auto px-3 py-3 sm:space-y-3 sm:p-4"
               onClick={() => {
                 if (reactionPickerMsgId) setReactionPickerMsgId(null);
+                if (mobileTrayOpen) setMobileTrayOpen(false);
               }}
             >
               {(!activeThread || activeThread.messages.length === 0) && (
-                <div className="py-12 text-center">
+                <div className="py-10 text-center sm:py-12">
                   <AvatarRing
                     src={recipient.avatarUrl}
                     alt={recipient.username}
@@ -1050,8 +1389,8 @@ export function MessagesView() {
                   <p className="mt-3 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
                     {recipient.displayName}
                   </p>
-                  <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                    Envie texto, arquivos, fotos da câmera, áudios de voz ou vídeos.
+                  <p className="mx-auto mt-1 max-w-xs text-xs text-zinc-500 dark:text-zinc-400">
+                    Envie texto, arquivos, fotos da câmera, áudios de voz ou inicie chamadas de vídeo e áudio.
                   </p>
                 </div>
               )}
@@ -1067,6 +1406,10 @@ export function MessagesView() {
                     Boolean(msg.fileUrl?.startsWith('data:image/')));
                 const isLatestOutgoing = isMine && msg.id === lastOutgoingMsgId;
                 const seenByPartner = isMine ? isMessageSeenByRecipient(msg) : false;
+                const isSearchHighlighted =
+                  threadSearchOpen &&
+                  searchMatches.length > 0 &&
+                  searchMatches[threadSearchIdx] === msg.id;
 
                 // Reaction grouping
                 const reactionEntries = msg.reactions
@@ -1091,19 +1434,96 @@ export function MessagesView() {
                       `@${recipient.username}`
                   : undefined;
 
+                // Dedicated Call Log Card
+                if (msg.isCallLog) {
+                  const isMissedOrRejected =
+                    msg.callStatus === 'missed' || msg.callStatus === 'rejected';
+                  const durLabel = formatCallLogDuration(msg.callDurationSec);
+                  return (
+                    <div
+                      key={msg.id}
+                      id={`msg-${msg.id}`}
+                      className={`flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
+                    >
+                      <div
+                        className={`flex max-w-[85%] items-center gap-3 rounded-2xl border px-3.5 py-2.5 sm:max-w-[74%] ${
+                          isSearchHighlighted
+                            ? 'ring-2 ring-amber-400'
+                            : ''
+                        } ${
+                          isMine
+                            ? 'border-zinc-200 bg-zinc-50 text-zinc-900 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100'
+                            : 'border-zinc-200 bg-white text-zinc-900 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100'
+                        }`}
+                      >
+                        <span
+                          className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${
+                            isMissedOrRejected
+                              ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400'
+                              : 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                          }`}
+                        >
+                          {isMissedOrRejected ? (
+                            <PhoneMissed className="h-4 w-4" />
+                          ) : msg.callType === 'video' ? (
+                            <Video className="h-4 w-4" />
+                          ) : (
+                            <PhoneCall className="h-4 w-4" />
+                          )}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-semibold">
+                            {msg.callType === 'video'
+                              ? 'Chamada de vídeo'
+                              : 'Chamada de áudio'}
+                          </p>
+                          <p className="text-[11px] text-zinc-500 tabular-nums dark:text-zinc-400">
+                            {msg.callStatus === 'completed'
+                              ? durLabel
+                                ? `Duração ${durLabel}`
+                                : 'Concluída'
+                              : msg.callStatus === 'rejected'
+                              ? 'Recusada'
+                              : 'Não atendida'}
+                            {' · '}
+                            {formatRelativeTime(msg.createdAt)}
+                          </p>
+                        </div>
+                        {!recipientBlocked && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void startCall(recipient.id, msg.callType || 'audio')
+                            }
+                            className="shrink-0 rounded-lg bg-zinc-900 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200"
+                          >
+                            Ligar
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                }
+
                 return (
                   <div
                     key={msg.id}
                     id={`msg-${msg.id}`}
                     className={`flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
                   >
-                    <div className="group relative max-w-[82%] sm:max-w-[75%]">
+                    <div
+                      className={`group relative max-w-[85%] sm:max-w-[74%] ${
+                        isSearchHighlighted
+                          ? 'rounded-2xl ring-2 ring-amber-400 ring-offset-2 dark:ring-offset-zinc-950'
+                          : ''
+                      }`}
+                    >
                       {msg.storyReplyUrl && (
                         <div className="mb-1.5 overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800">
                           <MediaImage
                             src={msg.storyReplyUrl}
                             alt="Story respondido"
-                            className="h-28 w-20 object-cover"
+                            className="h-24 w-16 object-cover sm:h-28 sm:w-20"
                           />
                         </div>
                       )}
@@ -1112,7 +1532,7 @@ export function MessagesView() {
                         <button
                           type="button"
                           onClick={() => setSelectedPostId(sharedPost.id)}
-                          className="mb-1.5 block w-52 overflow-hidden rounded-xl border border-zinc-200 bg-zinc-50 text-left dark:border-zinc-800 dark:bg-zinc-900"
+                          className="mb-1.5 block w-44 max-w-full overflow-hidden rounded-xl border border-zinc-200 bg-zinc-50 text-left sm:w-52 dark:border-zinc-800 dark:bg-zinc-900"
                         >
                           <MediaImage
                             src={sharedPost.media[0]?.url}
@@ -1135,7 +1555,7 @@ export function MessagesView() {
                         <button
                           type="button"
                           onClick={() => scrollToMessage(msg.replyToId)}
-                          className={`mb-1 flex w-full flex-col rounded-xl border-l-2 px-3 py-1.5 text-left text-xs transition-opacity hover:opacity-90 ${
+                          className={`mb-1 flex w-full flex-col rounded-xl border-l-2 px-2.5 py-1.5 text-left text-xs transition-opacity hover:opacity-90 sm:px-3 ${
                             isMine
                               ? 'border-sky-300 bg-sky-50 text-zinc-700 dark:border-sky-500 dark:bg-zinc-900 dark:text-zinc-300'
                               : 'border-zinc-400 bg-zinc-100/80 text-zinc-700 dark:border-zinc-600 dark:bg-zinc-900/70 dark:text-zinc-300'
@@ -1146,12 +1566,14 @@ export function MessagesView() {
                               {replyAuthor}
                             </span>
                           )}
-                          <span className="line-clamp-2 opacity-85">{msg.replyToText}</span>
+                          <span className="line-clamp-2 break-words opacity-85">
+                            {msg.replyToText}
+                          </span>
                         </button>
                       )}
 
                       <div
-                        className={`flex items-end gap-1.5 ${
+                        className={`flex items-end gap-1 ${
                           isMine ? 'flex-row-reverse' : 'flex-row'
                         }`}
                       >
@@ -1185,12 +1607,14 @@ export function MessagesView() {
                                 src={msg.videoUrl}
                                 controls
                                 playsInline
-                                className="max-h-72 w-full max-w-[280px] bg-black object-contain"
+                                className="max-h-60 w-full max-w-[220px] bg-black object-contain sm:max-h-72 sm:max-w-[280px]"
                               />
                               {msg.text &&
                                 msg.text !== 'Vídeo enviado' &&
                                 msg.text !== 'Mensagem de vídeo' && (
-                                  <p className="px-3.5 py-2 text-sm">{msg.text}</p>
+                                  <p className="break-words px-3 py-1.5 text-[13px] sm:px-3.5 sm:py-2 sm:text-sm">
+                                    {msg.text}
+                                  </p>
                                 )}
                             </div>
                           ) : msg.fileUrl && isImageFile ? (
@@ -1213,13 +1637,15 @@ export function MessagesView() {
                                 <img
                                   src={msg.fileUrl}
                                   alt={msg.fileName || 'Foto enviada'}
-                                  className="max-h-72 w-full max-w-[280px] object-cover"
+                                  className="max-h-60 w-full max-w-[220px] object-cover sm:max-h-72 sm:max-w-[280px]"
                                 />
                               </button>
                               {msg.text &&
                                 msg.text !== 'Foto da câmera' &&
                                 msg.text !== `Arquivo: ${msg.fileName || 'anexo'}` && (
-                                  <p className="px-3.5 py-2 text-sm">{msg.text}</p>
+                                  <p className="break-words px-3 py-1.5 text-[13px] sm:px-3.5 sm:py-2 sm:text-sm">
+                                    {msg.text}
+                                  </p>
                                 )}
                             </div>
                           ) : msg.fileUrl ? (
@@ -1228,7 +1654,7 @@ export function MessagesView() {
                               onDoubleClick={() =>
                                 reactToMessage(activeThread.id, msg.id, '❤️')
                               }
-                              className={`rounded-2xl px-3.5 py-2.5 ${
+                              className={`max-w-full rounded-2xl px-3 py-2 sm:px-3.5 sm:py-2.5 ${
                                 isMine
                                   ? 'bg-sky-600 text-white'
                                   : 'bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100'
@@ -1237,14 +1663,14 @@ export function MessagesView() {
                               <a
                                 href={msg.fileUrl}
                                 download={msg.fileName || 'arquivo'}
-                                className={`flex items-center gap-2.5 rounded-xl px-2.5 py-2 transition-colors ${
+                                className={`flex items-center gap-2 rounded-xl px-2.5 py-2 transition-colors ${
                                   isMine
                                     ? 'bg-white/15 hover:bg-white/25'
                                     : 'bg-white hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-700'
                                 }`}
                               >
                                 <span
-                                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${
+                                  className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg sm:h-9 sm:w-9 ${
                                     isMine
                                       ? 'bg-white/20 text-white'
                                       : 'bg-sky-500/10 text-sky-600 dark:text-sky-400'
@@ -1270,7 +1696,9 @@ export function MessagesView() {
                               </a>
                               {msg.text &&
                                 msg.text !== `Arquivo: ${msg.fileName || 'anexo'}` && (
-                                  <p className="mt-2 text-sm leading-relaxed">{msg.text}</p>
+                                  <p className="mt-2 break-words text-[13px] leading-relaxed sm:text-sm">
+                                    {msg.text}
+                                  </p>
                                 )}
                             </div>
                           ) : (
@@ -1279,7 +1707,7 @@ export function MessagesView() {
                               onDoubleClick={() =>
                                 reactToMessage(activeThread.id, msg.id, '❤️')
                               }
-                              className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                              className={`break-words rounded-2xl px-3.5 py-2 text-[13px] leading-relaxed sm:px-4 sm:py-2.5 sm:text-sm ${
                                 isMine
                                   ? 'bg-sky-600 text-white'
                                   : 'bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100'
@@ -1439,214 +1867,297 @@ export function MessagesView() {
               className="hidden"
             />
 
-            {/* Reply Banner above Composer */}
-            {replyingTo && (
-              <div className="flex items-center justify-between gap-3 border-t border-zinc-200 bg-zinc-50 px-4 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900/80">
-                <div className="min-w-0 flex-1 border-l-2 border-sky-600 pl-2.5">
-                  <p className="font-semibold text-sky-700 dark:text-sky-400">
-                    Respondendo a{' '}
-                    {isCurrentUserRef(replyingTo.senderId)
-                      ? 'você mesmo'
-                      : recipient.displayName}
-                  </p>
-                  <p className="truncate text-zinc-600 dark:text-zinc-300">
-                    {summarizeMessageForQuote(replyingTo)}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setReplyingTo(null)}
-                  aria-label="Cancelar resposta"
-                  className="text-zinc-400 hover:text-zinc-800 dark:hover:text-zinc-200"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-            )}
-
-            {/* Pending File / Image Attachment Preview above Composer */}
-            {pendingAttachment && (
-              <div className="flex items-center justify-between gap-3 border-t border-zinc-200 bg-sky-50/60 px-4 py-2 text-xs dark:border-zinc-800 dark:bg-sky-950/20">
-                <div className="flex min-w-0 items-center gap-2.5">
-                  {pendingAttachment.fileMime.startsWith('image/') ? (
-                    <img
-                      src={pendingAttachment.fileUrl}
-                      alt={pendingAttachment.fileName}
-                      className="h-10 w-10 rounded-lg object-cover"
-                    />
-                  ) : (
-                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-sky-600/15 text-sky-600 dark:text-sky-400">
-                      <FileText className="h-5 w-5" />
+            {/* Blocked Contact Banner OR Active Composer */}
+            {recipientBlocked ? (
+              <div className="shrink-0 border-t border-zinc-200 bg-zinc-50 px-3 py-3 dark:border-zinc-800 dark:bg-zinc-900/70">
+                <div className="flex flex-wrap items-center justify-between gap-2.5">
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-rose-500/15 text-rose-600 dark:text-rose-400">
+                      <Ban className="h-4 w-4" />
                     </span>
-                  )}
-                  <div className="min-w-0">
-                    <p className="truncate font-semibold text-zinc-900 dark:text-zinc-100">
-                      {pendingAttachment.fileName}
-                    </p>
-                    <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                      {formatBytes(pendingAttachment.fileSize)} · Pronto para enviar
-                    </p>
+                    <div className="min-w-0">
+                      <p className="truncate text-xs font-semibold text-zinc-900 dark:text-zinc-100">
+                        Você bloqueou @{recipient.username}
+                      </p>
+                      <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                        Mensagens e chamadas estão desativadas para este contato.
+                      </p>
+                    </div>
                   </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setPendingAttachment(null)}
-                  aria-label="Remover anexo"
-                  className="text-zinc-500 hover:text-zinc-900 dark:hover:text-white"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-            )}
-
-            {/* Fallback inline audio picker if microphone is unavailable */}
-            {audioFallbackOpen && (
-              <div className="flex items-center justify-between gap-3 border-t border-zinc-200 bg-zinc-50 px-4 py-2.5 text-xs dark:border-zinc-800 dark:bg-zinc-900">
-                <span className="text-zinc-600 dark:text-zinc-300">
-                  Microfone bloqueado ou ausente. Envie um arquivo de áudio:
-                </span>
-                <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => audioFileInputRef.current?.click()}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900 px-3 py-1.5 font-semibold text-white dark:bg-white dark:text-zinc-950"
+                    onClick={() => unblockUser(recipient.id)}
+                    className="h-9 shrink-0 rounded-xl bg-zinc-900 px-3.5 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200"
                   >
-                    <FileAudio className="h-3.5 w-3.5" />
-                    <span>Escolher áudio</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAudioFallbackOpen(false)}
-                    aria-label="Fechar aviso"
-                    className="text-zinc-500 hover:text-zinc-900 dark:hover:text-white"
-                  >
-                    <X className="h-4 w-4" />
+                    Desbloquear
                   </button>
                 </div>
               </div>
-            )}
-
-            {/* Composer */}
-            <div className="relative border-t border-zinc-200 p-3 dark:border-zinc-800">
-              {videoMenuOpen && (
-                <div className="absolute right-14 bottom-16 z-20 w-56 overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-950">
-                  <button
-                    type="button"
-                    onClick={() => void openCameraModal('video')}
-                    className="flex w-full items-center gap-2.5 px-4 py-3 text-left text-sm text-zinc-800 hover:bg-zinc-50 dark:text-zinc-200 dark:hover:bg-zinc-900"
-                  >
-                    <Camera className="h-4 w-4 text-sky-600" />
-                    <span>Gravar vídeo agora</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => videoFileInputRef.current?.click()}
-                    className="flex w-full items-center gap-2.5 border-t border-zinc-100 px-4 py-3 text-left text-sm text-zinc-800 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
-                  >
-                    <Upload className="h-4 w-4 text-zinc-600 dark:text-zinc-400" />
-                    <span>Enviar vídeo do dispositivo</span>
-                  </button>
-                </div>
-              )}
-
-              {isRecordingAudio ? (
-                <div className="flex h-11 items-center justify-between gap-3 rounded-full border border-rose-500/40 bg-rose-50 px-3 dark:bg-rose-950/30">
-                  <button
-                    type="button"
-                    onClick={cancelAudioRecording}
-                    aria-label="Cancelar áudio"
-                    className="flex h-8 w-8 items-center justify-center rounded-full text-rose-600 hover:bg-rose-100 dark:text-rose-400 dark:hover:bg-rose-900/40"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
-
-                  <div className="flex flex-1 items-center justify-center gap-2.5">
-                    <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-rose-500" />
-                    <span className="font-mono text-sm font-semibold text-rose-600 tabular-nums dark:text-rose-400">
-                      {formatTimer(recordingSec)}
-                    </span>
-                    <span className="text-xs text-zinc-600 dark:text-zinc-300">
-                      Gravando áudio...
-                    </span>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={finishAndSendAudio}
-                    aria-label="Enviar mensagem de voz"
-                    className="flex h-8 w-8 items-center justify-center rounded-full bg-sky-600 text-white hover:bg-sky-700"
-                  >
-                    <Send className="h-4 w-4" />
-                  </button>
-                </div>
-              ) : (
-                <form onSubmit={handleSend} className="flex items-center gap-1.5 sm:gap-2">
-                  <button
-                    type="button"
-                    onClick={() => void openCameraModal('photo')}
-                    aria-label="Abrir câmera"
-                    title="Abrir câmera (foto ou vídeo)"
-                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900"
-                  >
-                    <Camera className="h-5 w-5" />
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => attachmentFileInputRef.current?.click()}
-                    aria-label="Enviar arquivo"
-                    title="Enviar arquivo ou imagem"
-                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900"
-                  >
-                    <Paperclip className="h-5 w-5" />
-                  </button>
-
-                  <input
-                    ref={draftInputRef}
-                    type="text"
-                    value={draft}
-                    onChange={(e) => handleDraftChange(e.target.value)}
-                    onBlur={() => {
-                      if (selectedRecipientId) {
-                        setTypingStatus(selectedRecipientId, false, activeThread?.id);
-                      }
-                    }}
-                    placeholder="Mensagem..."
-                    className="h-11 min-w-0 flex-1 rounded-full border border-zinc-200 bg-zinc-50 px-4 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-400 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
-                  />
-
-                  <button
-                    type="button"
-                    onClick={startAudioRecording}
-                    aria-label="Gravar mensagem de voz"
-                    title="Gravar mensagem de voz"
-                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900"
-                  >
-                    <Mic className="h-5 w-5" />
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setVideoMenuOpen((o) => !o)}
-                    aria-label="Enviar mensagem de vídeo"
-                    title="Enviar vídeo"
-                    className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900"
-                  >
-                    <Video className="h-5 w-5" />
-                  </button>
-
-                  {(draft.trim() || pendingAttachment) && (
+            ) : (
+              <>
+                {/* Reply Banner above Composer */}
+                {replyingTo && (
+                  <div className="flex shrink-0 items-center justify-between gap-3 border-t border-zinc-200 bg-zinc-50 px-3 py-2 text-xs sm:px-4 dark:border-zinc-800 dark:bg-zinc-900/80">
+                    <div className="min-w-0 flex-1 border-l-2 border-sky-600 pl-2.5">
+                      <p className="font-semibold text-sky-700 dark:text-sky-400">
+                        Respondendo a{' '}
+                        {isCurrentUserRef(replyingTo.senderId)
+                          ? 'você mesmo'
+                          : recipient.displayName}
+                      </p>
+                      <p className="truncate text-zinc-600 dark:text-zinc-300">
+                        {summarizeMessageForQuote(replyingTo)}
+                      </p>
+                    </div>
                     <button
-                      type="submit"
-                      aria-label="Enviar mensagem"
-                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-sky-600 text-white transition-colors hover:bg-sky-700"
+                      type="button"
+                      onClick={() => setReplyingTo(null)}
+                      aria-label="Cancelar resposta"
+                      className="flex h-8 w-8 items-center justify-center text-zinc-400 hover:text-zinc-800 dark:hover:text-zinc-200"
                     >
-                      <Send className="h-4 w-4" />
+                      <X className="h-4 w-4" />
                     </button>
+                  </div>
+                )}
+
+                {/* Pending File / Image Attachment Preview above Composer */}
+                {pendingAttachment && (
+                  <div className="flex shrink-0 items-center justify-between gap-3 border-t border-zinc-200 bg-sky-50/60 px-3 py-2 text-xs sm:px-4 dark:border-zinc-800 dark:bg-sky-950/20">
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      {pendingAttachment.fileMime.startsWith('image/') ? (
+                        <img
+                          src={pendingAttachment.fileUrl}
+                          alt={pendingAttachment.fileName}
+                          className="h-10 w-10 rounded-lg object-cover"
+                        />
+                      ) : (
+                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-sky-600/15 text-sky-600 dark:text-sky-400">
+                          <FileText className="h-5 w-5" />
+                        </span>
+                      )}
+                      <div className="min-w-0">
+                        <p className="truncate font-semibold text-zinc-900 dark:text-zinc-100">
+                          {pendingAttachment.fileName}
+                        </p>
+                        <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                          {formatBytes(pendingAttachment.fileSize)} · Pronto para enviar
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setPendingAttachment(null)}
+                      aria-label="Remover anexo"
+                      className="flex h-8 w-8 items-center justify-center text-zinc-500 hover:text-zinc-900 dark:hover:text-white"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
+
+                {/* Fallback inline audio picker if microphone is unavailable */}
+                {audioFallbackOpen && (
+                  <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-zinc-200 bg-zinc-50 px-3 py-2 text-xs sm:px-4 sm:py-2.5 dark:border-zinc-800 dark:bg-zinc-900">
+                    <span className="text-zinc-600 dark:text-zinc-300">
+                      Microfone ausente. Envie um arquivo de áudio:
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => audioFileInputRef.current?.click()}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900 px-3 py-1.5 font-semibold text-white dark:bg-white dark:text-zinc-950"
+                      >
+                        <FileAudio className="h-3.5 w-3.5" />
+                        <span>Escolher áudio</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAudioFallbackOpen(false)}
+                        aria-label="Fechar aviso"
+                        className="text-zinc-500 hover:text-zinc-900 dark:hover:text-white"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Mobile Quick Media Tray (Keeps composer input wide on narrow screens) */}
+                {mobileTrayOpen && !isRecordingAudio && (
+                  <div className="grid shrink-0 grid-cols-4 gap-2 border-t border-zinc-200 bg-zinc-50 px-3 py-2.5 sm:hidden dark:border-zinc-800 dark:bg-zinc-900/90">
+                    <button
+                      type="button"
+                      onClick={() => void openCameraModal('photo')}
+                      className="flex flex-col items-center gap-1 rounded-xl bg-white py-2 text-[11px] font-medium text-zinc-700 shadow-xs dark:bg-zinc-950 dark:text-zinc-200"
+                    >
+                      <Camera className="h-4 w-4 text-sky-600" />
+                      <span>Câmera</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => attachmentFileInputRef.current?.click()}
+                      className="flex flex-col items-center gap-1 rounded-xl bg-white py-2 text-[11px] font-medium text-zinc-700 shadow-xs dark:bg-zinc-950 dark:text-zinc-200"
+                    >
+                      <Paperclip className="h-4 w-4 text-emerald-600" />
+                      <span>Arquivo</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void openCameraModal('video')}
+                      className="flex flex-col items-center gap-1 rounded-xl bg-white py-2 text-[11px] font-medium text-zinc-700 shadow-xs dark:bg-zinc-950 dark:text-zinc-200"
+                    >
+                      <Video className="h-4 w-4 text-violet-600" />
+                      <span>Gravar vídeo</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => videoFileInputRef.current?.click()}
+                      className="flex flex-col items-center gap-1 rounded-xl bg-white py-2 text-[11px] font-medium text-zinc-700 shadow-xs dark:bg-zinc-950 dark:text-zinc-200"
+                    >
+                      <Upload className="h-4 w-4 text-amber-600" />
+                      <span>Enviar vídeo</span>
+                    </button>
+                  </div>
+                )}
+
+                {/* Composer */}
+                <div className="relative shrink-0 border-t border-zinc-200 p-2 sm:p-3 dark:border-zinc-800">
+                  {videoMenuOpen && (
+                    <div className="absolute right-14 bottom-16 z-20 hidden w-56 overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-lg sm:block dark:border-zinc-800 dark:bg-zinc-950">
+                      <button
+                        type="button"
+                        onClick={() => void openCameraModal('video')}
+                        className="flex w-full items-center gap-2.5 px-4 py-3 text-left text-sm text-zinc-800 hover:bg-zinc-50 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                      >
+                        <Camera className="h-4 w-4 text-sky-600" />
+                        <span>Gravar vídeo agora</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => videoFileInputRef.current?.click()}
+                        className="flex w-full items-center gap-2.5 border-t border-zinc-100 px-4 py-3 text-left text-sm text-zinc-800 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                      >
+                        <Upload className="h-4 w-4 text-zinc-600 dark:text-zinc-400" />
+                        <span>Enviar vídeo do dispositivo</span>
+                      </button>
+                    </div>
                   )}
-                </form>
-              )}
-            </div>
+
+                  {isRecordingAudio ? (
+                    <div className="flex h-11 items-center justify-between gap-3 rounded-full border border-rose-500/40 bg-rose-50 px-3 dark:bg-rose-950/30">
+                      <button
+                        type="button"
+                        onClick={cancelAudioRecording}
+                        aria-label="Cancelar áudio"
+                        className="flex h-9 w-9 items-center justify-center rounded-full text-rose-600 hover:bg-rose-100 dark:text-rose-400 dark:hover:bg-rose-900/40"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+
+                      <div className="flex flex-1 items-center justify-center gap-2">
+                        <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-rose-500" />
+                        <span className="font-mono text-sm font-semibold text-rose-600 tabular-nums dark:text-rose-400">
+                          {formatTimer(recordingSec)}
+                        </span>
+                        <span className="text-xs text-zinc-600 dark:text-zinc-300">
+                          Gravando...
+                        </span>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={finishAndSendAudio}
+                        aria-label="Enviar mensagem de voz"
+                        className="flex h-9 w-9 items-center justify-center rounded-full bg-sky-600 text-white hover:bg-sky-700"
+                      >
+                        <Send className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <form onSubmit={handleSend} className="flex items-center gap-1 sm:gap-2">
+                      {/* Mobile '+' tray trigger */}
+                      <button
+                        type="button"
+                        onClick={() => setMobileTrayOpen((v) => !v)}
+                        aria-label="Mais opções de envio"
+                        className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-transform sm:hidden ${
+                          mobileTrayOpen
+                            ? 'rotate-45 bg-zinc-900 text-white dark:bg-white dark:text-zinc-950'
+                            : 'bg-zinc-100 text-zinc-700 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-200'
+                        }`}
+                      >
+                        <Plus className="h-5 w-5" />
+                      </button>
+
+                      {/* Desktop/Tablet direct media triggers */}
+                      <button
+                        type="button"
+                        onClick={() => void openCameraModal('photo')}
+                        aria-label="Abrir câmera"
+                        title="Abrir câmera (foto ou vídeo)"
+                        className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 sm:flex dark:text-zinc-200 dark:hover:bg-zinc-900"
+                      >
+                        <Camera className="h-5 w-5" />
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => attachmentFileInputRef.current?.click()}
+                        aria-label="Enviar arquivo"
+                        title="Enviar arquivo ou imagem"
+                        className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 sm:flex dark:text-zinc-200 dark:hover:bg-zinc-900"
+                      >
+                        <Paperclip className="h-5 w-5" />
+                      </button>
+
+                      <input
+                        ref={draftInputRef}
+                        type="text"
+                        value={draft}
+                        onChange={(e) => handleDraftChange(e.target.value)}
+                        onBlur={() => {
+                          if (selectedRecipientId) {
+                            setTypingStatus(selectedRecipientId, false, activeThread?.id);
+                          }
+                        }}
+                        placeholder="Mensagem..."
+                        className="h-10 min-w-0 flex-1 rounded-full border border-zinc-200 bg-zinc-50 px-3.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-400 focus:outline-none sm:h-11 sm:px-4 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100"
+                      />
+
+                      <button
+                        type="button"
+                        onClick={startAudioRecording}
+                        aria-label="Gravar mensagem de voz"
+                        title="Gravar mensagem de voz"
+                        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                      >
+                        <Mic className="h-5 w-5" />
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setVideoMenuOpen((o) => !o)}
+                        aria-label="Enviar mensagem de vídeo"
+                        title="Enviar vídeo"
+                        className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-full text-zinc-700 transition-colors hover:bg-zinc-100 sm:flex dark:text-zinc-200 dark:hover:bg-zinc-900"
+                      >
+                        <Video className="h-5 w-5" />
+                      </button>
+
+                      {(draft.trim() || pendingAttachment) && (
+                        <button
+                          type="submit"
+                          aria-label="Enviar mensagem"
+                          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-sky-600 text-white transition-colors hover:bg-sky-700"
+                        >
+                          <Send className="h-4 w-4" />
+                        </button>
+                      )}
+                    </form>
+                  )}
+                </div>
+              </>
+            )}
           </>
         ) : (
           <div className="flex flex-1 flex-col items-center justify-center p-6 text-center">
@@ -1654,16 +2165,466 @@ export function MessagesView() {
               Suas mensagens diretas
             </p>
             <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-              Selecione um perfil à esquerda para enviar textos, arquivos, fotos, áudios ou vídeos.
+              Selecione um perfil à esquerda para enviar textos, arquivos, fotos, áudios ou iniciar chamadas.
             </p>
           </div>
         )}
       </div>
 
+      {/* Advanced Chat Options Bottom Sheet (Mobile) / Modal (Desktop) */}
+      {optionsOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-xs sm:items-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Opções do bate-papo"
+          onClick={() => setOptionsOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="flex max-h-[88dvh] w-full max-w-md flex-col overflow-hidden rounded-t-3xl border border-zinc-200 bg-white shadow-2xl sm:rounded-2xl dark:border-zinc-800 dark:bg-zinc-950"
+          >
+            {/* Mobile drag handle */}
+            <div className="flex justify-center pt-2.5 sm:hidden">
+              <span className="h-1.5 w-10 rounded-full bg-zinc-300 dark:bg-zinc-700" />
+            </div>
+
+            <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
+              <div className="flex items-center gap-2">
+                {optionsSubView !== 'main' && recipient && (
+                  <button
+                    type="button"
+                    onClick={() => setOptionsSubView('main')}
+                    aria-label="Voltar"
+                    className="flex h-8 w-8 items-center justify-center rounded-full text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                  >
+                    <ArrowLeft className="h-4 w-4" />
+                  </button>
+                )}
+                <h2 className="text-sm font-bold text-zinc-950 dark:text-zinc-100">
+                  {optionsSubView === 'media'
+                    ? 'Mídias e arquivos'
+                    : optionsSubView === 'blocked'
+                    ? 'Pessoas bloqueadas'
+                    : 'Opções da conversa'}
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setOptionsOpen(false)}
+                aria-label="Fechar opções"
+                className="flex h-9 w-9 items-center justify-center rounded-full text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-900"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="flex-1 space-y-4 overflow-y-auto p-4">
+              {optionsSubView === 'blocked' ? (
+                resolvedBlockedUsers.length === 0 ? (
+                  <div className="py-10 text-center">
+                    <UserCheck className="mx-auto h-8 w-8 text-zinc-400" />
+                    <p className="mt-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                      Nenhum usuário bloqueado
+                    </p>
+                    <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                      Contatos bloqueados aparecerão aqui para você gerenciar quando quiser.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {resolvedBlockedUsers.map((bu) => (
+                      <div
+                        key={bu.id}
+                        className="flex items-center justify-between gap-3 rounded-xl border border-zinc-200 px-3 py-2.5 dark:border-zinc-800"
+                      >
+                        <div className="flex min-w-0 items-center gap-2.5">
+                          <AvatarRing src={bu.avatarUrl} alt={bu.username} size="sm" />
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                              {bu.displayName}
+                            </p>
+                            <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
+                              @{bu.username}
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => unblockUser(bu.id)}
+                          className="h-9 shrink-0 rounded-xl bg-zinc-900 px-3 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200"
+                        >
+                          Desbloquear
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )
+              ) : optionsSubView === 'media' && recipient ? (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                    <div className="rounded-xl bg-zinc-100 p-2.5 dark:bg-zinc-900">
+                      <p className="text-base font-bold text-zinc-900 tabular-nums dark:text-white">
+                        {sharedMediaStats.photos.length}
+                      </p>
+                      <p className="text-zinc-500 dark:text-zinc-400">Fotos</p>
+                    </div>
+                    <div className="rounded-xl bg-zinc-100 p-2.5 dark:bg-zinc-900">
+                      <p className="text-base font-bold text-zinc-900 tabular-nums dark:text-white">
+                        {sharedMediaStats.videos.length}
+                      </p>
+                      <p className="text-zinc-500 dark:text-zinc-400">Vídeos</p>
+                    </div>
+                    <div className="rounded-xl bg-zinc-100 p-2.5 dark:bg-zinc-900">
+                      <p className="text-base font-bold text-zinc-900 tabular-nums dark:text-white">
+                        {sharedMediaStats.files.length + sharedMediaStats.audioCount}
+                      </p>
+                      <p className="text-zinc-500 dark:text-zinc-400">Arq./Áudios</p>
+                    </div>
+                  </div>
+
+                  {sharedMediaStats.photos.length > 0 && (
+                    <div>
+                      <p className="mb-2 text-xs font-semibold text-zinc-500 uppercase">
+                        Fotos compartilhadas
+                      </p>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        {sharedMediaStats.photos.map((p) => (
+                          <button
+                            key={p.id}
+                            type="button"
+                            onClick={() => {
+                              setOptionsOpen(false);
+                              setLightboxImageUrl(p.fileUrl!);
+                            }}
+                            className="aspect-square overflow-hidden rounded-xl bg-zinc-100 dark:bg-zinc-900"
+                          >
+                            <img
+                              src={p.fileUrl}
+                              alt={p.fileName || 'Foto'}
+                              className="h-full w-full object-cover"
+                            />
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {sharedMediaStats.files.length > 0 && (
+                    <div>
+                      <p className="mb-2 text-xs font-semibold text-zinc-500 uppercase">
+                        Documentos
+                      </p>
+                      <div className="space-y-1.5">
+                        {sharedMediaStats.files.map((f) => (
+                          <a
+                            key={f.id}
+                            href={f.fileUrl}
+                            download={f.fileName || 'arquivo'}
+                            className="flex items-center gap-2.5 rounded-xl border border-zinc-200 px-3 py-2 text-xs hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
+                          >
+                            <FileText className="h-4 w-4 shrink-0 text-sky-600" />
+                            <span className="min-w-0 flex-1 truncate font-medium text-zinc-900 dark:text-zinc-100">
+                              {f.fileName || 'Documento'}
+                            </span>
+                            <Download className="h-4 w-4 shrink-0 text-zinc-400" />
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {sharedMediaStats.photos.length === 0 &&
+                    sharedMediaStats.videos.length === 0 &&
+                    sharedMediaStats.files.length === 0 && (
+                      <p className="py-6 text-center text-xs text-zinc-500 dark:text-zinc-400">
+                        Nenhuma mídia ou arquivo enviado nesta conversa ainda.
+                      </p>
+                    )}
+                </div>
+              ) : recipient ? (
+                <>
+                  {/* Recipient Identity Card */}
+                  <div className="flex items-center justify-between gap-3 rounded-2xl border border-zinc-200 p-3 dark:border-zinc-800">
+                    <div className="flex min-w-0 items-center gap-3">
+                      <AvatarRing
+                        src={recipient.avatarUrl}
+                        alt={recipient.username}
+                        size="md"
+                        showOnlineIndicator={Boolean(recipient.isOnline && !recipientBlocked)}
+                      />
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-bold text-zinc-950 dark:text-zinc-100">
+                          {recipient.displayName}
+                        </p>
+                        <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
+                          @{recipient.username}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setOptionsOpen(false);
+                        openProfile(recipient.id);
+                      }}
+                      className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-xl bg-zinc-100 px-3 text-xs font-semibold text-zinc-800 hover:bg-zinc-200 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                    >
+                      <span>Perfil</span>
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+
+                  {/* Quick Grid Actions */}
+                  <div className="grid grid-cols-4 gap-2">
+                    <button
+                      type="button"
+                      disabled={recipientBlocked || Boolean(activeCall)}
+                      onClick={() => {
+                        setOptionsOpen(false);
+                        void startCall(recipient.id, 'audio');
+                      }}
+                      className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-2xl bg-zinc-100 p-2 text-[11px] font-semibold text-zinc-800 hover:bg-zinc-200 disabled:opacity-40 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                    >
+                      <Phone className="h-4 w-4 text-emerald-600" />
+                      <span>Áudio</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={recipientBlocked || Boolean(activeCall)}
+                      onClick={() => {
+                        setOptionsOpen(false);
+                        void startCall(recipient.id, 'video');
+                      }}
+                      className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-2xl bg-zinc-100 p-2 text-[11px] font-semibold text-zinc-800 hover:bg-zinc-200 disabled:opacity-40 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                    >
+                      <Video className="h-4 w-4 text-sky-600" />
+                      <span>Vídeo</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!activeThread}
+                      onClick={() => {
+                        if (activeThread) toggleMuteThread(activeThread.id);
+                      }}
+                      className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-2xl bg-zinc-100 p-2 text-[11px] font-semibold text-zinc-800 hover:bg-zinc-200 disabled:opacity-40 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                    >
+                      {activeThreadMuted ? (
+                        <Bell className="h-4 w-4 text-amber-600" />
+                      ) : (
+                        <BellOff className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
+                      )}
+                      <span>{activeThreadMuted ? 'Reativar' : 'Silenciar'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!activeThread}
+                      onClick={() => {
+                        if (activeThread) togglePinThread(activeThread.id);
+                      }}
+                      className="flex min-h-[64px] flex-col items-center justify-center gap-1.5 rounded-2xl bg-zinc-100 p-2 text-[11px] font-semibold text-zinc-800 hover:bg-zinc-200 disabled:opacity-40 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                    >
+                      {activeThreadPinned ? (
+                        <PinOff className="h-4 w-4 text-sky-600" />
+                      ) : (
+                        <Pin className="h-4 w-4 text-zinc-600 dark:text-zinc-300" />
+                      )}
+                      <span>{activeThreadPinned ? 'Desafixar' : 'Fixar'}</span>
+                    </button>
+                  </div>
+
+                  {/* Conversation Tools List */}
+                  <div className="divide-y divide-zinc-200 overflow-hidden rounded-2xl border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setOptionsOpen(false);
+                        setThreadSearchOpen(true);
+                      }}
+                      className="flex min-h-[48px] w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-zinc-800 hover:bg-zinc-50 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                    >
+                      <span className="flex items-center gap-3">
+                        <Search className="h-4 w-4 text-zinc-500" />
+                        <span>Buscar nesta conversa</span>
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setOptionsSubView('media')}
+                      className="flex min-h-[48px] w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-zinc-800 hover:bg-zinc-50 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                    >
+                      <span className="flex items-center gap-3">
+                        <FolderOpen className="h-4 w-4 text-sky-600" />
+                        <span>Mídias e arquivos compartilhados</span>
+                      </span>
+                      <span className="text-xs text-zinc-400 tabular-nums">
+                        {sharedMediaStats.photos.length +
+                          sharedMediaStats.videos.length +
+                          sharedMediaStats.files.length}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setOptionsSubView('blocked')}
+                      className="flex min-h-[48px] w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-zinc-800 hover:bg-zinc-50 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                    >
+                      <span className="flex items-center gap-3">
+                        <UserX className="h-4 w-4 text-zinc-500" />
+                        <span>Gerenciar pessoas bloqueadas</span>
+                      </span>
+                      <span className="text-xs text-zinc-400 tabular-nums">
+                        {blockedUserIds.length}
+                      </span>
+                    </button>
+                  </div>
+
+                  {/* Privacy & Safety / Destructive Actions */}
+                  <div className="space-y-2">
+                    {activeThread && (
+                      <>
+                        {confirmAction === 'clear' ? (
+                          <div className="flex items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2.5 text-xs dark:border-amber-900/50 dark:bg-amber-950/30">
+                            <span className="font-medium text-amber-900 dark:text-amber-200">
+                              Limpar histórico deste chat?
+                            </span>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setConfirmAction(null)}
+                                className="rounded-lg px-2.5 py-1 font-semibold text-zinc-600 hover:bg-black/5 dark:text-zinc-300"
+                              >
+                                Cancelar
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  clearThreadMessages(activeThread.id);
+                                  setConfirmAction(null);
+                                  setOptionsOpen(false);
+                                }}
+                                className="rounded-lg bg-amber-600 px-2.5 py-1 font-semibold text-white hover:bg-amber-700"
+                              >
+                                Limpar
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmAction('clear')}
+                            className="flex min-h-[46px] w-full items-center gap-3 rounded-xl border border-zinc-200 px-4 py-2.5 text-left text-sm font-medium text-zinc-800 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                          >
+                            <Trash2 className="h-4 w-4 text-zinc-500" />
+                            <span>Limpar histórico da conversa</span>
+                          </button>
+                        )}
+
+                        {confirmAction === 'delete' ? (
+                          <div className="flex items-center justify-between gap-2 rounded-xl border border-rose-300 bg-rose-50 px-3 py-2.5 text-xs dark:border-rose-900/50 dark:bg-rose-950/30">
+                            <span className="font-medium text-rose-900 dark:text-rose-200">
+                              Remover conversa da lista?
+                            </span>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setConfirmAction(null)}
+                                className="rounded-lg px-2.5 py-1 font-semibold text-zinc-600 hover:bg-black/5 dark:text-zinc-300"
+                              >
+                                Cancelar
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  deleteThread(activeThread.id);
+                                  setConfirmAction(null);
+                                  setOptionsOpen(false);
+                                  setSelectedRecipientId(null);
+                                }}
+                                className="rounded-lg bg-rose-600 px-2.5 py-1 font-semibold text-white hover:bg-rose-700"
+                              >
+                                Remover
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmAction('delete')}
+                            className="flex min-h-[46px] w-full items-center gap-3 rounded-xl border border-zinc-200 px-4 py-2.5 text-left text-sm font-medium text-zinc-800 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                          >
+                            <X className="h-4 w-4 text-zinc-500" />
+                            <span>Excluir conversa da lista</span>
+                          </button>
+                        )}
+                      </>
+                    )}
+
+                    {/* Block / Unblock User */}
+                    {recipientBlocked ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          unblockUser(recipient.id);
+                          setOptionsOpen(false);
+                        }}
+                        className="flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-3 text-sm font-semibold text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200"
+                      >
+                        <UserCheck className="h-4 w-4" />
+                        <span>Desbloquear @{recipient.username}</span>
+                      </button>
+                    ) : confirmAction === 'block' ? (
+                      <div className="space-y-2 rounded-xl border border-rose-300 bg-rose-50 p-3 text-xs dark:border-rose-900/60 dark:bg-rose-950/30">
+                        <p className="font-semibold text-rose-900 dark:text-rose-200">
+                          Bloquear @{recipient.username}?
+                        </p>
+                        <p className="text-rose-800/80 dark:text-rose-300/80">
+                          Vocês não poderão enviar mensagens nem iniciar chamadas de áudio ou vídeo.
+                        </p>
+                        <div className="flex justify-end gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => setConfirmAction(null)}
+                            className="h-8 rounded-lg px-3 font-semibold text-zinc-700 hover:bg-black/5 dark:text-zinc-300"
+                          >
+                            Cancelar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              blockUser(recipient.id);
+                              setConfirmAction(null);
+                              setOptionsOpen(false);
+                            }}
+                            className="h-8 rounded-lg bg-rose-600 px-3 font-semibold text-white hover:bg-rose-700"
+                          >
+                            Confirmar bloqueio
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmAction('block')}
+                        className="flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl border border-rose-200 bg-rose-50/70 px-4 py-3 text-sm font-semibold text-rose-600 hover:bg-rose-100 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-400 dark:hover:bg-rose-950/50"
+                      >
+                        <Ban className="h-4 w-4" />
+                        <span>Bloquear @{recipient.username}</span>
+                      </button>
+                    )}
+                  </div>
+                </>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Unified Live Camera Modal (Photo & Video) */}
       {cameraModalOpen && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-3 backdrop-blur-sm sm:p-4"
           role="dialog"
           aria-modal="true"
           aria-label="Câmera do Messenger"
@@ -1671,7 +2632,7 @@ export function MessagesView() {
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-md overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-xl dark:border-zinc-800 dark:bg-zinc-950"
+            className="max-h-[92dvh] w-full max-w-md overflow-y-auto rounded-2xl border border-zinc-200 bg-white shadow-xl dark:border-zinc-800 dark:bg-zinc-950"
           >
             <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
               <div className="flex items-center gap-2">
@@ -1877,7 +2838,7 @@ export function MessagesView() {
             src={lightboxImageUrl}
             alt="Visualização ampliada"
             onClick={(e) => e.stopPropagation()}
-            className="max-h-[88vh] max-w-[92vw] rounded-xl object-contain"
+            className="max-h-[88dvh] max-w-[92vw] rounded-xl object-contain"
           />
         </div>
       )}

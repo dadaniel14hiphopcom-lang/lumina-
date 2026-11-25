@@ -1,12 +1,14 @@
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
+import { WebSocket, WebSocketServer } from 'ws';
 import { createZipBuffer } from './server/zip.ts';
 import type { ZipEntryInput } from './server/zip.ts';
 import {
@@ -51,6 +53,7 @@ const ADMIN_STATE_FILE = path.join(ROOT_DIR, '.lumina-admin-state.json');
 const USER_AUTH_FILE = path.join(ROOT_DIR, '.lumina-user-auth.json');
 const SOCIAL_STATE_FILE = path.join(ROOT_DIR, '.lumina-social-state.json');
 const POST_PREVIEWS_FILE = path.join(ROOT_DIR, '.lumina-post-previews.json');
+const USER_BLOCKS_FILE = path.join(ROOT_DIR, '.lumina-user-blocks.json');
 const UPLOADS_DIR = path.join(ROOT_DIR, '.lumina-uploads');
 
 const FALLBACK_RANDOM_KEY = crypto.randomBytes(32);
@@ -217,6 +220,86 @@ const typingStateMap = new Map<
   string,
   { fromUserId: string; toUserId: string; threadId?: string; updatedAt: number }
 >();
+
+let memoryUserBlocks: Record<string, string[]> | null = null;
+function readUserBlocksStore(): Record<string, string[]> {
+  if (memoryUserBlocks) return memoryUserBlocks;
+  try {
+    if (fs.existsSync(USER_BLOCKS_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(USER_BLOCKS_FILE, 'utf8'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        memoryUserBlocks = parsed as Record<string, string[]>;
+        return memoryUserBlocks;
+      }
+    }
+  } catch {
+    // Ignore malformed blocks store
+  }
+  memoryUserBlocks = {};
+  return memoryUserBlocks;
+}
+
+function writeUserBlocksStore(store: Record<string, string[]>): void {
+  memoryUserBlocks = store;
+  try {
+    fs.writeFileSync(USER_BLOCKS_FILE, JSON.stringify(store), 'utf8');
+  } catch {
+    // Keep in memory if filesystem is read-only
+  }
+}
+
+function isUserBlockedPair(userIdA: string, userIdB: string): boolean {
+  if (!userIdA || !userIdB) return false;
+  const store = readUserBlocksStore();
+  const listA = store[userIdA] || [];
+  const listB = store[userIdB] || [];
+  return listA.includes(userIdB) || listB.includes(userIdA);
+}
+
+interface QueuedCallSignal {
+  id: string;
+  signal: Record<string, unknown>;
+  createdAt: number;
+}
+
+const callSignalQueueMap = new Map<string, QueuedCallSignal[]>();
+const wsClientsByUserId = new Map<string, Set<WebSocket>>();
+
+function sendRealtimeToUserIds(userIds: string[], payload: Record<string, unknown>): void {
+  const serialized = JSON.stringify(payload);
+  const delivered = new Set<WebSocket>();
+  for (const uid of userIds) {
+    if (!uid) continue;
+    const sockets = wsClientsByUserId.get(uid);
+    if (!sockets) continue;
+    for (const sock of sockets) {
+      if (delivered.has(sock)) continue;
+      if (sock.readyState === WebSocket.OPEN) {
+        try {
+          sock.send(serialized);
+          delivered.add(sock);
+        } catch {
+          // Ignore broken socket write
+        }
+      }
+    }
+  }
+}
+
+function enqueueCallSignalForUserIds(recipientIds: string[], signal: Record<string, unknown>): void {
+  const now = Date.now();
+  const cutoff = now - 45_000;
+  const id = `sig_${now}_${Math.random().toString(36).slice(2, 8)}`;
+  const item: QueuedCallSignal = { id, signal, createdAt: now };
+
+  for (const uid of recipientIds) {
+    if (!uid) continue;
+    const prev = (callSignalQueueMap.get(uid) || []).filter((s) => s.createdAt >= cutoff);
+    prev.push(item);
+    callSignalQueueMap.set(uid, prev.slice(-80));
+  }
+  sendRealtimeToUserIds(recipientIds, { type: 'call_signal', signal });
+}
 
 interface IntegrationState {
   aws: {
@@ -1304,7 +1387,98 @@ function resolveAwsMediaTarget(state: IntegrationState) {
 
 async function startServer() {
   const app = express();
+  const httpServer = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true });
   app.use(express.json({ limit: '4mb' }));
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    try {
+      const reqUrl = new URL(req.url || '/', 'http://localhost');
+      if (reqUrl.pathname !== '/ws/realtime') {
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
+      });
+    } catch {
+      socket.destroy();
+    }
+  });
+
+  wss.on('connection', (ws, req) => {
+    let boundIds: string[] = [];
+    try {
+      const reqUrl = new URL(req.url || '/', 'http://localhost');
+      const rawIds = reqUrl.searchParams.get('userIds') || '';
+      boundIds = Array.from(
+        new Set(
+          rawIds
+            .split(',')
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0 && s.length <= 128)
+        )
+      ).slice(0, 4);
+    } catch {
+      boundIds = [];
+    }
+
+    for (const uid of boundIds) {
+      let set = wsClientsByUserId.get(uid);
+      if (!set) {
+        set = new Set();
+        wsClientsByUserId.set(uid, set);
+      }
+      set.add(ws);
+    }
+
+    ws.on('message', (rawData) => {
+      try {
+        const parsed = JSON.parse(String(rawData || '')) as {
+          type?: string;
+          signal?: Record<string, unknown>;
+        };
+        if (parsed?.type === 'call_signal' && parsed.signal && typeof parsed.signal === 'object') {
+          const sig = parsed.signal;
+          const fromId = typeof sig.fromUserId === 'string' ? sig.fromUserId.trim() : '';
+          const toId = typeof sig.toUserId === 'string' ? sig.toUserId.trim() : '';
+          const toUid = typeof sig.toUid === 'string' ? sig.toUid.trim() : '';
+          const sigType = typeof sig.type === 'string' ? sig.type : '';
+          if (!fromId || !toId) return;
+
+          if (
+            sigType === 'call:invite' &&
+            (isUserBlockedPair(fromId, toId) || (toUid && isUserBlockedPair(fromId, toUid)))
+          ) {
+            sendRealtimeToUserIds([fromId], {
+              type: 'call_signal',
+              signal: {
+                callId: sig.callId,
+                type: 'call:busy',
+                fromUserId: toId,
+                toUserId: fromId,
+                reason: 'blocked',
+                createdAt: Date.now(),
+              },
+            });
+            return;
+          }
+
+          enqueueCallSignalForUserIds([toId, toUid].filter(Boolean), sig);
+        }
+      } catch {
+        // Ignore malformed client WS frame
+      }
+    });
+
+    ws.on('close', () => {
+      for (const uid of boundIds) {
+        const set = wsClientsByUserId.get(uid);
+        if (!set) continue;
+        set.delete(ws);
+        if (set.size === 0) wsClientsByUserId.delete(uid);
+      }
+    });
+  });
 
   // Media delivery capability check
   app.get('/api/media/status', (_req, res) => {
@@ -3923,6 +4097,12 @@ async function startServer() {
       res.status(400).json({ error: 'Mensagem inválida.' });
       return;
     }
+    if (isUserBlockedPair(senderId, recipientId)) {
+      res.status(403).json({
+        error: 'Não foi possível enviar a mensagem porque este contato está bloqueado.',
+      });
+      return;
+    }
     const current = readSharedSocialState() || {
       version: 0,
       updatedAt: Date.now(),
@@ -3993,6 +4173,12 @@ async function startServer() {
         synced = await upsertMessageToSupabase(adminState.supabase, msgPayload);
       }
     }
+    sendRealtimeToUserIds([recipientId], {
+      type: 'chat_message',
+      threadId,
+      senderId,
+      recipientId,
+    });
     res.json({ ok: true, supabaseSynced: synced });
   });
 
@@ -4066,6 +4252,17 @@ async function startServer() {
       );
     }
 
+    const matchedThread = current?.threads.find((t) => String(t.id || '') === threadId);
+    const otherParticipantIds = Array.isArray(matchedThread?.participantIds)
+      ? matchedThread.participantIds.filter(
+          (pid: unknown): pid is string => typeof pid === 'string' && !readerSet.has(pid)
+        )
+      : [];
+    sendRealtimeToUserIds(otherParticipantIds, {
+      type: 'chat_read',
+      threadId,
+      readerIds,
+    });
     res.json({ ok: true, supabaseSynced });
   });
 
@@ -4171,6 +4368,13 @@ async function startServer() {
       typingStateMap.delete(key);
     }
 
+    sendRealtimeToUserIds([toUserId], {
+      type: 'chat_typing',
+      fromUserId,
+      toUserId,
+      isTyping,
+    });
+
     res.json({ ok: true });
   });
 
@@ -4195,6 +4399,125 @@ async function startServer() {
       }
     }
     res.json({ ok: true, typingFromIds: Array.from(new Set(typingFromIds)) });
+  });
+
+  // Persistent per-user block list
+  app.get('/api/social/blocks', (req, res) => {
+    const rawIds = typeof req.query.userIds === 'string' ? req.query.userIds : '';
+    const userIds = rawIds
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0 && s.length <= 128)
+      .slice(0, 4);
+    const store = readUserBlocksStore();
+    const merged = new Set<string>();
+    for (const uid of userIds) {
+      for (const b of store[uid] || []) merged.add(b);
+    }
+    res.json({ ok: true, blockedIds: Array.from(merged) });
+  });
+
+  app.put('/api/social/blocks', express.json({ limit: '16kb' }), (req, res) => {
+    const rawUserIds = Array.isArray(req.body?.userIds) ? (req.body.userIds as unknown[]) : [];
+    const userIds = rawUserIds
+      .filter((v): v is string => typeof v === 'string' && v.trim().length > 0 && v.length <= 128)
+      .map((v) => v.trim())
+      .slice(0, 4);
+    const targetIdsRaw = Array.isArray(req.body?.targetIds)
+      ? (req.body.targetIds as unknown[])
+      : typeof req.body?.blockedUserId === 'string'
+      ? [req.body.blockedUserId]
+      : [];
+    const targetIds = targetIdsRaw
+      .filter((v): v is string => typeof v === 'string' && v.trim().length > 0 && v.length <= 128)
+      .map((v) => v.trim())
+      .slice(0, 4);
+    const action = req.body?.action === 'unblock' ? 'unblock' : 'block';
+    if (userIds.length === 0 || targetIds.length === 0) {
+      res.status(400).json({ error: 'Parâmetros de bloqueio inválidos.' });
+      return;
+    }
+
+    const store = { ...readUserBlocksStore() };
+    for (const uid of userIds) {
+      const set = new Set(store[uid] || []);
+      for (const tid of targetIds) {
+        if (action === 'block') set.add(tid);
+        else set.delete(tid);
+      }
+      store[uid] = Array.from(set).slice(0, 500);
+    }
+    writeUserBlocksStore(store);
+
+    const merged = new Set<string>();
+    for (const uid of userIds) {
+      for (const b of store[uid] || []) merged.add(b);
+    }
+    res.json({ ok: true, blockedIds: Array.from(merged) });
+  });
+
+  // WebRTC audio/video call signaling REST endpoints (with WS broadcast + HTTP poll fallback)
+  app.post('/api/social/calls/signal', express.json({ limit: '64kb' }), (req, res) => {
+    const signal = req.body?.signal as Record<string, unknown> | undefined;
+    if (!signal || typeof signal !== 'object') {
+      res.status(400).json({ error: 'Sinal de chamada inválido.' });
+      return;
+    }
+    const fromId = typeof signal.fromUserId === 'string' ? signal.fromUserId.trim() : '';
+    const toId = typeof signal.toUserId === 'string' ? signal.toUserId.trim() : '';
+    const toUid = typeof signal.toUid === 'string' ? signal.toUid.trim() : '';
+    const sigType = typeof signal.type === 'string' ? signal.type : '';
+    if (!fromId || !toId || !sigType) {
+      res.status(400).json({ error: 'Destinatário ou remetente de chamada ausente.' });
+      return;
+    }
+
+    if (
+      sigType === 'call:invite' &&
+      (isUserBlockedPair(fromId, toId) || (toUid && isUserBlockedPair(fromId, toUid)))
+    ) {
+      enqueueCallSignalForUserIds([fromId], {
+        callId: signal.callId,
+        type: 'call:busy',
+        fromUserId: toId,
+        toUserId: fromId,
+        reason: 'blocked',
+        createdAt: Date.now(),
+      });
+      res.status(403).json({ error: 'Contato bloqueado ou indisponível para chamadas.' });
+      return;
+    }
+
+    enqueueCallSignalForUserIds([toId, toUid].filter(Boolean), signal);
+    res.json({ ok: true });
+  });
+
+  app.get('/api/social/calls/poll', (req, res) => {
+    const rawIds = typeof req.query.userIds === 'string' ? req.query.userIds : '';
+    const userIds = rawIds
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0 && s.length <= 128)
+      .slice(0, 4);
+    if (userIds.length === 0) {
+      res.json({ ok: true, signals: [] });
+      return;
+    }
+    const cutoff = Date.now() - 45_000;
+    const seenIds = new Set<string>();
+    const signals: Record<string, unknown>[] = [];
+    for (const uid of userIds) {
+      const queue = callSignalQueueMap.get(uid);
+      if (!queue || queue.length === 0) continue;
+      for (const entry of queue) {
+        if (entry.createdAt >= cutoff && !seenIds.has(entry.id)) {
+          seenIds.add(entry.id);
+          signals.push(entry.signal);
+        }
+      }
+      callSignalQueueMap.delete(uid);
+    }
+    res.json({ ok: true, signals });
   });
 
   app.patch('/api/social/users/:id', express.json({ limit: '4mb' }), async (req, res) => {
@@ -4570,7 +4893,7 @@ Este pacote dá controle total da infraestrutura ao administrador:
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Lumina server running on http://0.0.0.0:${PORT}`);
   });
 }

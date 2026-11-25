@@ -115,6 +115,51 @@ export interface StoryItem {
   reactions: { userId: string; emoji: string }[];
 }
 
+export type CallType = 'audio' | 'video';
+
+export type CallStatus = 'ringing' | 'connecting' | 'connected' | 'ended';
+
+export interface CallSignalPayload {
+  callId: string;
+  type:
+    | 'call:invite'
+    | 'call:answer'
+    | 'call:ice'
+    | 'call:reject'
+    | 'call:end'
+    | 'call:busy'
+    | 'call:media-state';
+  fromUserId: string;
+  fromUid?: string;
+  fromUsername?: string;
+  fromDisplayName?: string;
+  fromAvatarUrl?: string;
+  toUserId: string;
+  toUid?: string;
+  callType?: CallType;
+  threadId?: string;
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+  reason?: string;
+  micMuted?: boolean;
+  camOff?: boolean;
+  createdAt: number;
+}
+
+export interface ActiveCallSession {
+  callId: string;
+  threadId?: string;
+  peerId: string;
+  peerUid?: string;
+  direction: 'outgoing' | 'incoming';
+  callType: CallType;
+  status: CallStatus;
+  startedAt?: number;
+  remoteMicMuted?: boolean;
+  remoteCamOff?: boolean;
+  minimized?: boolean;
+}
+
 export interface DirectMessage {
   id: string;
   senderId: string;
@@ -136,6 +181,10 @@ export interface DirectMessage {
   reactions?: Record<string, string>;
   readBy?: string[];
   seenAt?: number;
+  isCallLog?: boolean;
+  callType?: CallType;
+  callStatus?: 'completed' | 'missed' | 'rejected';
+  callDurationSec?: number;
   createdAt: number;
 }
 
