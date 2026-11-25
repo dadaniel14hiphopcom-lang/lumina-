@@ -125,7 +125,17 @@ export interface DirectMessage {
   audioDurationSec?: number;
   videoUrl?: string;
   videoName?: string;
+  fileUrl?: string;
+  fileName?: string;
+  fileMime?: string;
+  fileSize?: number;
+  replyToId?: string;
+  replyToSenderId?: string;
+  replyToText?: string;
   reaction?: string;
+  reactions?: Record<string, string>;
+  readBy?: string[];
+  seenAt?: number;
   createdAt: number;
 }
 
@@ -134,6 +144,7 @@ export interface DirectThread {
   participantIds: string[];
   messages: DirectMessage[];
   unreadBy: string[];
+  lastReadBy?: Record<string, number>;
   updatedAt: number;
 }
 

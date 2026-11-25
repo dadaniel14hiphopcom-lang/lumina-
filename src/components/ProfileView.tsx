@@ -17,6 +17,7 @@ import {
   LogOut,
   MessageCircle,
   Moon,
+  RefreshCw,
   Settings,
   Share2,
   Sun,
@@ -25,6 +26,7 @@ import {
 } from 'lucide-react';
 import React, { useMemo, useRef, useState } from 'react';
 import { useSocial } from '../context/SocialContext';
+import { lookupCachedProfileInstant } from '../lib/userProfileCache';
 import { ASSETS, STUDIO_SAMPLE_IMAGES } from '../data/seed';
 import {
   compressImageFile,
@@ -64,7 +66,10 @@ export function ProfileView() {
     pendingProfileSlug,
     profileLookupLoading,
     setPendingProfileSlug,
+    refreshPublicUsersFromSupabase,
+    mergeExternalUsers,
   } = useSocial();
+  const [retryingLookup, setRetryingLookup] = useState(false);
 
   const userPool = allUsers.filter(
     (u) => !u.restricted || u.id === viewingProfileId || u.uid === viewingProfileId
@@ -309,17 +314,31 @@ export function ProfileView() {
   );
 
   if (unresolvedPendingProfile) {
+    const handleRetryProfileLookup = async () => {
+      if (!pendingProfileSlug || retryingLookup) return;
+      setRetryingLookup(true);
+      try {
+        const cached = await lookupCachedProfileInstant(pendingProfileSlug);
+        if (cached) {
+          mergeExternalUsers([cached]);
+        }
+        await refreshPublicUsersFromSupabase();
+      } finally {
+        setRetryingLookup(false);
+      }
+    };
+
     return (
       <div className="mx-auto w-full max-w-xl px-4 py-16 text-center">
         <div className="rounded-2xl border border-zinc-200 bg-white p-8 dark:border-zinc-800 dark:bg-zinc-950">
-          {profileLookupLoading ? (
+          {profileLookupLoading || retryingLookup ? (
             <>
               <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-2 border-sky-600 border-t-transparent" />
               <p className="text-sm font-semibold text-zinc-950 dark:text-white">
                 Buscando perfil @{pendingProfileSlug}...
               </p>
               <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                Consultando perfis públicos na Lumina.
+                Consultando cache local e perfis públicos na Lumina.
               </p>
             </>
           ) : (
@@ -328,9 +347,17 @@ export function ProfileView() {
                 Perfil @{pendingProfileSlug} não encontrado
               </p>
               <p className="mt-1.5 text-xs text-zinc-500 dark:text-zinc-400">
-                Verifique se o link está correto ou explore os membros já cadastrados na rede.
+                Verifique se o link está correto, tente sincronizar novamente ou explore os membros já cadastrados na rede.
               </p>
               <div className="mt-5 flex flex-wrap justify-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleRetryProfileLookup()}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-sky-600 px-4 text-xs font-semibold text-white hover:bg-sky-700"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Tentar novamente
+                </button>
                 <button
                   type="button"
                   onClick={() => {

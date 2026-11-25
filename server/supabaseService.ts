@@ -22,7 +22,9 @@ const SELECT_POSTS_CORE =
   'id,author_id,caption,location,category,aspect_ratio,is_reel,media_urls,created_at';
 const SELECT_STORIES =
   'id,author_id,author_uid,media_url,caption,location,viewed_by,reactions,created_at,expires_at';
-const SELECT_MESSAGES =
+const SELECT_MESSAGES_EXTENDED =
+  'id,thread_id,sender_id,recipient_id,text,shared_post_id,story_reply_url,audio_url,audio_duration_sec,video_url,video_name,file_url,file_name,file_mime,file_size,reply_to_id,reply_to_sender_id,reply_to_text,reaction,reactions,read_by,seen_at,created_at';
+const SELECT_MESSAGES_CORE =
   'id,thread_id,sender_id,recipient_id,text,shared_post_id,story_reply_url,audio_url,audio_duration_sec,video_url,video_name,reaction,read_by,created_at';
 
 export function isSecretSupabaseKey(rawKey?: string): boolean {
@@ -113,8 +115,17 @@ export interface SupabaseMessageSyncPayload {
   audioDurationSec?: number;
   videoUrl?: string;
   videoName?: string;
+  fileUrl?: string;
+  fileName?: string;
+  fileMime?: string;
+  fileSize?: number;
+  replyToId?: string;
+  replyToSenderId?: string;
+  replyToText?: string;
   reaction?: string;
+  reactions?: Record<string, string>;
   readBy?: string[];
+  seenAt?: number;
   createdAt: number;
 }
 
@@ -258,8 +269,28 @@ function compactAssetForDb(url?: string, maxDataLen = 280_000): string | null {
   if (!trimmed) return null;
   if (/^https?:\/\//i.test(trimmed)) return trimmed.slice(0, 1000);
   if (/^\/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]+$/.test(trimmed)) return trimmed.slice(0, 300);
-  if (/^data:image\//i.test(trimmed) && trimmed.length <= maxDataLen) return trimmed;
-  if (/^data:audio\//i.test(trimmed) && trimmed.length <= maxDataLen) return trimmed;
+  if (/^data:image\/(png|jpeg|jpg|webp|gif);/i.test(trimmed) && trimmed.length <= maxDataLen) return trimmed;
+  if (/^data:audio\/(webm|ogg|mp4|mpeg|wav);/i.test(trimmed) && trimmed.length <= maxDataLen) return trimmed;
+  if (/^data:video\/(mp4|webm|quicktime);/i.test(trimmed) && trimmed.length <= maxDataLen) return trimmed;
+  return null;
+}
+
+function compactAttachmentForDb(url?: string, maxDataLen = 450_000): string | null {
+  if (typeof url !== 'string') return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  if (/^data:(?:text\/html|image\/svg\+xml|application\/xhtml\+xml)/i.test(trimmed)) return null;
+  if (/^javascript:/i.test(trimmed)) return null;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed.slice(0, 1000);
+  if (/^\/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]+$/.test(trimmed)) return trimmed.slice(0, 300);
+  if (
+    /^data:(?:image\/(?:png|jpeg|jpg|webp|gif)|application\/pdf|text\/plain|text\/csv|application\/zip|application\/x-zip-compressed|application\/msword|application\/vnd\.|application\/octet-stream);/i.test(
+      trimmed
+    ) &&
+    trimmed.length <= maxDataLen
+  ) {
+    return trimmed;
+  }
   return null;
 }
 
@@ -1454,8 +1485,17 @@ export async function upsertMessageToSupabase(
       audio_duration_sec: msg.audioDurationSec ?? null,
       video_url: compactAssetForDb(msg.videoUrl, 260_000),
       video_name: msg.videoName ? msg.videoName.slice(0, 120) : null,
+      file_url: compactAttachmentForDb(msg.fileUrl, 450_000),
+      file_name: msg.fileName ? msg.fileName.slice(0, 140) : null,
+      file_mime: msg.fileMime ? msg.fileMime.slice(0, 100) : null,
+      file_size: typeof msg.fileSize === 'number' ? msg.fileSize : null,
+      reply_to_id: msg.replyToId || null,
+      reply_to_sender_id: msg.replyToSenderId || null,
+      reply_to_text: msg.replyToText ? msg.replyToText.slice(0, 240) : null,
       reaction: msg.reaction || null,
-      read_by: Array.isArray(msg.readBy) ? msg.readBy.slice(0, 20) : [msg.senderId],
+      reactions: msg.reactions || {},
+      read_by: Array.isArray(msg.readBy) && msg.readBy.length > 0 ? msg.readBy.slice(0, 20) : [msg.senderId],
+      seen_at: msg.seenAt ? new Date(msg.seenAt).toISOString() : null,
       created_at: new Date(msg.createdAt || Date.now()).toISOString(),
     };
     const res = await fetch(
@@ -1481,6 +1521,13 @@ export async function upsertMessageToSupabase(
         recipient_id: fullBody.recipient_id,
         text: fullBody.text,
         shared_post_id: fullBody.shared_post_id,
+        story_reply_url: fullBody.story_reply_url,
+        audio_url: fullBody.audio_url,
+        audio_duration_sec: fullBody.audio_duration_sec,
+        video_url: fullBody.video_url,
+        video_name: fullBody.video_name,
+        reaction: fullBody.reaction,
+        read_by: fullBody.read_by,
         created_at: fullBody.created_at,
       };
       const retry = await fetch(
@@ -1505,6 +1552,136 @@ export async function upsertMessageToSupabase(
   }
 }
 
+export async function markThreadMessagesReadInSupabase(
+  config: SupabaseRuntimeConfig,
+  threadId: string,
+  readerIds: string[]
+): Promise<boolean> {
+  const cleanReaders = Array.from(new Set(readerIds.map((r) => r.trim()).filter(Boolean)));
+  const keys = getSupabaseKeys(config.anonKey);
+  if (!keys.hasKeys || !threadId || cleanReaders.length === 0) return false;
+  try {
+    const origin = await resolveValidatedSupabaseOrigin(config.projectUrl);
+    const schema = sanitizeSchemaName(config.schemaName);
+    const listRes = await fetch(
+      new URL(
+        `/rest/v1/lumina_messages?select=id,sender_id,read_by&thread_id=eq.${encodeURIComponent(threadId)}&limit=150`,
+        origin
+      ).toString(),
+      {
+        method: 'GET',
+        headers: {
+          ...buildSupabaseHeaders(keys.activeKey),
+          'Accept-Profile': schema,
+        },
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    if (!listRes.ok) return false;
+    const rows = (await listRes.json()) as Array<{
+      id?: string;
+      sender_id?: string;
+      read_by?: unknown;
+    }>;
+    if (!Array.isArray(rows) || rows.length === 0) return true;
+
+    const myIdSet = new Set(cleanReaders);
+    const nowIso = new Date().toISOString();
+    const toUpdate = rows.filter((r) => {
+      if (!r.id || myIdSet.has(String(r.sender_id || ''))) return false;
+      const cur = parseStringArray(r.read_by);
+      return !cleanReaders.some((idVal) => cur.includes(idVal));
+    });
+
+    await Promise.all(
+      toUpdate.slice(0, 50).map(async (r) => {
+        const nextReadBy = Array.from(new Set([...parseStringArray(r.read_by), ...cleanReaders]));
+        const patchUrl = new URL(
+          `/rest/v1/lumina_messages?id=eq.${encodeURIComponent(String(r.id))}`,
+          origin
+        ).toString();
+        const patchRes = await fetch(patchUrl, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            ...buildSupabaseHeaders(keys.activeKey),
+            'Content-Profile': schema,
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify({ read_by: nextReadBy, seen_at: nowIso }),
+          signal: AbortSignal.timeout(4000),
+        });
+        if (patchRes.status === 400) {
+          await fetch(patchUrl, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              ...buildSupabaseHeaders(keys.activeKey),
+              'Content-Profile': schema,
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({ read_by: nextReadBy }),
+            signal: AbortSignal.timeout(4000),
+          }).catch(() => {});
+        }
+      })
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function reactToMessageInSupabase(
+  config: SupabaseRuntimeConfig,
+  messageId: string,
+  reaction: string | undefined,
+  reactionsMap?: Record<string, string>
+): Promise<boolean> {
+  const keys = getSupabaseKeys(config.anonKey);
+  if (!keys.hasKeys || !messageId) return false;
+  try {
+    const origin = await resolveValidatedSupabaseOrigin(config.projectUrl);
+    const schema = sanitizeSchemaName(config.schemaName);
+    const patchUrl = new URL(
+      `/rest/v1/lumina_messages?id=eq.${encodeURIComponent(messageId)}`,
+      origin
+    ).toString();
+    const res = await fetch(patchUrl, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildSupabaseHeaders(keys.activeKey),
+        'Content-Profile': schema,
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        reaction: reaction || null,
+        ...(reactionsMap ? { reactions: reactionsMap } : {}),
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) return true;
+    if (res.status === 400 && reactionsMap) {
+      const retry = await fetch(patchUrl, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildSupabaseHeaders(keys.activeKey),
+          'Content-Profile': schema,
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ reaction: reaction || null }),
+        signal: AbortSignal.timeout(5000),
+      });
+      return retry.ok;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export async function fetchDirectThreadsForUserFromSupabase(
   config: SupabaseRuntimeConfig,
   userIds: string[]
@@ -1517,23 +1694,31 @@ export async function fetchDirectThreadsForUserFromSupabase(
     const schema = sanitizeSchemaName(config.schemaName);
     const inList = `(${cleanIds.map((id) => `"${id.replace(/"/g, '')}"`).join(',')})`;
     const orFilter = `or=(sender_id.in.${encodeURIComponent(inList)},recipient_id.in.${encodeURIComponent(inList)})`;
-    const res = await fetch(
-      new URL(
-        `/rest/v1/lumina_messages?select=${SELECT_MESSAGES}&${orFilter}&order=created_at.asc&limit=300`,
-        origin
-      ).toString(),
-      {
-        method: 'GET',
-        headers: {
-          ...buildSupabaseHeaders(keys.activeKey),
-          'Accept-Profile': schema,
-        },
-        signal: AbortSignal.timeout(5000),
+
+    let rows: Array<Record<string, unknown>> = [];
+    for (const selectCols of [SELECT_MESSAGES_EXTENDED, SELECT_MESSAGES_CORE]) {
+      const res = await fetch(
+        new URL(
+          `/rest/v1/lumina_messages?select=${selectCols}&${orFilter}&order=created_at.asc&limit=300`,
+          origin
+        ).toString(),
+        {
+          method: 'GET',
+          headers: {
+            ...buildSupabaseHeaders(keys.activeKey),
+            'Accept-Profile': schema,
+          },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+      if (res.ok) {
+        const parsed = (await res.json()) as Array<Record<string, unknown>>;
+        if (Array.isArray(parsed)) rows = parsed;
+        break;
       }
-    );
-    if (!res.ok) return [];
-    const rows = (await res.json()) as Array<Record<string, unknown>>;
-    if (!Array.isArray(rows) || rows.length === 0) return [];
+      if (res.status !== 400) return [];
+    }
+    if (rows.length === 0) return [];
 
     const myIdSet = new Set(cleanIds);
     const threadMap = new Map<string, Record<string, unknown>>();
@@ -1556,6 +1741,16 @@ export async function fetchDirectThreadsForUserFromSupabase(
           ? r.created_at
           : Date.now();
       const readBy = parseStringArray(r.read_by);
+      const rawReactions =
+        r.reactions && typeof r.reactions === 'object' && !Array.isArray(r.reactions)
+          ? (r.reactions as Record<string, string>)
+          : undefined;
+      const seenAt =
+        typeof r.seen_at === 'string'
+          ? Date.parse(r.seen_at) || undefined
+          : typeof r.seen_at === 'number'
+          ? r.seen_at
+          : undefined;
 
       const messageObj = {
         id,
@@ -1568,7 +1763,18 @@ export async function fetchDirectThreadsForUserFromSupabase(
           typeof r.audio_duration_sec === 'number' ? r.audio_duration_sec : undefined,
         videoUrl: typeof r.video_url === 'string' ? r.video_url : undefined,
         videoName: typeof r.video_name === 'string' ? r.video_name : undefined,
+        fileUrl: typeof r.file_url === 'string' ? r.file_url : undefined,
+        fileName: typeof r.file_name === 'string' ? r.file_name : undefined,
+        fileMime: typeof r.file_mime === 'string' ? r.file_mime : undefined,
+        fileSize: typeof r.file_size === 'number' ? r.file_size : undefined,
+        replyToId: typeof r.reply_to_id === 'string' ? r.reply_to_id : undefined,
+        replyToSenderId:
+          typeof r.reply_to_sender_id === 'string' ? r.reply_to_sender_id : undefined,
+        replyToText: typeof r.reply_to_text === 'string' ? r.reply_to_text : undefined,
         reaction: typeof r.reaction === 'string' ? r.reaction : undefined,
+        reactions: rawReactions,
+        readBy,
+        seenAt,
         createdAt,
       };
 

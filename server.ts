@@ -30,6 +30,8 @@ import {
   fetchPublicStoriesFromSupabase,
   fetchPublicUserByUsernameFromSupabase,
   isSecretSupabaseKey,
+  markThreadMessagesReadInSupabase,
+  reactToMessageInSupabase,
   registerOrSyncUserToSupabase,
   resolveSupabaseEmailByUsername,
   testSupabaseConnection,
@@ -211,6 +213,10 @@ let supabaseContentCache: {
   stories: Record<string, unknown>[];
 } | null = null;
 const deletedPostIds = new Set<string>();
+const typingStateMap = new Map<
+  string,
+  { fromUserId: string; toUserId: string; threadId?: string; updatedAt: number }
+>();
 
 interface IntegrationState {
   aws: {
@@ -555,20 +561,80 @@ function mergeByIdRecords(
       map.set(item.id, item);
     } else if (Array.isArray(prev.messages) && Array.isArray(item.messages)) {
       const msgMap = new Map<string, Record<string, unknown>>();
+      const mergeMsg = (base: Record<string, unknown> | undefined, inc: Record<string, unknown>) => {
+        if (!base) return inc;
+        const prevReadBy = Array.isArray(base.readBy) ? (base.readBy as string[]) : [];
+        const incReadBy = Array.isArray(inc.readBy) ? (inc.readBy as string[]) : [];
+        const mergedReadBy = Array.from(new Set([...prevReadBy, ...incReadBy]));
+        const prevReactions =
+          base.reactions && typeof base.reactions === 'object' && !Array.isArray(base.reactions)
+            ? (base.reactions as Record<string, string>)
+            : {};
+        const incReactions =
+          inc.reactions && typeof inc.reactions === 'object' && !Array.isArray(inc.reactions)
+            ? (inc.reactions as Record<string, string>)
+            : {};
+        const mergedReactions = { ...prevReactions, ...incReactions };
+        const mergedSeenAt =
+          typeof base.seenAt === 'number' || typeof inc.seenAt === 'number'
+            ? Math.max(Number(base.seenAt || 0), Number(inc.seenAt || 0))
+            : undefined;
+        return {
+          ...base,
+          ...inc,
+          ...(mergedReadBy.length > 0 ? { readBy: mergedReadBy } : {}),
+          ...(Object.keys(mergedReactions).length > 0 ? { reactions: mergedReactions } : {}),
+          ...(mergedSeenAt ? { seenAt: mergedSeenAt } : {}),
+        };
+      };
       for (const m of prev.messages as Record<string, unknown>[]) {
         if (m && typeof m.id === 'string') msgMap.set(m.id, m);
       }
       for (const m of item.messages as Record<string, unknown>[]) {
-        if (m && typeof m.id === 'string') msgMap.set(m.id, m);
+        if (m && typeof m.id === 'string') msgMap.set(m.id, mergeMsg(msgMap.get(m.id), m));
       }
       const mergedMessages = Array.from(msgMap.values()).sort(
         (a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0)
       );
+      const prevLastRead =
+        prev.lastReadBy && typeof prev.lastReadBy === 'object' && !Array.isArray(prev.lastReadBy)
+          ? (prev.lastReadBy as Record<string, number>)
+          : {};
+      const incLastRead =
+        item.lastReadBy && typeof item.lastReadBy === 'object' && !Array.isArray(item.lastReadBy)
+          ? (item.lastReadBy as Record<string, number>)
+          : {};
+      const mergedLastRead: Record<string, number> = { ...prevLastRead };
+      for (const [uid, ts] of Object.entries(incLastRead)) {
+        mergedLastRead[uid] = Math.max(Number(mergedLastRead[uid] || 0), Number(ts || 0));
+      }
+      const prevUnread = Array.isArray(prev.unreadBy) ? (prev.unreadBy as string[]) : [];
+      const incUnread = Array.isArray(item.unreadBy) ? (item.unreadBy as string[]) : [];
+      const candidateUnread = Array.from(new Set([...prevUnread, ...incUnread]));
+      const filteredUnread = candidateUnread.filter((uid) => {
+        const readAt = Number(mergedLastRead[uid] || 0);
+        const hasUnreadFromOther = mergedMessages.some((m) => {
+          const sender = String(m.senderId || '');
+          if (!sender || sender === uid) return false;
+          const mReadBy = Array.isArray(m.readBy) ? (m.readBy as string[]) : [];
+          if (mReadBy.includes(uid)) return false;
+          return Number(m.createdAt || 0) > readAt;
+        });
+        return hasUnreadFromOther;
+      });
       map.set(item.id, {
         ...prev,
         ...item,
         messages: mergedMessages,
+        unreadBy: filteredUnread,
+        ...(Object.keys(mergedLastRead).length > 0 ? { lastReadBy: mergedLastRead } : {}),
         updatedAt: Math.max(Number(prev.updatedAt || 0), Number(item.updatedAt || 0)),
+      });
+    } else if ('recipientId' in item && 'actorId' in item && 'read' in item) {
+      map.set(item.id, {
+        ...prev,
+        ...item,
+        read: Boolean(prev.read || item.read),
       });
     } else {
       map.set(item.id, { ...prev, ...item });
@@ -3883,6 +3949,7 @@ async function startServer() {
       updatedAt: Date.now(),
       threads: nextThreads,
     });
+    typingStateMap.delete(`${senderId}=>${recipientId}`);
 
     const adminState = readAdminState();
     let synced = false;
@@ -3900,8 +3967,21 @@ async function startServer() {
           typeof message.audioDurationSec === 'number' ? message.audioDurationSec : undefined,
         videoUrl: typeof message.videoUrl === 'string' ? message.videoUrl : undefined,
         videoName: typeof message.videoName === 'string' ? message.videoName : undefined,
+        fileUrl: typeof message.fileUrl === 'string' ? message.fileUrl : undefined,
+        fileName: typeof message.fileName === 'string' ? message.fileName : undefined,
+        fileMime: typeof message.fileMime === 'string' ? message.fileMime : undefined,
+        fileSize: typeof message.fileSize === 'number' ? message.fileSize : undefined,
+        replyToId: typeof message.replyToId === 'string' ? message.replyToId : undefined,
+        replyToSenderId:
+          typeof message.replyToSenderId === 'string' ? message.replyToSenderId : undefined,
+        replyToText: typeof message.replyToText === 'string' ? message.replyToText : undefined,
         reaction: typeof message.reaction === 'string' ? message.reaction : undefined,
-        readBy: [senderId],
+        reactions:
+          message.reactions && typeof message.reactions === 'object' && !Array.isArray(message.reactions)
+            ? (message.reactions as Record<string, string>)
+            : undefined,
+        readBy: Array.isArray(message.readBy) ? (message.readBy as string[]) : [senderId],
+        seenAt: typeof message.seenAt === 'number' ? message.seenAt : undefined,
         createdAt: typeof message.createdAt === 'number' ? message.createdAt : Date.now(),
       };
       synced = await upsertMessageToSupabase(adminState.supabase, msgPayload);
@@ -3914,6 +3994,207 @@ async function startServer() {
       }
     }
     res.json({ ok: true, supabaseSynced: synced });
+  });
+
+  app.patch('/api/social/threads/:id/read', express.json({ limit: '64kb' }), async (req, res) => {
+    const threadId = String(req.params.id || '').trim();
+    const rawReaders = Array.isArray(req.body?.readerIds) ? (req.body.readerIds as unknown[]) : [];
+    const readerIds = Array.from(
+      new Set(
+        rawReaders
+          .filter((r): r is string => typeof r === 'string' && r.trim().length > 0 && r.length <= 128)
+          .map((r) => r.trim())
+      )
+    ).slice(0, 6);
+    if (!threadId || threadId.length > 160 || readerIds.length === 0) {
+      res.status(400).json({ error: 'Parâmetros de leitura inválidos.' });
+      return;
+    }
+
+    const now = typeof req.body?.readAt === 'number' && Number.isFinite(req.body.readAt)
+      ? req.body.readAt
+      : Date.now();
+    const readerSet = new Set(readerIds);
+
+    const current = readSharedSocialState();
+    if (current) {
+      const nextThreads = current.threads.map((t) => {
+        if (String(t.id || '') !== threadId) return t;
+        const prevUnread = Array.isArray(t.unreadBy) ? (t.unreadBy as string[]) : [];
+        const prevLastRead =
+          t.lastReadBy && typeof t.lastReadBy === 'object' && !Array.isArray(t.lastReadBy)
+            ? { ...(t.lastReadBy as Record<string, number>) }
+            : {};
+        for (const rId of readerIds) {
+          prevLastRead[rId] = Math.max(Number(prevLastRead[rId] || 0), now);
+        }
+        const prevMsgs = Array.isArray(t.messages) ? (t.messages as Record<string, unknown>[]) : [];
+        const nextMsgs = prevMsgs.map((m) => {
+          const sender = String(m.senderId || '');
+          if (!sender || readerSet.has(sender)) return m;
+          const curReadBy = Array.isArray(m.readBy) ? (m.readBy as string[]) : [];
+          const nextReadBy = Array.from(new Set([...curReadBy, ...readerIds]));
+          return {
+            ...m,
+            readBy: nextReadBy,
+            seenAt: typeof m.seenAt === 'number' ? Math.min(m.seenAt, now) : now,
+          };
+        });
+        return {
+          ...t,
+          unreadBy: prevUnread.filter((id) => !readerSet.has(id)),
+          lastReadBy: prevLastRead,
+          messages: nextMsgs,
+        };
+      });
+
+      writeSharedSocialState({
+        ...current,
+        version: (current.version || 0) + 1,
+        updatedAt: Date.now(),
+        threads: nextThreads,
+      });
+    }
+
+    const adminState = readAdminState();
+    let supabaseSynced = false;
+    if (adminState.supabase.projectUrl) {
+      supabaseSynced = await markThreadMessagesReadInSupabase(
+        adminState.supabase,
+        threadId,
+        readerIds
+      );
+    }
+
+    res.json({ ok: true, supabaseSynced });
+  });
+
+  app.patch(
+    '/api/social/threads/:id/messages/:msgId/react',
+    express.json({ limit: '32kb' }),
+    async (req, res) => {
+      const threadId = String(req.params.id || '').trim();
+      const msgId = String(req.params.msgId || '').trim();
+      const userId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+      const emoji = typeof req.body?.emoji === 'string' ? req.body.emoji.trim().slice(0, 16) : '';
+      if (!threadId || !msgId || !userId || !emoji) {
+        res.status(400).json({ error: 'Dados de reação inválidos.' });
+        return;
+      }
+
+      let nextReaction: string | undefined;
+      let nextReactionsMap: Record<string, string> = {};
+
+      const current = readSharedSocialState();
+      if (current) {
+        const nextThreads = current.threads.map((t) => {
+          if (String(t.id || '') !== threadId) return t;
+          const prevMsgs = Array.isArray(t.messages) ? (t.messages as Record<string, unknown>[]) : [];
+          const nextMsgs = prevMsgs.map((m) => {
+            if (String(m.id || '') !== msgId) return m;
+            const prevMap =
+              m.reactions && typeof m.reactions === 'object' && !Array.isArray(m.reactions)
+                ? { ...(m.reactions as Record<string, string>) }
+                : {};
+            if (prevMap[userId] === emoji || (!Object.keys(prevMap).length && m.reaction === emoji)) {
+              delete prevMap[userId];
+            } else {
+              prevMap[userId] = emoji;
+            }
+            nextReactionsMap = prevMap;
+            const values = Object.values(prevMap);
+            nextReaction = values.length > 0 ? values[values.length - 1] : undefined;
+            return {
+              ...m,
+              reaction: nextReaction,
+              reactions: prevMap,
+            };
+          });
+          return {
+            ...t,
+            messages: nextMsgs,
+            updatedAt: Date.now(),
+          };
+        });
+        writeSharedSocialState({
+          ...current,
+          version: (current.version || 0) + 1,
+          updatedAt: Date.now(),
+          threads: nextThreads,
+        });
+      }
+
+      const adminState = readAdminState();
+      let supabaseSynced = false;
+      if (adminState.supabase.projectUrl) {
+        supabaseSynced = await reactToMessageInSupabase(
+          adminState.supabase,
+          msgId,
+          nextReaction,
+          nextReactionsMap
+        );
+      }
+
+      res.json({ ok: true, reaction: nextReaction, reactions: nextReactionsMap, supabaseSynced });
+    }
+  );
+
+  app.post('/api/social/typing', express.json({ limit: '8kb' }), (req, res) => {
+    const fromUserId =
+      typeof req.body?.fromUserId === 'string' ? req.body.fromUserId.trim().slice(0, 128) : '';
+    const toUserId =
+      typeof req.body?.toUserId === 'string' ? req.body.toUserId.trim().slice(0, 128) : '';
+    const threadId =
+      typeof req.body?.threadId === 'string' ? req.body.threadId.trim().slice(0, 160) : undefined;
+    const isTyping = Boolean(req.body?.isTyping);
+
+    if (!fromUserId || !toUserId) {
+      res.status(400).json({ error: 'Parâmetros de digitação inválidos.' });
+      return;
+    }
+
+    const key = `${fromUserId}=>${toUserId}`;
+    if (isTyping) {
+      if (typingStateMap.size > 500) {
+        const cutoff = Date.now() - 4500;
+        for (const [k, v] of typingStateMap.entries()) {
+          if (v.updatedAt < cutoff) typingStateMap.delete(k);
+        }
+      }
+      typingStateMap.set(key, {
+        fromUserId,
+        toUserId,
+        threadId,
+        updatedAt: Date.now(),
+      });
+    } else {
+      typingStateMap.delete(key);
+    }
+
+    res.json({ ok: true });
+  });
+
+  app.get('/api/social/typing', (req, res) => {
+    const rawIds = typeof req.query.userIds === 'string' ? req.query.userIds : '';
+    const myIds = new Set(
+      rawIds
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 4)
+    );
+    const now = Date.now();
+    const typingFromIds: string[] = [];
+    for (const [k, entry] of typingStateMap.entries()) {
+      if (now - entry.updatedAt > 4500) {
+        typingStateMap.delete(k);
+        continue;
+      }
+      if (myIds.size === 0 || myIds.has(entry.toUserId)) {
+        typingFromIds.push(entry.fromUserId);
+      }
+    }
+    res.json({ ok: true, typingFromIds: Array.from(new Set(typingFromIds)) });
   });
 
   app.patch('/api/social/users/:id', express.json({ limit: '4mb' }), async (req, res) => {

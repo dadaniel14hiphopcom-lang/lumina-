@@ -17,13 +17,16 @@ export function NotificationsView() {
     markNotificationsRead,
   } = useSocial();
 
-  const myNotifs = notifications.filter(
-    (n) => n.recipientId === currentUser.id
-  );
+  const myIds = new Set([currentUser.id, currentUser.uid || ''].filter(Boolean));
+
+  const myNotifs = notifications.filter((n) => myIds.has(n.recipientId));
+  const hasUnread = myNotifs.some((n) => !n.read);
 
   useEffect(() => {
-    markNotificationsRead();
-  }, []);
+    if (hasUnread) {
+      markNotificationsRead();
+    }
+  }, [hasUnread]);
 
   return (
     <div className="mx-auto w-full max-w-2xl px-4 py-5 sm:py-8">
@@ -37,7 +40,7 @@ export function NotificationsView() {
             Nenhuma atividade recente
           </p>
           <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-            Curtidas, comentários e novos seguidores aparecerão aqui.
+            Curtidas, comentários, menções e novos seguidores aparecerão aqui.
           </p>
         </div>
       ) : (
@@ -81,7 +84,13 @@ export function NotificationsView() {
                         `comentou: "${item.text || ''}"`}
                       {item.type === 'follow' && 'começou a seguir você.'}
                       {item.type === 'mention' &&
-                        (item.text ? `enviou mensagem: "${item.text}"` : 'mencionou você.')}
+                        (item.postId
+                          ? item.text
+                            ? `mencionou você: "${item.text}"`
+                            : 'mencionou você em uma publicação.'
+                          : item.text
+                          ? `enviou mensagem: "${item.text}"`
+                          : 'mencionou você.')}
                     </span>{' '}
                     <span className="text-xs text-zinc-400">
                       · {formatRelativeTime(item.createdAt)}

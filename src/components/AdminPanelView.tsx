@@ -36,13 +36,19 @@ import { DEFAULT_VIDEO_RULES, encodeInviteMeta, useSocial } from '../context/Soc
 import { ADMIN_EMAIL, auth, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
 import {
   DEFAULT_SUPABASE_URL,
+  type SupabaseCacheAuditResult,
+  type SupabaseSyncLogEntry,
+  auditRealUsersVsSupabaseCache,
+  clearSupabaseSyncLogs,
   fetchPublicPostsFromSupabaseBrowser,
   fetchPublicStoriesFromSupabaseBrowser,
   fetchPublicUsersFromSupabaseBrowser,
   getBrowserSupabaseConfig,
+  getSupabaseSyncLogs,
   isServiceRoleOrSecretKey,
   isSupabaseApiKeyLike,
   sanitizeSupabaseSchemaName,
+  subscribeSupabaseSyncLogs,
   syncPostsToSupabaseFromBrowser,
   syncUsersToSupabaseFromBrowser,
   testSupabaseFromBrowser,
@@ -359,9 +365,19 @@ export function AdminPanelView() {
   const [supabaseTestStatus, setSupabaseTestStatus] = useState<string | null>(null);
   const [showSupabaseAnonKey, setShowSupabaseAnonKey] = useState(false);
   const [syncingSupabase, setSyncingSupabase] = useState(false);
+  const [sbSyncLogs, setSbSyncLogs] = useState<SupabaseSyncLogEntry[]>(() => getSupabaseSyncLogs());
+  const [sbAuditResult, setSbAuditResult] = useState<SupabaseCacheAuditResult | null>(null);
+  const [runningSbAudit, setRunningSbAudit] = useState(false);
   const [wpTestStatus, setWpTestStatus] = useState<string | null>(null);
   const [wpSyncedPosts, setWpSyncedPosts] = useState<WordPressPostPreview[]>([]);
   const [testingKey, setTestingKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSbSyncLogs(getSupabaseSyncLogs());
+    return subscribeSupabaseSyncLogs(() => {
+      setSbSyncLogs(getSupabaseSyncLogs());
+    });
+  }, []);
 
   // Updates tab state
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckResult | null>(null);
@@ -1298,6 +1314,7 @@ export function AdminPanelView() {
                 : ''
             }`;
         setSupabaseTestStatus(msg);
+        setSbAuditResult(auditRealUsersVsSupabaseCache(allUsers, remoteUsers as unknown as typeof allUsers));
         setOverview((prev) => {
           if (!prev) return prev;
           const nextState: ServerOverview['state'] = {
@@ -1755,8 +1772,17 @@ create table if not exists ${schema}.lumina_messages (
   audio_duration_sec integer,
   video_url text,
   video_name text,
+  file_url text,
+  file_name text,
+  file_mime text,
+  file_size integer,
+  reply_to_id text,
+  reply_to_sender_id text,
+  reply_to_text text,
   reaction text,
+  reactions jsonb not null default '{}'::jsonb,
   read_by jsonb not null default '[]'::jsonb,
+  seen_at timestamptz,
   created_at timestamptz default now()
 );
 
@@ -1770,8 +1796,17 @@ alter table ${schema}.lumina_messages add column if not exists audio_url text;
 alter table ${schema}.lumina_messages add column if not exists audio_duration_sec integer;
 alter table ${schema}.lumina_messages add column if not exists video_url text;
 alter table ${schema}.lumina_messages add column if not exists video_name text;
+alter table ${schema}.lumina_messages add column if not exists file_url text;
+alter table ${schema}.lumina_messages add column if not exists file_name text;
+alter table ${schema}.lumina_messages add column if not exists file_mime text;
+alter table ${schema}.lumina_messages add column if not exists file_size integer;
+alter table ${schema}.lumina_messages add column if not exists reply_to_id text;
+alter table ${schema}.lumina_messages add column if not exists reply_to_sender_id text;
+alter table ${schema}.lumina_messages add column if not exists reply_to_text text;
 alter table ${schema}.lumina_messages add column if not exists reaction text;
+alter table ${schema}.lumina_messages add column if not exists reactions jsonb default '{}'::jsonb;
 alter table ${schema}.lumina_messages add column if not exists read_by jsonb default '[]'::jsonb;
+alter table ${schema}.lumina_messages add column if not exists seen_at timestamptz;
 alter table ${schema}.lumina_messages add column if not exists created_at timestamptz default now();
 
 create index if not exists idx_lumina_messages_thread on ${schema}.lumina_messages (thread_id, created_at);
@@ -3616,6 +3651,158 @@ ${itemsXml}
                       <Copy className="h-3.5 w-3.5" />
                       <span>Copiar .env estático</span>
                     </button>
+                  )}
+                </div>
+
+                {/* Detailed Supabase Sync Log & Cache/ID Disparity Auditor (Admin Only) */}
+                <div className="mt-4 space-y-3 rounded-xl border border-zinc-200 bg-zinc-50/70 p-4 dark:border-zinc-800 dark:bg-zinc-900/40">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-xs font-bold text-zinc-900 dark:text-zinc-100">
+                        Log de Depuração &amp; Auditoria de IDs (Supabase vs Cache Local)
+                      </h3>
+                      <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                        Detecta disparidades de IDs/UIDs, campos obrigatórios ausentes e falhas HTTP de persistência.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={runningSbAudit}
+                        onClick={async () => {
+                          setRunningSbAudit(true);
+                          try {
+                            const cfg = {
+                              projectUrl:
+                                state.supabase.projectUrl || DEFAULT_SUPABASE_URL,
+                              schemaName: sanitizeSupabaseSchemaName(
+                                state.supabase.schemaName
+                              ),
+                              anonKey:
+                                (state.supabase.anonKey || '').trim() ||
+                                getBrowserSupabaseConfig().anonKey,
+                              autoSyncUsers: state.supabase.autoSyncUsers,
+                            };
+                            const remoteUsers = cfg.anonKey
+                              ? await fetchPublicUsersFromSupabaseBrowser(cfg)
+                              : [];
+                            const audit = auditRealUsersVsSupabaseCache(
+                              allUsers,
+                              remoteUsers as unknown as typeof allUsers
+                            );
+                            setSbAuditResult(audit);
+                            showToast(
+                              audit.issues.length === 0
+                                ? 'Auditoria concluída: nenhuma disparidade encontrada.'
+                                : `Auditoria concluída: ${audit.issues.length} alerta(s) detectado(s).`
+                            );
+                          } finally {
+                            setRunningSbAudit(false);
+                          }
+                        }}
+                        className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-zinc-900 px-3 text-[11px] font-semibold text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950"
+                      >
+                        <Search className="h-3.5 w-3.5" />
+                        <span>
+                          {runningSbAudit ? 'Auditando...' : 'Executar auditoria (IDs e campos)'}
+                        </span>
+                      </button>
+                      {sbSyncLogs.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            clearSupabaseSyncLogs();
+                            showToast('Log de sincronização limpo');
+                          }}
+                          className="inline-flex h-8 items-center gap-1 rounded-lg border border-zinc-200 px-2.5 text-[11px] font-semibold text-zinc-600 hover:bg-white dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                          <span>Limpar log</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {sbAuditResult && (
+                    <div className="space-y-2 rounded-lg border border-zinc-200 bg-white p-3 text-xs dark:border-zinc-800 dark:bg-zinc-950">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+                          Resultado da auditoria ({formatRelativeTime(sbAuditResult.ranAt)})
+                        </span>
+                        <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                          {sbAuditResult.checkedLocal} local(is) · {sbAuditResult.checkedRemote} no Supabase ·{' '}
+                          <strong
+                            className={
+                              sbAuditResult.issues.length > 0
+                                ? 'text-amber-600 dark:text-amber-400'
+                                : 'text-emerald-600 dark:text-emerald-400'
+                            }
+                          >
+                            {sbAuditResult.issues.length} divergência(s)
+                          </strong>
+                        </span>
+                      </div>
+
+                      {sbAuditResult.issues.length === 0 ? (
+                        <p className="text-[11px] text-emerald-700 dark:text-emerald-400">
+                          Todos os usuários reais locais e remotos estão consistentes em ID, auth_uid e campos obrigatórios.
+                        </p>
+                      ) : (
+                        <div className="max-h-48 space-y-1.5 overflow-y-auto pr-1">
+                          {sbAuditResult.issues.map((issue, idx) => (
+                            <div
+                              key={`${issue.type}-${issue.userId || issue.username || idx}`}
+                              className={`rounded-lg border px-2.5 py-2 text-[11px] ${
+                                issue.severity === 'error'
+                                  ? 'border-rose-200 bg-rose-50/70 text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/30 dark:text-rose-200'
+                                  : 'border-amber-200 bg-amber-50/70 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200'
+                              }`}
+                            >
+                              <p className="font-semibold">{issue.summary}</p>
+                              <p className="mt-0.5 opacity-85">{issue.details}</p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {sbSyncLogs.length === 0 ? (
+                    <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                      Nenhum evento ou erro de sincronização registrado neste navegador.
+                    </p>
+                  ) : (
+                    <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
+                      {sbSyncLogs.slice(0, 40).map((log) => (
+                        <div
+                          key={log.id}
+                          className={`rounded-lg border px-2.5 py-2 text-[11px] ${
+                            log.level === 'error'
+                              ? 'border-rose-200 bg-rose-50/60 text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/25 dark:text-rose-200'
+                              : log.level === 'warn'
+                              ? 'border-amber-200 bg-amber-50/60 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/25 dark:text-amber-200'
+                              : 'border-zinc-200 bg-white text-zinc-700 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300'
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-mono font-semibold uppercase">
+                              [{log.category}]
+                              {log.httpStatus ? ` HTTP ${log.httpStatus}` : ''}
+                              {log.username ? ` · @${log.username}` : ''}
+                            </span>
+                            <span className="text-[10px] opacity-75">
+                              {formatRelativeTime(log.timestamp)}
+                            </span>
+                          </div>
+                          <p className="mt-0.5 font-medium">{log.summary}</p>
+                          {log.details && (
+                            <p className="mt-0.5 break-all font-mono text-[10px] opacity-80">
+                              {log.details}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
               </section>

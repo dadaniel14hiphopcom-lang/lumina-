@@ -1,5 +1,5 @@
 import { AlertTriangle, Shield } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AdminPanelView } from './components/AdminPanelView';
 import { AuthView } from './components/AuthView';
 import { CreateModal } from './components/CreateModal';
@@ -114,10 +114,22 @@ function LuminaShell() {
     guestBrowsing,
     firebaseUser,
     adminMemoryToken,
+    currentUser,
+    notifications,
+    markNotificationsRead,
   } = useSocial();
   const canSeeAdminEntry =
     !isAuthenticated || isExclusiveAdminUser(firebaseUser) || Boolean(adminMemoryToken);
   const [createMode, setCreateMode] = useState<'post' | 'story' | 'reel'>('post');
+
+  useEffect(() => {
+    if (activeNav !== 'notifications') return;
+    const myIds = new Set([currentUser.id, currentUser.uid || ''].filter(Boolean));
+    const hasUnread = notifications.some((n) => !n.read && myIds.has(n.recipientId));
+    if (hasUnread) {
+      markNotificationsRead();
+    }
+  }, [activeNav, notifications, currentUser.id, currentUser.uid, markNotificationsRead]);
 
   const openCreateWithMode = (mode: 'post' | 'story' | 'reel') => {
     setCreateMode(mode);

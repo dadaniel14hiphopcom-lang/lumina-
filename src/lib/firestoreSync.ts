@@ -3,6 +3,8 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocs,
+  limit,
   onSnapshot,
   query,
   serverTimestamp,
@@ -168,6 +170,47 @@ export async function adminUpdateProfileFlagsInCloud(
   }
 }
 
+export async function fetchProfileByUsernameFromCloud(
+  username: string,
+  fbUser: FirebaseUser | null
+): Promise<UserProfile | null> {
+  if (!fbUser || !fbUser.emailVerified) return null;
+  const clean = toSafeUsername(username);
+  if (!clean) return null;
+  try {
+    const q = query(
+      collection(db, 'profiles'),
+      where('restricted', '==', false),
+      where('username', '==', clean),
+      limit(1)
+    );
+    const snap = await getDocs(q);
+    if (snap.empty) return null;
+    const d = snap.docs[0];
+    const data = d.data();
+    return {
+      id: String(data.id || d.id),
+      uid: typeof data.uid === 'string' ? data.uid : undefined,
+      username: String(data.username || clean),
+      displayName: String(data.displayName || clean),
+      avatarUrl: String(data.avatarUrl || '/og-preview.jpg'),
+      coverUrl: typeof data.coverUrl === 'string' ? data.coverUrl : undefined,
+      bio: String(data.bio || ''),
+      website: typeof data.website === 'string' ? data.website : undefined,
+      verified: Boolean(data.verified),
+      isOnline: Boolean(data.isOnline),
+      isDemoSeed: Boolean(data.isDemoSeed),
+      restricted: Boolean(data.restricted),
+      boosted: Boolean(data.boosted),
+      followers: Array.isArray(data.followers) ? data.followers : [],
+      following: Array.isArray(data.following) ? data.following : [],
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, 'profiles');
+    return null;
+  }
+}
+
 export async function updateProfileFollowersInCloud(
   targetProfileId: string,
   followers: string[]
@@ -328,11 +371,32 @@ export async function upsertThreadInCloud(
   const threadId = toValidFirestoreId(thread.id);
   const ref = doc(db, 'threads', threadId);
   const safeUids = Array.from(new Set([fbUser.uid, ...participantUids.filter(Boolean)])).slice(0, 10);
-  const safeMessages = thread.messages.slice(-150).map((m) => ({
-    ...m,
-    audioUrl: m.audioUrl && m.audioUrl.length <= 220_000 ? m.audioUrl : undefined,
-    videoUrl: m.videoUrl && m.videoUrl.length <= 220_000 ? m.videoUrl : undefined,
-  }));
+  const safeMessages = thread.messages.slice(-150).map((m) => {
+    const cleanMsg: Record<string, unknown> = {
+      id: m.id,
+      senderId: m.senderId,
+      text: (m.text || '').slice(0, 2000),
+      createdAt: m.createdAt || Date.now(),
+    };
+    if (m.sharedPostId) cleanMsg.sharedPostId = m.sharedPostId;
+    if (m.storyReplyUrl && m.storyReplyUrl.length <= 160_000) cleanMsg.storyReplyUrl = m.storyReplyUrl;
+    if (m.audioUrl && m.audioUrl.length <= 220_000) cleanMsg.audioUrl = m.audioUrl;
+    if (typeof m.audioDurationSec === 'number') cleanMsg.audioDurationSec = m.audioDurationSec;
+    if (m.videoUrl && m.videoUrl.length <= 220_000) cleanMsg.videoUrl = m.videoUrl;
+    if (m.videoName) cleanMsg.videoName = m.videoName.slice(0, 120);
+    if (m.fileUrl && m.fileUrl.length <= 220_000) cleanMsg.fileUrl = m.fileUrl;
+    if (m.fileName) cleanMsg.fileName = m.fileName.slice(0, 140);
+    if (m.fileMime) cleanMsg.fileMime = m.fileMime.slice(0, 100);
+    if (typeof m.fileSize === 'number') cleanMsg.fileSize = m.fileSize;
+    if (m.replyToId) cleanMsg.replyToId = m.replyToId;
+    if (m.replyToSenderId) cleanMsg.replyToSenderId = m.replyToSenderId;
+    if (m.replyToText) cleanMsg.replyToText = m.replyToText.slice(0, 240);
+    if (m.reaction) cleanMsg.reaction = m.reaction;
+    if (m.reactions && Object.keys(m.reactions).length > 0) cleanMsg.reactions = m.reactions;
+    if (Array.isArray(m.readBy) && m.readBy.length > 0) cleanMsg.readBy = m.readBy.slice(0, 12);
+    if (typeof m.seenAt === 'number') cleanMsg.seenAt = m.seenAt;
+    return cleanMsg;
+  });
 
   try {
     const snap = await getDoc(ref);
@@ -359,6 +423,61 @@ export async function upsertThreadInCloud(
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `threads/${threadId}`);
   }
+}
+
+export async function createNotificationInCloud(
+  notif: NotificationItem,
+  recipientUid: string | undefined,
+  fbUser: FirebaseUser
+): Promise<void> {
+  if (!fbUser.emailVerified || !recipientUid) return;
+  const cleanRecipientUid = toValidFirestoreId(recipientUid);
+  const notifId = toValidFirestoreId(notif.id);
+  const payload: Record<string, unknown> = {
+    id: notifId,
+    recipientId: toValidFirestoreId(notif.recipientId),
+    recipientUid: cleanRecipientUid,
+    actorId: toValidFirestoreId(notif.actorId),
+    actorUid: fbUser.uid,
+    type: notif.type,
+    read: Boolean(notif.read),
+    createdAtMs: notif.createdAt || Date.now(),
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+  if (notif.postId) payload.postId = toValidFirestoreId(notif.postId).slice(0, 128);
+  if (notif.text) payload.text = notif.text.slice(0, 400);
+
+  try {
+    await setDoc(doc(db, 'notifications', notifId), payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `notifications/${notifId}`);
+  }
+}
+
+export async function markNotificationsReadInCloud(
+  notificationIds: string[],
+  fbUser: FirebaseUser
+): Promise<void> {
+  if (!fbUser.emailVerified || notificationIds.length === 0) return;
+  await Promise.all(
+    notificationIds.slice(0, 40).map(async (rawId) => {
+      const notifId = toValidFirestoreId(rawId);
+      const ref = doc(db, 'notifications', notifId);
+      try {
+        const snap = await getDoc(ref);
+        if (!snap.exists()) return;
+        const data = snap.data();
+        if (data?.recipientUid !== fbUser.uid || data?.read === true) return;
+        await updateDoc(ref, {
+          read: true,
+          updatedAt: serverTimestamp(),
+        });
+      } catch {
+        // Non-fatal for local-only notification IDs
+      }
+    })
+  );
 }
 
 export async function createInviteInCloud(

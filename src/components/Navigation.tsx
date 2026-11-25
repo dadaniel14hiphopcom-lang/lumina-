@@ -40,14 +40,16 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
   const canSeeAdminNav =
     !isAuthenticated || isExclusiveAdminUser(firebaseUser) || Boolean(adminMemoryToken);
 
+  const myIds = new Set([currentUser.id, currentUser.uid || ''].filter(Boolean));
+
   const unreadNotifs = notifications.filter(
-    (n) => n.recipientId === currentUser.id && !n.read
+    (n) => myIds.has(n.recipientId) && !n.read
   ).length;
 
   const unreadDMs = threads.filter(
     (t) =>
-      t.participantIds.includes(currentUser.id) &&
-      t.unreadBy.includes(currentUser.id)
+      t.participantIds.some((pid) => myIds.has(pid)) &&
+      t.unreadBy.some((uid) => myIds.has(uid))
   ).length;
 
   const navItems: {

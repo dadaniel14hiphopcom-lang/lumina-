@@ -28,6 +28,7 @@ import {
   fetchPublicUsersFromSupabaseBrowser,
   getBrowserSupabaseConfig,
   loginSupabaseFromBrowser,
+  markThreadMessagesReadInSupabaseBrowser,
   reactToDirectMessageInSupabaseBrowser,
   setRuntimePublicSupabaseConfig,
   signupRealUserInSupabaseFromBrowser,
@@ -41,10 +42,13 @@ import {
 import {
   adminUpdateProfileFlagsInCloud,
   createInviteInCloud,
+  createNotificationInCloud,
   createPostInCloud,
   createStoryInCloud,
   deletePostInCloud,
   ensureAdminDocIfMatched,
+  fetchProfileByUsernameFromCloud,
+  markNotificationsReadInCloud,
   subscribeToCloudState,
   syncSiteMetaToCloud,
   updatePostInteractionInCloud,
@@ -53,6 +57,12 @@ import {
   upsertOwnProfileInCloud,
   upsertThreadInCloud,
 } from '../lib/firestoreSync';
+import {
+  lookupCachedProfileInstant,
+  readAllCachedProfilesIDB,
+  readCachedProfilesSync,
+  upsertCachedProfiles,
+} from '../lib/userProfileCache';
 import {
   DirectThread,
   InviteRecord,
@@ -97,7 +107,101 @@ const STORAGE_KEY = 'lumina_social_v1';
 const INVITES_KEY = 'lumina_invites_v1';
 const CREDENTIALS_KEY = 'lumina_user_credentials_v1';
 const ADMIN_USER_FLAGS_KEY = 'lumina_admin_user_flags_v1';
+const THREAD_READ_WATERMARK_KEY = 'lumina_thread_read_v1';
+const NOTIF_READ_IDS_KEY = 'lumina_notif_read_ids_v1';
 const REALTIME_CHANNEL = 'lumina_realtime_sync_v1';
+
+function loadThreadReadWatermarks(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(THREAD_READ_WATERMARK_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, number>;
+      }
+    }
+  } catch {
+    // Ignore storage read error
+  }
+  return {};
+}
+
+function saveThreadReadWatermarks(map: Record<string, number>): void {
+  try {
+    localStorage.setItem(THREAD_READ_WATERMARK_KEY, JSON.stringify(map));
+  } catch {
+    // Ignore storage quota error
+  }
+}
+
+function loadReadNotifIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(NOTIF_READ_IDS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return new Set(parsed.filter((v): v is string => typeof v === 'string').slice(-400));
+      }
+    }
+  } catch {
+    // Ignore storage read error
+  }
+  return new Set();
+}
+
+function saveReadNotifIds(ids: Set<string>): void {
+  try {
+    localStorage.setItem(NOTIF_READ_IDS_KEY, JSON.stringify(Array.from(ids).slice(-400)));
+  } catch {
+    // Ignore storage quota error
+  }
+}
+
+function mergeNotificationsSmart(
+  localList: NotificationItem[],
+  remoteList: NotificationItem[],
+  readIds: Set<string>
+): NotificationItem[] {
+  const map = new Map<string, NotificationItem>();
+  for (const item of localList) {
+    if (!item?.id) continue;
+    map.set(item.id, readIds.has(item.id) && !item.read ? { ...item, read: true } : item);
+  }
+  for (const item of remoteList) {
+    if (!item?.id) continue;
+    const prev = map.get(item.id);
+    const isRead = Boolean(prev?.read || item.read || readIds.has(item.id));
+    map.set(item.id, prev ? { ...prev, ...item, read: isRead } : { ...item, read: isRead });
+  }
+  return Array.from(map.values())
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 250);
+}
+
+function extractMentionedUsers(
+  text: string,
+  users: UserProfile[],
+  excludeIds: string[]
+): UserProfile[] {
+  if (!text) return [];
+  const matches = text.match(/(?:^|[\s(])@([a-z0-9._]{2,32})/gi);
+  if (!matches) return [];
+  const excluded = new Set(excludeIds.filter(Boolean));
+  const seenIds = new Set<string>();
+  const mentioned: UserProfile[] = [];
+  for (const raw of matches) {
+    const handle = raw.replace(/^[\s(]*@/, '').trim().toLowerCase();
+    if (!handle) continue;
+    const candidates = users.filter((u) => u.username.trim().toLowerCase() === handle);
+    const target = candidates.find((u) => !u.isDemoSeed) || candidates[0];
+    if (!target) continue;
+    if (excluded.has(target.id) || (target.uid && excluded.has(target.uid))) continue;
+    if (seenIds.has(target.id)) continue;
+    seenIds.add(target.id);
+    mentioned.push(target);
+  }
+  return mentioned;
+}
 
 interface AdminUserFlagOverride {
   id?: string;
@@ -290,6 +394,7 @@ function loadInitialInvites(): InviteRecord[] {
 }
 
 function loadInitialState(): PersistedState {
+  const cachedRealUsers = readCachedProfilesSync();
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
@@ -308,23 +413,30 @@ function loadInitialState(): PersistedState {
               : false,
           };
         });
-        const current = mappedUsers.find((u) => u.id === parsed.currentUserId);
+        const mergedUsers =
+          cachedRealUsers.length > 0
+            ? mergeUsersSmart(mappedUsers, cachedRealUsers)
+            : mappedUsers;
+        const current = mergedUsers.find((u) => u.id === parsed.currentUserId);
         const canRestoreAuth =
           parsed.isAuthenticated === true && Boolean(current && !current.isDemoSeed);
         return {
           ...parsed,
           isAuthenticated: canRestoreAuth,
-          users: mappedUsers,
+          users: mergedUsers,
         };
       }
     }
   } catch {
-    // Fallback to seed
+    // Fallback to seed + persistent real user cache
   }
   return {
     currentUserId: 'user_daniel',
     isAuthenticated: false,
-    users: SEED_USERS,
+    users:
+      cachedRealUsers.length > 0
+        ? mergeUsersSmart(SEED_USERS, cachedRealUsers)
+        : SEED_USERS,
     posts: SEED_POSTS,
     stories: SEED_STORIES,
     threads: SEED_THREADS,
@@ -488,10 +600,19 @@ interface SocialContextValue {
       audioDurationSec?: number;
       videoUrl?: string;
       videoName?: string;
+      fileUrl?: string;
+      fileName?: string;
+      fileMime?: string;
+      fileSize?: number;
+      replyToId?: string;
+      replyToSenderId?: string;
+      replyToText?: string;
     }
   ) => void;
   markThreadRead: (threadId: string) => void;
   reactToMessage: (threadId: string, messageId: string, emoji: string) => void;
+  typingByUserId: Record<string, number>;
+  setTypingStatus: (recipientId: string, isTyping: boolean, threadId?: string) => void;
 
   markNotificationsRead: () => void;
   addRecentSearch: (term: string) => void;
@@ -642,7 +763,41 @@ function mergeUsersSmart(
   return result;
 }
 
-function mergeThreadsSmart(localThreads: DirectThread[], remoteThreads: DirectThread[]): DirectThread[] {
+function mergeThreadsSmart(
+  localThreads: DirectThread[],
+  remoteThreads: DirectThread[],
+  myIds: string[] = [],
+  readWatermarks: Record<string, number> = {}
+): DirectThread[] {
+  const myIdSet = new Set(myIds.filter(Boolean));
+  const mergeMsg = (
+    base: DirectThread['messages'][number] | undefined,
+    inc: DirectThread['messages'][number]
+  ): DirectThread['messages'][number] => {
+    if (!base) return inc;
+    const mergedReadBy = Array.from(
+      new Set([...(base.readBy || []), ...(inc.readBy || [])])
+    );
+    const mergedReactions =
+      base.reactions || inc.reactions
+        ? { ...(base.reactions || {}), ...(inc.reactions || {}) }
+        : undefined;
+    const mergedSeenAt =
+      typeof base.seenAt === 'number' || typeof inc.seenAt === 'number'
+        ? Math.max(base.seenAt || 0, inc.seenAt || 0)
+        : undefined;
+    return {
+      ...base,
+      ...inc,
+      readBy: mergedReadBy.length > 0 ? mergedReadBy : undefined,
+      reactions:
+        mergedReactions && Object.keys(mergedReactions).length > 0
+          ? mergedReactions
+          : undefined,
+      seenAt: mergedSeenAt,
+    };
+  };
+
   const map = new Map<string, DirectThread>();
   for (const t of localThreads) {
     map.set(t.id, t);
@@ -650,19 +805,66 @@ function mergeThreadsSmart(localThreads: DirectThread[], remoteThreads: DirectTh
   for (const rt of remoteThreads) {
     const existing = map.get(rt.id);
     if (!existing) {
-      map.set(rt.id, rt);
+      const wm = readWatermarks[rt.id] || 0;
+      const mergedLastRead: Record<string, number> = { ...(rt.lastReadBy || {}) };
+      for (const idVal of myIdSet) {
+        if (wm > 0) mergedLastRead[idVal] = Math.max(mergedLastRead[idVal] || 0, wm);
+      }
+      const nextUnread = (rt.unreadBy || []).filter((uid) => {
+        const readTs = mergedLastRead[uid] || (myIdSet.has(uid) ? wm : 0);
+        return rt.messages.some(
+          (m) =>
+            m.senderId !== uid &&
+            !(m.readBy || []).includes(uid) &&
+            m.createdAt > readTs
+        );
+      });
+      map.set(rt.id, {
+        ...rt,
+        unreadBy: nextUnread,
+        ...(Object.keys(mergedLastRead).length > 0 ? { lastReadBy: mergedLastRead } : {}),
+      });
     } else {
       const msgMap = new Map<string, DirectThread['messages'][number]>();
       for (const m of existing.messages) msgMap.set(m.id, m);
-      for (const m of rt.messages) msgMap.set(m.id, m);
-      const mergedMessages = Array.from(msgMap.values()).sort((a, b) => a.createdAt - b.createdAt);
-      const mergedUnread = Array.from(new Set([...existing.unreadBy, ...rt.unreadBy]));
+      for (const m of rt.messages) msgMap.set(m.id, mergeMsg(msgMap.get(m.id), m));
+      const mergedMessages = Array.from(msgMap.values()).sort(
+        (a, b) => a.createdAt - b.createdAt
+      );
+
+      const wm = readWatermarks[rt.id] || 0;
+      const mergedLastRead: Record<string, number> = {
+        ...(existing.lastReadBy || {}),
+        ...(rt.lastReadBy || {}),
+      };
+      for (const [k, v] of Object.entries(existing.lastReadBy || {})) {
+        mergedLastRead[k] = Math.max(mergedLastRead[k] || 0, v || 0);
+      }
+      for (const idVal of myIdSet) {
+        if (wm > 0) mergedLastRead[idVal] = Math.max(mergedLastRead[idVal] || 0, wm);
+      }
+
+      const candidateUnread = Array.from(
+        new Set([...(existing.unreadBy || []), ...(rt.unreadBy || [])])
+      );
+      const filteredUnread = candidateUnread.filter((uid) => {
+        const readTs = mergedLastRead[uid] || (myIdSet.has(uid) ? wm : 0);
+        const matchIds = myIdSet.has(uid) ? myIdSet : new Set([uid]);
+        return mergedMessages.some((m) => {
+          if (matchIds.has(m.senderId)) return false;
+          const isReadInMsg = (m.readBy || []).some((rId) => matchIds.has(rId));
+          if (isReadInMsg) return false;
+          return m.createdAt > readTs;
+        });
+      });
+
       map.set(rt.id, {
         ...existing,
         ...rt,
         participantIds: Array.from(new Set([...existing.participantIds, ...rt.participantIds])),
         messages: mergedMessages,
-        unreadBy: mergedUnread,
+        unreadBy: filteredUnread,
+        ...(Object.keys(mergedLastRead).length > 0 ? { lastReadBy: mergedLastRead } : {}),
         updatedAt: Math.max(existing.updatedAt, rt.updatedAt),
       });
     }
@@ -740,6 +942,12 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const lastServerUpdatedAtRef = useRef(0);
   const serverAdminFlagsRef = useRef<AdminUserFlagOverrideMap>({});
   const pendingAdminFlagsRef = useRef<AdminUserFlagOverrideMap>({});
+  const threadReadWatermarkRef = useRef<Record<string, number>>(loadThreadReadWatermarks());
+  const readNotifIdsRef = useRef<Set<string>>(loadReadNotifIds());
+  const [typingByUserId, setTypingByUserId] = useState<Record<string, number>>({});
+  const lastTypingEmitRef = useRef<Record<string, number>>({});
+  const currentUserIdRef = useRef(state.currentUserId);
+  currentUserIdRef.current = state.currentUserId;
 
   const getActiveAdminFlagOverrides = (): AdminUserFlagOverrideMap => {
     const now = Date.now();
@@ -824,6 +1032,26 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     void refreshSiteMeta();
+  }, []);
+
+  // Hydrate full persistent IndexedDB profile cache into memory on mount
+  useEffect(() => {
+    let active = true;
+    void readAllCachedProfilesIDB()
+      .then((cachedProfiles) => {
+        if (!active || cachedProfiles.length === 0) return;
+        const activeFlags = getActiveAdminFlagOverrides();
+        skipNextServerPushRef.current = true;
+        skipNextStateBroadcastRef.current = true;
+        setState((prev) => ({
+          ...prev,
+          users: mergeUsersSmart(prev.users, cachedProfiles, activeFlags),
+        }));
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
   }, []);
 
   // Keep client-side canonical URL and OpenGraph preview metadata synchronized
@@ -1015,6 +1243,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       }));
     }
 
+    void upsertCachedProfiles([activeProfile]);
     setGuestBrowsing(false);
     setViewingProfileId(null);
     setIsInviteModalOpen(false);
@@ -1121,6 +1350,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       unsubCloud = subscribeToCloudState(fbUser, {
         onProfiles: (cloudProfiles) => {
           if (cloudProfiles.length === 0) return;
+          void upsertCachedProfiles(cloudProfiles.filter((u) => !u.isDemoSeed));
           skipNextStateBroadcastRef.current = true;
           skipNextServerPushRef.current = true;
           const activeFlags = getActiveAdminFlagOverrides();
@@ -1151,10 +1381,19 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           if (cloudThreads.length === 0) return;
           skipNextStateBroadcastRef.current = true;
           skipNextServerPushRef.current = true;
-          setState((prev) => ({
-            ...prev,
-            threads: mergeRecordsById(prev.threads, cloudThreads).sort((a, b) => b.updatedAt - a.updatedAt),
-          }));
+          setState((prev) => {
+            const me = prev.users.find((u) => u.id === prev.currentUserId);
+            const myIds = [prev.currentUserId, me?.uid || ''].filter(Boolean);
+            return {
+              ...prev,
+              threads: mergeThreadsSmart(
+                prev.threads,
+                cloudThreads,
+                myIds,
+                threadReadWatermarkRef.current
+              ),
+            };
+          });
         },
         onNotifications: (cloudNotifs) => {
           if (cloudNotifs.length === 0) return;
@@ -1162,7 +1401,11 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           skipNextServerPushRef.current = true;
           setState((prev) => ({
             ...prev,
-            notifications: mergeRecordsById(prev.notifications, cloudNotifs).sort((a, b) => b.createdAt - a.createdAt),
+            notifications: mergeNotificationsSmart(
+              prev.notifications,
+              cloudNotifs,
+              readNotifIdsRef.current
+            ),
           }));
         },
         onSiteMeta: (cloudMeta) => {
@@ -1179,6 +1422,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
   const mergeExternalUsers = (incoming: UserProfile[]) => {
     if (!Array.isArray(incoming) || incoming.length === 0) return;
+    void upsertCachedProfiles(incoming.filter((u) => !u.isDemoSeed));
     skipNextServerPushRef.current = true;
     skipNextStateBroadcastRef.current = true;
     const activeFlags = getActiveAdminFlagOverrides();
@@ -1187,9 +1431,6 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       users: mergeUsersSmart(prev.users, incoming, activeFlags),
     }));
   };
-
-  const currentUserIdRef = useRef(state.currentUserId);
-  currentUserIdRef.current = state.currentUserId;
 
   const refreshPublicUsersFromSupabase = async (): Promise<UserProfile[]> => {
     let collected: UserProfile[] = [];
@@ -1224,26 +1465,40 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         if (remote && Array.isArray(remote.users) && Array.isArray(remote.posts)) {
           const activeFlags = getActiveAdminFlagOverrides();
           collected = mergeUsersSmart([], remote.users, activeFlags);
+          void upsertCachedProfiles(collected.filter((u) => !u.isDemoSeed));
           lastServerUpdatedAtRef.current = Math.max(
             lastServerUpdatedAtRef.current,
             remote.updatedAt || Date.now()
           );
           skipNextServerPushRef.current = true;
           skipNextStateBroadcastRef.current = true;
-          setState((prev) => ({
-            ...prev,
-            users: mergeUsersSmart(prev.users, remote.users!, activeFlags),
-            posts: mergeRecordsById(prev.posts, remote.posts!).sort((a, b) => b.createdAt - a.createdAt),
-            stories: Array.isArray(remote.stories)
-              ? mergeRecordsById(prev.stories, remote.stories).sort((a, b) => b.createdAt - a.createdAt)
-              : prev.stories,
-            threads: Array.isArray(remote.threads)
-              ? mergeThreadsSmart(prev.threads, remote.threads)
-              : prev.threads,
-            notifications: Array.isArray(remote.notifications)
-              ? mergeRecordsById(prev.notifications, remote.notifications).sort((a, b) => b.createdAt - a.createdAt)
-              : prev.notifications,
-          }));
+          setState((prev) => {
+            const me = prev.users.find((u) => u.id === prev.currentUserId);
+            const myIds = [prev.currentUserId, me?.uid || ''].filter(Boolean);
+            return {
+              ...prev,
+              users: mergeUsersSmart(prev.users, remote.users!, activeFlags),
+              posts: mergeRecordsById(prev.posts, remote.posts!).sort((a, b) => b.createdAt - a.createdAt),
+              stories: Array.isArray(remote.stories)
+                ? mergeRecordsById(prev.stories, remote.stories).sort((a, b) => b.createdAt - a.createdAt)
+                : prev.stories,
+              threads: Array.isArray(remote.threads)
+                ? mergeThreadsSmart(
+                    prev.threads,
+                    remote.threads,
+                    myIds,
+                    threadReadWatermarkRef.current
+                  )
+                : prev.threads,
+              notifications: Array.isArray(remote.notifications)
+                ? mergeNotificationsSmart(
+                    prev.notifications,
+                    remote.notifications,
+                    readNotifIdsRef.current
+                  )
+                : prev.notifications,
+            };
+          });
         }
       }
     } catch {
@@ -1263,36 +1518,44 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       if (sbUsers.length > 0 || sbPosts.length > 0 || sbStories.length > 0 || sbThreads.length > 0) {
         const activeFlags = getActiveAdminFlagOverrides();
         collected = mergeUsersSmart(collected, sbUsers, activeFlags);
+        if (sbUsers.length > 0) {
+          void upsertCachedProfiles(sbUsers.filter((u) => !u.isDemoSeed));
+        }
         skipNextServerPushRef.current = true;
         skipNextStateBroadcastRef.current = true;
-        setState((prev) => ({
-          ...prev,
-          users: sbUsers.length > 0 ? mergeUsersSmart(prev.users, sbUsers, activeFlags) : prev.users,
-          posts:
-            sbPosts.length > 0
-              ? mergeRecordsById(prev.posts, sbPosts).sort((a, b) => b.createdAt - a.createdAt)
-              : prev.posts,
-          stories:
-            sbStories.length > 0
-              ? mergeRecordsById(prev.stories, sbStories).sort((a, b) => b.createdAt - a.createdAt)
-              : prev.stories,
-          threads:
-            sbThreads.length > 0
-              ? mergeThreadsSmart(prev.threads, sbThreads)
-              : prev.threads,
-        }));
+        setState((prev) => {
+          const me = prev.users.find((u) => u.id === prev.currentUserId);
+          const myIds = [prev.currentUserId, me?.uid || ''].filter(Boolean);
+          return {
+            ...prev,
+            users: sbUsers.length > 0 ? mergeUsersSmart(prev.users, sbUsers, activeFlags) : prev.users,
+            posts:
+              sbPosts.length > 0
+                ? mergeRecordsById(prev.posts, sbPosts).sort((a, b) => b.createdAt - a.createdAt)
+                : prev.posts,
+            stories:
+              sbStories.length > 0
+                ? mergeRecordsById(prev.stories, sbStories).sort((a, b) => b.createdAt - a.createdAt)
+                : prev.stories,
+            threads:
+              sbThreads.length > 0
+                ? mergeThreadsSmart(prev.threads, sbThreads, myIds, threadReadWatermarkRef.current)
+                : prev.threads,
+          };
+        });
       }
     }
     return collected;
   };
 
-  // Resolve shared profile links (?perfil=username or /@username) across local, server, and Supabase
+  // Resolve shared profile links (?perfil=username or /@username) across instant cache, server, Supabase, and Firestore
   useEffect(() => {
     if (!pendingProfileSlug) {
       setProfileLookupLoading(false);
       return;
     }
     const cleanSlug = pendingProfileSlug.trim().toLowerCase().replace(/^@/, '');
+    const rawTrimmed = pendingProfileSlug.trim().replace(/^@/, '');
     const currentUsers = usersRef.current;
     const localMatches = currentUsers.filter(
       (u) =>
@@ -1301,91 +1564,150 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         (u.uid && u.uid.toLowerCase() === cleanSlug)
     );
     const localReal = localMatches.find((u) => !u.isDemoSeed);
-    const localPreferred = localReal || localMatches[0];
-    if (localReal) {
-      setViewingProfileId(localReal.id);
+    const cachedSyncHit = !localReal
+      ? readCachedProfilesSync().find(
+          (u) =>
+            u.username.toLowerCase() === cleanSlug ||
+            u.id.toLowerCase() === cleanSlug ||
+            (u.uid && u.uid.toLowerCase() === cleanSlug)
+        )
+      : undefined;
+    const immediateReal = localReal || cachedSyncHit;
+    const localPreferred = immediateReal || localMatches[0];
+
+    if (cachedSyncHit) {
+      skipNextServerPushRef.current = true;
+      skipNextStateBroadcastRef.current = true;
+      const activeFlags = getActiveAdminFlagOverrides();
+      setState((prev) => ({
+        ...prev,
+        users: mergeUsersSmart(prev.users, [cachedSyncHit], activeFlags),
+      }));
+    }
+
+    if (immediateReal) {
+      setViewingProfileId(immediateReal.id);
       setProfileLookupLoading(false);
     } else if (localPreferred && siteMetaReady && !getBrowserSupabaseConfig().anonKey) {
       setViewingProfileId(localPreferred.id);
     }
 
-    // Wait for /api/site/meta to hydrate public Supabase anonKey before declaring not found
-    if (!localReal && !siteMetaReady) {
+    let cancelled = false;
+    if (!immediateReal) {
       setProfileLookupLoading(true);
-      return;
     }
 
-    let cancelled = false;
-    if (!localReal) {
-      setProfileLookupLoading(true);
-    }
+    const applyResolvedUser = (
+      foundUser: UserProfile,
+      foundPosts: Post[] = [],
+      foundStories: StoryItem[] = []
+    ) => {
+      if (cancelled || !foundUser?.id) return;
+      void upsertCachedProfiles([foundUser]);
+      skipNextServerPushRef.current = true;
+      skipNextStateBroadcastRef.current = true;
+      const activeFlags = getActiveAdminFlagOverrides();
+      setState((prev) => ({
+        ...prev,
+        users: mergeUsersSmart(prev.users, [foundUser], activeFlags),
+        posts:
+          foundPosts.length > 0
+            ? mergeRecordsById(prev.posts, foundPosts).sort((a, b) => b.createdAt - a.createdAt)
+            : prev.posts,
+        stories:
+          foundStories.length > 0
+            ? mergeRecordsById(prev.stories, foundStories).sort((a, b) => b.createdAt - a.createdAt)
+            : prev.stories,
+      }));
+      setViewingProfileId(foundUser.id);
+      setProfileLookupLoading(false);
+    };
+
     const lookupRemoteProfile = async () => {
-      try {
-        const res = await fetch(`/api/social/profile/${encodeURIComponent(cleanSlug)}`);
-        const ct = res.headers.get('content-type') || '';
-        if (res.ok && ct.includes('application/json')) {
+      if (!immediateReal) {
+        const idbHit = await lookupCachedProfileInstant(rawTrimmed).catch(() => null);
+        if (!cancelled && idbHit && idbHit.id) {
+          applyResolvedUser(idbHit);
+        }
+      }
+
+      const sbConfig = getBrowserSupabaseConfig();
+      const canQuerySupabase = Boolean(sbConfig.anonKey);
+
+      const nodePromise = fetch(`/api/social/profile/${encodeURIComponent(cleanSlug)}`)
+        .then(async (res) => {
+          const ct = res.headers.get('content-type') || '';
+          if (!res.ok || !ct.includes('application/json')) return null;
           const data = (await res.json()) as {
             ok?: boolean;
             user?: UserProfile;
             posts?: Post[];
             stories?: StoryItem[];
           };
-          if (!cancelled && data.ok && data.user) {
-            skipNextServerPushRef.current = true;
-            skipNextStateBroadcastRef.current = true;
-            const activeFlags = getActiveAdminFlagOverrides();
-            setState((prev) => ({
-              ...prev,
-              users: mergeUsersSmart(prev.users, [data.user!], activeFlags),
-              posts:
-                Array.isArray(data.posts) && data.posts.length > 0
-                  ? mergeRecordsById(prev.posts, data.posts).sort((a, b) => b.createdAt - a.createdAt)
-                  : prev.posts,
-              stories:
-                Array.isArray(data.stories) && data.stories.length > 0
-                  ? mergeRecordsById(prev.stories, data.stories).sort((a, b) => b.createdAt - a.createdAt)
-                  : prev.stories,
-            }));
-            setViewingProfileId(data.user.id);
-            setProfileLookupLoading(false);
-            return;
-          }
-        }
-      } catch {
-        // Fallback directly to browser Supabase REST query
+          return data.ok && data.user ? data : null;
+        })
+        .catch(() => null);
+
+      const sbPromise = canQuerySupabase
+        ? fetchPublicUserByUsernameFromSupabaseBrowser(sbConfig, rawTrimmed).catch(() => null)
+        : Promise.resolve(null);
+
+      const cloudPromise =
+        auth.currentUser && auth.currentUser.emailVerified
+          ? fetchProfileByUsernameFromCloud(cleanSlug, auth.currentUser).catch(() => null)
+          : Promise.resolve(null);
+
+      const [nodeHit, sbHit, cloudHit] = await Promise.all([
+        nodePromise,
+        sbPromise,
+        cloudPromise,
+      ]);
+
+      if (cancelled) return;
+
+      if (nodeHit?.user) {
+        applyResolvedUser(
+          nodeHit.user,
+          Array.isArray(nodeHit.posts) ? nodeHit.posts : [],
+          Array.isArray(nodeHit.stories) ? nodeHit.stories : []
+        );
+        return;
       }
 
-      const sbConfig = getBrowserSupabaseConfig();
-      if (sbConfig.anonKey) {
-        const sbUser = await fetchPublicUserByUsernameFromSupabaseBrowser(sbConfig, cleanSlug);
-        if (!cancelled && sbUser && sbUser.id) {
-          const [sbPosts, sbStories] = await Promise.all([
-            fetchPublicPostsFromSupabaseBrowser(sbConfig, sbUser.id),
-            fetchPublicStoriesFromSupabaseBrowser(sbConfig, sbUser.id),
-          ]);
-          if (!cancelled) {
-            skipNextServerPushRef.current = true;
-            skipNextStateBroadcastRef.current = true;
-            const activeFlags = getActiveAdminFlagOverrides();
-            setState((prev) => ({
-              ...prev,
-              users: mergeUsersSmart(prev.users, [sbUser], activeFlags),
-              posts:
-                sbPosts.length > 0
-                  ? mergeRecordsById(prev.posts, sbPosts).sort((a, b) => b.createdAt - a.createdAt)
-                  : prev.posts,
-              stories:
-                sbStories.length > 0
-                  ? mergeRecordsById(prev.stories, sbStories).sort((a, b) => b.createdAt - a.createdAt)
-                  : prev.stories,
-            }));
-            setViewingProfileId(sbUser.id);
-            setProfileLookupLoading(false);
-            return;
-          }
+      let remoteUser = sbHit || cloudHit || null;
+
+      if (!remoteUser && canQuerySupabase) {
+        const allPublic = await fetchPublicUsersFromSupabaseBrowser(sbConfig).catch(() => []);
+        if (cancelled) return;
+        if (allPublic.length > 0) {
+          void upsertCachedProfiles(allPublic.filter((u) => !u.isDemoSeed));
+          remoteUser =
+            allPublic.find(
+              (u) =>
+                u.username.toLowerCase() === cleanSlug ||
+                u.id.toLowerCase() === cleanSlug ||
+                (u.uid && u.uid.toLowerCase() === cleanSlug)
+            ) || null;
         }
       }
+
+      if (remoteUser && remoteUser.id) {
+        const [sbPosts, sbStories] = canQuerySupabase
+          ? await Promise.all([
+              fetchPublicPostsFromSupabaseBrowser(sbConfig, remoteUser.id),
+              fetchPublicStoriesFromSupabaseBrowser(sbConfig, remoteUser.id),
+            ])
+          : [[], []];
+        if (!cancelled) {
+          applyResolvedUser(remoteUser, sbPosts, sbStories);
+          return;
+        }
+      }
+
       if (!cancelled) {
+        if (!siteMetaReady && !immediateReal) {
+          return;
+        }
         if (localPreferred) {
           setViewingProfileId(localPreferred.id);
         }
@@ -1398,7 +1720,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     };
   }, [pendingProfileSlug, siteMetaReady, runtimeConfigVersion]);
 
-  // Node server + Supabase cross-device sync (users, posts, active stories, and direct messages)
+  // Node server + Supabase cross-device sync (parallelized for lower latency)
   useEffect(() => {
     let active = true;
     const pullServerState = async () => {
@@ -1408,33 +1730,54 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           ? [activeUser.id, activeUser.uid || ''].filter(Boolean)
           : [];
       const qs = activeIds.length > 0 ? `?userIds=${encodeURIComponent(activeIds.join(','))}` : '';
+      const sbConfig = getBrowserSupabaseConfig();
 
-      try {
-        const res = await fetch(`/api/social/state${qs}`);
-        const ct = res.headers.get('content-type') || '';
-        if (!res.ok || !ct.includes('application/json')) {
-          throw new Error('Static hosting fallback');
+      const nodePromise = (async () => {
+        try {
+          const res = await fetch(`/api/social/state${qs}`);
+          const ct = res.headers.get('content-type') || '';
+          if (!res.ok || !ct.includes('application/json')) return null;
+          return (await res.json()) as {
+            ok?: boolean;
+            state?: {
+              updatedAt?: number;
+              users?: UserProfile[];
+              posts?: Post[];
+              stories?: StoryItem[];
+              threads?: DirectThread[];
+              notifications?: NotificationItem[];
+              userFlagOverrides?: AdminUserFlagOverrideMap;
+            } | null;
+          };
+        } catch {
+          return null;
         }
-        const data = (await res.json()) as {
-          ok?: boolean;
-          state?: {
-            updatedAt?: number;
-            users?: UserProfile[];
-            posts?: Post[];
-            stories?: StoryItem[];
-            threads?: DirectThread[];
-            notifications?: NotificationItem[];
-            userFlagOverrides?: AdminUserFlagOverrideMap;
-          } | null;
-        };
-        if (!active || !data.ok) return;
+      })();
+
+      const sbPromise =
+        sbConfig.autoSyncUsers && sbConfig.anonKey
+          ? Promise.all([
+              fetchPublicUsersFromSupabaseBrowser(sbConfig),
+              fetchPublicPostsFromSupabaseBrowser(sbConfig),
+              fetchPublicStoriesFromSupabaseBrowser(sbConfig),
+              activeIds.length > 0
+                ? fetchDirectThreadsForUserFromSupabaseBrowser(sbConfig, activeIds)
+                : Promise.resolve([] as DirectThread[]),
+            ])
+          : Promise.resolve(null);
+
+      const [nodeData, sbData] = await Promise.all([nodePromise, sbPromise]);
+      if (!active) return;
+
+      if (nodeData?.ok) {
         setServerSyncAvailable(true);
-        const remote = data.state;
+        const remote = nodeData.state;
         if (remote?.userFlagOverrides && typeof remote.userFlagOverrides === 'object') {
           serverAdminFlagsRef.current = remote.userFlagOverrides;
         }
         if (remote && Array.isArray(remote.users) && Array.isArray(remote.posts)) {
-          const isNewerTimestamp = !remote.updatedAt || remote.updatedAt > lastServerUpdatedAtRef.current;
+          const isNewerTimestamp =
+            !remote.updatedAt || remote.updatedAt > lastServerUpdatedAtRef.current;
           const hasUnseenUsers = remote.users.some(
             (ru) =>
               !usersRef.current.some(
@@ -1453,61 +1796,85 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
               );
             }
             const activeFlags = getActiveAdminFlagOverrides();
+            void upsertCachedProfiles(remote.users.filter((u) => !u.isDemoSeed));
             skipNextServerPushRef.current = true;
             skipNextStateBroadcastRef.current = true;
-            setState((prev) => ({
-              ...prev,
-              users: mergeUsersSmart(prev.users, remote.users!, activeFlags),
-              posts: mergeRecordsById(prev.posts, remote.posts!).sort((a, b) => b.createdAt - a.createdAt),
-              stories: Array.isArray(remote.stories)
-                ? mergeRecordsById(prev.stories, remote.stories).sort((a, b) => b.createdAt - a.createdAt)
-                : prev.stories,
-              threads: Array.isArray(remote.threads)
-                ? mergeThreadsSmart(prev.threads, remote.threads)
-                : prev.threads,
-              notifications: Array.isArray(remote.notifications)
-                ? mergeRecordsById(prev.notifications, remote.notifications).sort(
-                    (a, b) => b.createdAt - a.createdAt
-                  )
-                : prev.notifications,
-            }));
+            setState((prev) => {
+              const me = prev.users.find((u) => u.id === prev.currentUserId);
+              const myIds = [prev.currentUserId, me?.uid || ''].filter(Boolean);
+              return {
+                ...prev,
+                users: mergeUsersSmart(prev.users, remote.users!, activeFlags),
+                posts: mergeRecordsById(prev.posts, remote.posts!).sort(
+                  (a, b) => b.createdAt - a.createdAt
+                ),
+                stories: Array.isArray(remote.stories)
+                  ? mergeRecordsById(prev.stories, remote.stories).sort(
+                      (a, b) => b.createdAt - a.createdAt
+                    )
+                  : prev.stories,
+                threads: Array.isArray(remote.threads)
+                  ? mergeThreadsSmart(
+                      prev.threads,
+                      remote.threads,
+                      myIds,
+                      threadReadWatermarkRef.current
+                    )
+                  : prev.threads,
+                notifications: Array.isArray(remote.notifications)
+                  ? mergeNotificationsSmart(
+                      prev.notifications,
+                      remote.notifications,
+                      readNotifIdsRef.current
+                    )
+                  : prev.notifications,
+              };
+            });
           }
         }
-      } catch {
-        // Static hosting without Node /api/social/state
       }
 
-      if (!active) return;
-      const sbConfig = getBrowserSupabaseConfig();
-      if (sbConfig.autoSyncUsers && sbConfig.anonKey) {
-        const [sbUsers, sbPosts, sbStories, sbThreads] = await Promise.all([
-          fetchPublicUsersFromSupabaseBrowser(sbConfig),
-          fetchPublicPostsFromSupabaseBrowser(sbConfig),
-          fetchPublicStoriesFromSupabaseBrowser(sbConfig),
-          activeIds.length > 0
-            ? fetchDirectThreadsForUserFromSupabaseBrowser(sbConfig, activeIds)
-            : Promise.resolve([] as DirectThread[]),
-        ]);
-        if (active && (sbUsers.length > 0 || sbPosts.length > 0 || sbStories.length > 0 || sbThreads.length > 0)) {
+      if (active && sbData) {
+        const [sbUsers, sbPosts, sbStories, sbThreads] = sbData;
+        if (
+          sbUsers.length > 0 ||
+          sbPosts.length > 0 ||
+          sbStories.length > 0 ||
+          sbThreads.length > 0
+        ) {
           const activeFlags = getActiveAdminFlagOverrides();
+          if (sbUsers.length > 0) {
+            void upsertCachedProfiles(sbUsers.filter((u) => !u.isDemoSeed));
+          }
           skipNextServerPushRef.current = true;
           skipNextStateBroadcastRef.current = true;
-          setState((prev) => ({
-            ...prev,
-            users: sbUsers.length > 0 ? mergeUsersSmart(prev.users, sbUsers, activeFlags) : prev.users,
-            posts:
-              sbPosts.length > 0
-                ? mergeRecordsById(prev.posts, sbPosts).sort((a, b) => b.createdAt - a.createdAt)
-                : prev.posts,
-            stories:
-              sbStories.length > 0
-                ? mergeRecordsById(prev.stories, sbStories).sort((a, b) => b.createdAt - a.createdAt)
-                : prev.stories,
-            threads:
-              sbThreads.length > 0
-                ? mergeThreadsSmart(prev.threads, sbThreads)
-                : prev.threads,
-          }));
+          setState((prev) => {
+            const me = prev.users.find((u) => u.id === prev.currentUserId);
+            const myIds = [prev.currentUserId, me?.uid || ''].filter(Boolean);
+            return {
+              ...prev,
+              users: sbUsers.length > 0 ? mergeUsersSmart(prev.users, sbUsers, activeFlags) : prev.users,
+              posts:
+                sbPosts.length > 0
+                  ? mergeRecordsById(prev.posts, sbPosts).sort((a, b) => b.createdAt - a.createdAt)
+                  : prev.posts,
+              stories:
+                sbStories.length > 0
+                  ? mergeRecordsById(prev.stories, sbStories).sort(
+                      (a, b) => b.createdAt - a.createdAt
+                    )
+                  : prev.stories,
+              threads:
+                sbThreads.length > 0
+                  ? mergeThreadsSmart(
+                      prev.threads,
+                      sbThreads,
+                      myIds,
+                      threadReadWatermarkRef.current
+                    )
+                  : prev.threads,
+            };
+          });
         }
       }
     };
@@ -1520,6 +1887,111 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       window.clearInterval(timer);
     };
   }, [runtimeConfigVersion, state.currentUserId, state.isAuthenticated]);
+
+  // Fast lightweight Messenger sync loop (messages + read receipts + live typing indicator)
+  useEffect(() => {
+    if (!state.isAuthenticated) return;
+    const activeUser = usersRef.current.find((u) => u.id === currentUserIdRef.current);
+    if (!activeUser || activeUser.isDemoSeed) return;
+    const activeIds = [activeUser.id, activeUser.uid || ''].filter(Boolean);
+    if (activeIds.length === 0) return;
+
+    let active = true;
+    const intervalMs = activeNav === 'messages' ? 1800 : 5000;
+
+    const pullMessagesAndTyping = async () => {
+      const qs = `?userIds=${encodeURIComponent(activeIds.join(','))}`;
+      const sbConfig = getBrowserSupabaseConfig();
+
+      const [nodeMsgsRes, typingRes, sbThreads] = await Promise.all([
+        fetch(`/api/social/messages${qs}`)
+          .then(async (r) => {
+            if (!r.ok || !r.headers.get('content-type')?.includes('application/json')) return null;
+            return (await r.json()) as { ok?: boolean; threads?: DirectThread[] };
+          })
+          .catch(() => null),
+        activeNav === 'messages'
+          ? fetch(`/api/social/typing${qs}`)
+              .then(async (r) => {
+                if (!r.ok || !r.headers.get('content-type')?.includes('application/json')) return null;
+                return (await r.json()) as { ok?: boolean; typingFromIds?: string[] };
+              })
+              .catch(() => null)
+          : Promise.resolve(null),
+        !serverSyncAvailable && sbConfig.anonKey
+          ? fetchDirectThreadsForUserFromSupabaseBrowser(sbConfig, activeIds).catch(() => [] as DirectThread[])
+          : Promise.resolve([] as DirectThread[]),
+      ]);
+
+      if (!active) return;
+
+      if (typingRes?.ok && Array.isArray(typingRes.typingFromIds)) {
+        const now = Date.now();
+        setTypingByUserId((prev) => {
+          const next: Record<string, number> = {};
+          for (const [k, ts] of Object.entries(prev)) {
+            if (now - ts < 4200) next[k] = ts;
+          }
+          for (const id of typingRes.typingFromIds!) {
+            next[id] = now;
+          }
+          const prevKeys = Object.keys(prev);
+          const nextKeys = Object.keys(next);
+          if (
+            prevKeys.length === nextKeys.length &&
+            nextKeys.every((k) => prev[k] !== undefined)
+          ) {
+            return prev;
+          }
+          return next;
+        });
+      }
+
+      const incomingThreads = [
+        ...(Array.isArray(nodeMsgsRes?.threads) ? nodeMsgsRes!.threads : []),
+        ...sbThreads,
+      ];
+      if (incomingThreads.length === 0) return;
+
+      skipNextServerPushRef.current = true;
+      skipNextStateBroadcastRef.current = true;
+      setState((prev) => {
+        const me = prev.users.find((u) => u.id === prev.currentUserId);
+        const myIds = [prev.currentUserId, me?.uid || ''].filter(Boolean);
+        const merged = mergeThreadsSmart(
+          prev.threads,
+          incomingThreads,
+          myIds,
+          threadReadWatermarkRef.current
+        );
+        const sig = (list: DirectThread[]) =>
+          list
+            .map((t) => {
+              const last = t.messages[t.messages.length - 1];
+              const lastReadLen = last?.readBy?.length || 0;
+              const reactCount = t.messages.reduce(
+                (acc, m) => acc + Object.keys(m.reactions || {}).length + (m.reaction ? 1 : 0),
+                0
+              );
+              return `${t.id}:${t.messages.length}:${t.unreadBy.join(',')}:${lastReadLen}:${reactCount}`;
+            })
+            .join('|');
+        if (sig(merged) === sig(prev.threads)) {
+          return prev;
+        }
+        return { ...prev, threads: merged };
+      });
+    };
+
+    void pullMessagesAndTyping();
+    const timer = window.setInterval(() => {
+      void pullMessagesAndTyping();
+    }, intervalMs);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [activeNav, state.isAuthenticated, state.currentUserId, serverSyncAvailable, runtimeConfigVersion]);
 
   // Cross-tab real-time synchronization for real user messages, posts, and profiles
   useEffect(() => {
@@ -1537,20 +2009,57 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           notifications?: NotificationItem[];
           invites?: InviteRecord[];
           siteMeta?: SiteMeta;
+          fromUserId?: string;
+          fromUid?: string;
+          toUserId?: string;
+          isTyping?: boolean;
         };
         if (!payload || payload.senderTabId === tabIdRef.current) return;
+        if (payload.type === 'typing_sync' && payload.fromUserId) {
+          const me = usersRef.current.find((u) => u.id === currentUserIdRef.current);
+          const myIds = new Set([currentUserIdRef.current, me?.uid || ''].filter(Boolean));
+          if (!payload.toUserId || myIds.has(payload.toUserId)) {
+            setTypingByUserId((prev) => {
+              const next = { ...prev };
+              if (payload.isTyping) {
+                next[payload.fromUserId!] = Date.now();
+                if (payload.fromUid) next[payload.fromUid] = Date.now();
+              } else {
+                delete next[payload.fromUserId!];
+                if (payload.fromUid) delete next[payload.fromUid];
+              }
+              return next;
+            });
+          }
+          return;
+        }
         if (payload.type === 'state_sync') {
           skipNextStateBroadcastRef.current = true;
-          setState((prev) => ({
-            ...prev,
-            users: Array.isArray(payload.users) ? payload.users : prev.users,
-            posts: Array.isArray(payload.posts) ? payload.posts : prev.posts,
-            stories: Array.isArray(payload.stories) ? payload.stories : prev.stories,
-            threads: Array.isArray(payload.threads) ? payload.threads : prev.threads,
-            notifications: Array.isArray(payload.notifications)
-              ? payload.notifications
-              : prev.notifications,
-          }));
+          setState((prev) => {
+            const me = prev.users.find((u) => u.id === prev.currentUserId);
+            const myIds = [prev.currentUserId, me?.uid || ''].filter(Boolean);
+            return {
+              ...prev,
+              users: Array.isArray(payload.users) ? payload.users : prev.users,
+              posts: Array.isArray(payload.posts) ? payload.posts : prev.posts,
+              stories: Array.isArray(payload.stories) ? payload.stories : prev.stories,
+              threads: Array.isArray(payload.threads)
+                ? mergeThreadsSmart(
+                    prev.threads,
+                    payload.threads,
+                    myIds,
+                    threadReadWatermarkRef.current
+                  )
+                : prev.threads,
+              notifications: Array.isArray(payload.notifications)
+                ? mergeNotificationsSmart(
+                    prev.notifications,
+                    payload.notifications,
+                    readNotifIdsRef.current
+                  )
+                : prev.notifications,
+            };
+          });
         } else if (payload.type === 'invites_sync' && Array.isArray(payload.invites)) {
           skipNextInvitesBroadcastRef.current = true;
           setInvites(payload.invites);
@@ -1566,14 +2075,27 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           const parsed = JSON.parse(e.newValue) as PersistedState;
           if (parsed && Array.isArray(parsed.users)) {
             skipNextStateBroadcastRef.current = true;
-            setState((prev) => ({
-              ...prev,
-              users: parsed.users,
-              posts: parsed.posts,
-              stories: parsed.stories,
-              threads: parsed.threads,
-              notifications: parsed.notifications,
-            }));
+            setState((prev) => {
+              const me = prev.users.find((u) => u.id === prev.currentUserId);
+              const myIds = [prev.currentUserId, me?.uid || ''].filter(Boolean);
+              return {
+                ...prev,
+                users: parsed.users,
+                posts: parsed.posts,
+                stories: parsed.stories,
+                threads: mergeThreadsSmart(
+                  prev.threads,
+                  parsed.threads || [],
+                  myIds,
+                  threadReadWatermarkRef.current
+                ),
+                notifications: mergeNotificationsSmart(
+                  prev.notifications,
+                  parsed.notifications || [],
+                  readNotifIdsRef.current
+                ),
+              };
+            });
           }
         } catch {
           // Ignore malformed storage event
@@ -1610,18 +2132,17 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     }
   }, [state.theme]);
 
-  useEffect(() => {
-    if (skipNextStateBroadcastRef.current) {
-      skipNextStateBroadcastRef.current = false;
-      return;
-    }
+  const latestStateRef = useRef(state);
+  latestStateRef.current = state;
+
+  const persistLocalStorageNow = (snapshot: PersistedState) => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
     } catch {
       try {
         const compactState: PersistedState = {
-          ...state,
-          posts: state.posts.map((p) => ({
+          ...snapshot,
+          posts: snapshot.posts.map((p) => ({
             ...p,
             media: p.media.map((m) => ({
               ...m,
@@ -1631,12 +2152,13 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
                   : m.url,
             })),
           })),
-          threads: state.threads.map((t) => ({
+          threads: snapshot.threads.map((t) => ({
             ...t,
             messages: t.messages.map((m) => ({
               ...m,
               videoUrl: m.videoUrl && m.videoUrl.length > 500_000 ? undefined : m.videoUrl,
               audioUrl: m.audioUrl && m.audioUrl.length > 500_000 ? undefined : m.audioUrl,
+              fileUrl: m.fileUrl && m.fileUrl.length > 350_000 ? undefined : m.fileUrl,
             })),
           })),
         };
@@ -1645,39 +2167,83 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         // Keep running smoothly in memory
       }
     }
+  };
 
-    channelRef.current?.postMessage({
-      senderTabId: tabIdRef.current,
-      type: 'state_sync',
-      users: state.users,
-      posts: state.posts,
-      stories: state.stories,
-      threads: state.threads,
-      notifications: state.notifications,
-    });
+  useEffect(() => {
+    const handleFlush = () => {
+      persistLocalStorageNow(latestStateRef.current);
+      const realUsers = latestStateRef.current.users.filter((u) => !u.isDemoSeed);
+      if (realUsers.length > 0) {
+        void upsertCachedProfiles(realUsers);
+      }
+    };
+    window.addEventListener('beforeunload', handleFlush);
+    window.addEventListener('pagehide', handleFlush);
+    return () => {
+      window.removeEventListener('beforeunload', handleFlush);
+      window.removeEventListener('pagehide', handleFlush);
+    };
+  }, []);
 
+  // Keep dedicated real-user localStorage + IndexedDB cache continuously updated
+  useEffect(() => {
+    const realUsers = state.users.filter((u) => !u.isDemoSeed);
+    if (realUsers.length === 0) return;
+    const timer = window.setTimeout(() => {
+      void upsertCachedProfiles(realUsers);
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [state.users]);
+
+  useEffect(() => {
+    if (skipNextStateBroadcastRef.current) {
+      skipNextStateBroadcastRef.current = false;
+      return;
+    }
+
+    const storageTimer = window.setTimeout(() => {
+      persistLocalStorageNow(state);
+      channelRef.current?.postMessage({
+        senderTabId: tabIdRef.current,
+        type: 'state_sync',
+        users: state.users,
+        posts: state.posts,
+        stories: state.stories,
+        threads: state.threads,
+        notifications: state.notifications,
+      });
+    }, 320);
+
+    let pushTimer: number | null = null;
     if (skipNextServerPushRef.current) {
       skipNextServerPushRef.current = false;
     } else if (serverSyncAvailable) {
-      fetch('/api/social/state', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          users: state.users,
-          posts: state.posts,
-          stories: state.stories,
-          threads: state.threads,
-          notifications: state.notifications,
-        }),
-      })
-        .then(async (res) => {
-          if (res.ok) {
-            const data = (await res.json()) as { updatedAt?: number };
-            if (data.updatedAt) lastServerUpdatedAtRef.current = data.updatedAt;
-          }
+      pushTimer = window.setTimeout(() => {
+        fetch('/api/social/state', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            users: state.users,
+            posts: state.posts,
+            stories: state.stories,
+            threads: state.threads,
+            notifications: state.notifications,
+          }),
         })
-        .catch(() => {});
+          .then(async (res) => {
+            if (res.ok) {
+              const data = (await res.json()) as { updatedAt?: number };
+              if (data.updatedAt) lastServerUpdatedAtRef.current = data.updatedAt;
+            }
+          })
+          .catch(() => {});
+      }, 650);
     }
+
+    return () => {
+      window.clearTimeout(storageTimer);
+      if (pushTimer !== null) window.clearTimeout(pushTimer);
+    };
   }, [state, serverSyncAvailable]);
 
   // Always index public post previews on Node SSR server (even for posts loaded from Firestore)
@@ -1769,12 +2335,36 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     );
   }, [state.stories, visibleUserIds, siteMeta.realUsersOnly]);
 
-  const getUserById = (id: string) =>
-    state.users.find((u) => u.id === id || (u.uid && u.uid === id));
+  const usersIndexMap = useMemo(() => {
+    const map = new Map<string, UserProfile>();
+    // Index demo seeds first so real profiles win on handle collisions
+    for (const u of state.users) {
+      if (!u.isDemoSeed) continue;
+      map.set(u.id, u);
+      if (u.uid) map.set(u.uid, u);
+      if (u.username) map.set(u.username.trim().toLowerCase(), u);
+    }
+    for (const u of state.users) {
+      if (u.isDemoSeed) continue;
+      map.set(u.id, u);
+      if (u.uid) map.set(u.uid, u);
+      if (u.username) map.set(u.username.trim().toLowerCase(), u);
+    }
+    return map;
+  }, [state.users]);
+
+  const getUserById = (id: string) => {
+    if (!id) return undefined;
+    const direct = usersIndexMap.get(id);
+    if (direct) return direct;
+    const normalized = id.trim().replace(/^@/, '').toLowerCase();
+    return normalized ? usersIndexMap.get(normalized) : undefined;
+  };
 
   const openProfile = (userId: string) => {
+    const matched = getUserById(userId);
     setPendingProfileSlug(null);
-    setViewingProfileId(userId);
+    setViewingProfileId(matched?.id || userId);
     setActiveNav('profile');
   };
 
@@ -2208,6 +2798,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       following: [],
     };
 
+    void upsertCachedProfiles([newUser]);
     setState((prev) => ({
       ...prev,
       users: [newUser, ...prev.users],
@@ -2394,6 +2985,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       following: [],
     };
 
+    void upsertCachedProfiles([newUser]);
     setState((prev) => ({
       ...prev,
       users: [newUser, ...prev.users.filter((u) => u.id !== resolvedId)],
@@ -3045,6 +3637,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       void upsertOwnProfileInCloud(updatedUser, auth.currentUser).catch(() => {});
     }
     if (!updatedUser.isDemoSeed) {
+      void upsertCachedProfiles([updatedUser]);
       persistUserPatchRemote(updatedUser.id, updates);
     }
     showToast('Perfil atualizado');
@@ -3110,6 +3703,12 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  const syncNotificationToCloud = (notif: NotificationItem, recipientUser?: UserProfile) => {
+    if (auth.currentUser && auth.currentUser.emailVerified && recipientUser?.uid) {
+      void createNotificationInCloud(notif, recipientUser.uid, auth.currentUser).catch(() => {});
+    }
+  };
+
   const toggleLikePost = (postId: string) => {
     if (!requireAuthForAction()) return;
     const targetPost = state.posts.find((p) => p.id === postId);
@@ -3120,29 +3719,52 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         : [...targetPost.likes, currentUser.id]
       : [];
 
+    const postAuthor = targetPost ? getUserById(targetPost.authorId) : undefined;
+    const canonicalRecipientId = postAuthor?.id || targetPost?.authorId || '';
+    const isSelfPost =
+      !canonicalRecipientId ||
+      canonicalRecipientId === currentUser.id ||
+      (Boolean(currentUser.uid) && canonicalRecipientId === currentUser.uid);
+
+    const likeNotif: NotificationItem | null =
+      !alreadyLiked && targetPost && !isSelfPost
+        ? {
+            id: `notif_like_${postId}_${currentUser.id}_${Date.now()}`,
+            recipientId: canonicalRecipientId,
+            actorId: currentUser.id,
+            type: 'like',
+            postId,
+            createdAt: Date.now(),
+            read: false,
+          }
+        : null;
+
     setState((prev) => {
       const posts = prev.posts.map((p) =>
         p.id === postId ? { ...p, likes: nextLikes } : p
       );
 
-      const notifications =
-        !alreadyLiked && targetPost && targetPost.authorId !== prev.currentUserId
-          ? [
-              {
-                id: `notif_${Date.now()}`,
-                recipientId: targetPost.authorId,
-                actorId: prev.currentUserId,
-                type: 'like' as const,
-                postId,
-                createdAt: Date.now(),
-                read: false,
-              },
-              ...prev.notifications,
-            ]
-          : prev.notifications;
+      let notifications = prev.notifications;
+      if (likeNotif) {
+        const recentDuplicate = prev.notifications.some(
+          (n) =>
+            n.type === 'like' &&
+            n.postId === postId &&
+            n.actorId === prev.currentUserId &&
+            n.recipientId === likeNotif.recipientId &&
+            Date.now() - n.createdAt < 60_000
+        );
+        if (!recentDuplicate) {
+          notifications = [likeNotif, ...prev.notifications];
+        }
+      }
 
       return { ...prev, posts, notifications };
     });
+
+    if (likeNotif) {
+      syncNotificationToCloud(likeNotif, postAuthor);
+    }
 
     if (targetPost) {
       const updatedPost = { ...targetPost, likes: nextLikes };
@@ -3184,6 +3806,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     const trimmed = text.trim();
     if (!trimmed) return;
     const targetPost = state.posts.find((p) => p.id === postId);
+    const now = Date.now();
     const nextComments = targetPost
       ? parentCommentId
         ? targetPost.comments.map((c) =>
@@ -3193,10 +3816,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
                   replies: [
                     ...c.replies,
                     {
-                      id: `rep_${Date.now()}`,
+                      id: `rep_${now}`,
                       userId: currentUser.id,
                       text: trimmed,
-                      createdAt: Date.now(),
+                      createdAt: now,
                       likes: [],
                     },
                   ],
@@ -3206,15 +3829,85 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         : [
             ...targetPost.comments,
             {
-              id: `com_${Date.now()}`,
+              id: `com_${now}`,
               userId: currentUser.id,
               text: trimmed,
-              createdAt: Date.now(),
+              createdAt: now,
               likes: [],
               replies: [],
             },
           ]
       : [];
+
+    const newNotifications: Array<{ notif: NotificationItem; user?: UserProfile }> = [];
+    const postAuthor = targetPost ? getUserById(targetPost.authorId) : undefined;
+    const postAuthorId = postAuthor?.id || targetPost?.authorId || '';
+    const isSelfPost =
+      !postAuthorId ||
+      postAuthorId === currentUser.id ||
+      (Boolean(currentUser.uid) && postAuthorId === currentUser.uid);
+
+    if (targetPost && !isSelfPost) {
+      newNotifications.push({
+        notif: {
+          id: `notif_com_${now}_${Math.random().toString(36).slice(2, 6)}`,
+          recipientId: postAuthorId,
+          actorId: currentUser.id,
+          type: 'comment',
+          postId,
+          text: trimmed.slice(0, 200),
+          createdAt: now,
+          read: false,
+        },
+        user: postAuthor,
+      });
+    }
+
+    if (targetPost && parentCommentId) {
+      const parentComment = targetPost.comments.find((c) => c.id === parentCommentId);
+      if (parentComment) {
+        const parentAuthor = getUserById(parentComment.userId);
+        const parentAuthorId = parentAuthor?.id || parentComment.userId;
+        const isSelfParent =
+          parentAuthorId === currentUser.id ||
+          (Boolean(currentUser.uid) && parentAuthorId === currentUser.uid);
+        if (!isSelfParent && parentAuthorId !== postAuthorId) {
+          newNotifications.push({
+            notif: {
+              id: `notif_rep_${now}_${Math.random().toString(36).slice(2, 6)}`,
+              recipientId: parentAuthorId,
+              actorId: currentUser.id,
+              type: 'comment',
+              postId,
+              text: trimmed.slice(0, 200),
+              createdAt: now,
+              read: false,
+            },
+            user: parentAuthor,
+          });
+        }
+      }
+    }
+
+    const mentionedUsers = extractMentionedUsers(trimmed, state.users, [
+      currentUser.id,
+      currentUser.uid || '',
+    ]);
+    for (const mentioned of mentionedUsers) {
+      newNotifications.push({
+        notif: {
+          id: `notif_men_${now}_${mentioned.id}_${Math.random().toString(36).slice(2, 5)}`,
+          recipientId: mentioned.id,
+          actorId: currentUser.id,
+          type: 'mention',
+          postId,
+          text: trimmed.slice(0, 200),
+          createdAt: now,
+          read: false,
+        },
+        user: mentioned,
+      });
+    }
 
     setState((prev) => {
       const posts = prev.posts.map((p) =>
@@ -3222,24 +3915,16 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       );
 
       const notifications =
-        targetPost && targetPost.authorId !== prev.currentUserId
-          ? [
-              {
-                id: `notif_${Date.now()}`,
-                recipientId: targetPost.authorId,
-                actorId: prev.currentUserId,
-                type: 'comment' as const,
-                postId,
-                text: trimmed,
-                createdAt: Date.now(),
-                read: false,
-              },
-              ...prev.notifications,
-            ]
+        newNotifications.length > 0
+          ? [...newNotifications.map((entry) => entry.notif), ...prev.notifications]
           : prev.notifications;
 
       return { ...prev, posts, notifications };
     });
+
+    for (const entry of newNotifications) {
+      syncNotificationToCloud(entry.notif, entry.user);
+    }
 
     if (targetPost) {
       const updatedPost = { ...targetPost, comments: nextComments };
@@ -3322,12 +4007,13 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         ? payload.mediaAssets
         : payload.mediaUrls.map((url) => ({ url, mediaType: 'image' as const }));
 
+    const now = Date.now();
     const newPost: Post = {
-      id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      id: `post_${now}_${Math.random().toString(36).slice(2, 6)}`,
       authorId: currentUser.id,
       authorUid: currentUser.uid || auth.currentUser?.uid,
       media: assets.map((asset, idx) => ({
-        id: `m_${Date.now()}_${idx}`,
+        id: `m_${now}_${idx}`,
         url: asset.url,
         alt: payload.caption.slice(0, 80) || 'Publicação na Lumina',
         mediaType: asset.mediaType || 'image',
@@ -3343,12 +4029,37 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       likes: [],
       savedBy: [],
       comments: [],
-      createdAt: Date.now(),
+      createdAt: now,
     };
+
+    const captionMentions = extractMentionedUsers(newPost.caption, state.users, [
+      currentUser.id,
+      currentUser.uid || '',
+    ]).map((mentioned) => ({
+      user: mentioned,
+      notif: {
+        id: `notif_postmen_${now}_${mentioned.id}_${Math.random().toString(36).slice(2, 5)}`,
+        recipientId: mentioned.id,
+        actorId: currentUser.id,
+        type: 'mention' as const,
+        postId: newPost.id,
+        text: newPost.caption.slice(0, 200),
+        createdAt: now,
+        read: false,
+      },
+    }));
+
     setState((prev) => ({
       ...prev,
       posts: [newPost, ...prev.posts],
+      notifications:
+        captionMentions.length > 0
+          ? [...captionMentions.map((m) => m.notif), ...prev.notifications]
+          : prev.notifications,
     }));
+    for (const entry of captionMentions) {
+      syncNotificationToCloud(entry.notif, entry.user);
+    }
     if (auth.currentUser && auth.currentUser.emailVerified) {
       void createPostInCloud(newPost, currentUser, auth.currentUser).catch(() => {});
     }
@@ -3436,21 +4147,37 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       audioDurationSec?: number;
       videoUrl?: string;
       videoName?: string;
+      fileUrl?: string;
+      fileName?: string;
+      fileMime?: string;
+      fileSize?: number;
+      replyToId?: string;
+      replyToSenderId?: string;
+      replyToText?: string;
     }
   ) => {
     if (!requireAuthForAction()) return;
     const trimmed = text.trim();
-    if (!trimmed && !options?.sharedPostId && !options?.audioUrl && !options?.videoUrl) {
+    if (
+      !trimmed &&
+      !options?.sharedPostId &&
+      !options?.audioUrl &&
+      !options?.videoUrl &&
+      !options?.fileUrl
+    ) {
       return;
     }
 
     const resolvedRecipient = getUserById(recipientId);
     const canonicalRecipientId = resolvedRecipient?.id || recipientId;
-    const msgId = `dm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const now = Date.now();
+    const msgId = `dm_${now}_${Math.random().toString(36).slice(2, 6)}`;
     const fallbackLabel = options?.audioUrl
       ? 'Mensagem de voz'
       : options?.videoUrl
       ? 'Vídeo'
+      : options?.fileUrl
+      ? `Arquivo: ${options.fileName || 'anexo'}`
       : options?.sharedPostId
       ? 'Compartilhou uma publicação'
       : '';
@@ -3465,7 +4192,15 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       audioDurationSec: options?.audioDurationSec,
       videoUrl: options?.videoUrl,
       videoName: options?.videoName,
-      createdAt: Date.now(),
+      fileUrl: options?.fileUrl,
+      fileName: options?.fileName,
+      fileMime: options?.fileMime,
+      fileSize: options?.fileSize,
+      replyToId: options?.replyToId,
+      replyToSenderId: options?.replyToSenderId,
+      replyToText: options?.replyToText,
+      readBy: [currentUser.id],
+      createdAt: now,
     };
 
     const existingThread = state.threads.find(
@@ -3479,28 +4214,33 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       ? {
           ...existingThread,
           messages: [...existingThread.messages, newMsg],
-          unreadBy: [canonicalRecipientId],
-          updatedAt: Date.now(),
+          unreadBy:
+            canonicalRecipientId !== currentUser.id ? [canonicalRecipientId] : [],
+          lastReadBy: {
+            ...(existingThread.lastReadBy || {}),
+            [currentUser.id]: now,
+          },
+          updatedAt: now,
         }
       : {
           id: canonicalThreadIdForPair(currentUser.id, canonicalRecipientId),
           participantIds: [currentUser.id, canonicalRecipientId],
           messages: [newMsg],
-          unreadBy: [canonicalRecipientId],
-          updatedAt: Date.now(),
+          unreadBy:
+            canonicalRecipientId !== currentUser.id ? [canonicalRecipientId] : [],
+          lastReadBy: {
+            [currentUser.id]: now,
+          },
+          updatedAt: now,
         };
 
-    setState((prev) => {
-      const newNotif: NotificationItem = {
-        id: `notif_${Date.now()}`,
-        recipientId: canonicalRecipientId,
-        actorId: prev.currentUserId,
-        type: 'mention',
-        text: trimmed || fallbackLabel,
-        createdAt: Date.now(),
-        read: false,
-      };
+    threadReadWatermarkRef.current = {
+      ...threadReadWatermarkRef.current,
+      [updatedThread.id]: now,
+    };
+    saveThreadReadWatermarks(threadReadWatermarkRef.current);
 
+    setState((prev) => {
       const threadsList = existingThread
         ? prev.threads
             .map((t) => (t.id === existingThread.id ? updatedThread : t))
@@ -3510,10 +4250,6 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       return {
         ...prev,
         threads: threadsList,
-        notifications:
-          canonicalRecipientId !== prev.currentUserId
-            ? [newNotif, ...prev.notifications]
-            : prev.notifications,
       };
     });
 
@@ -3527,48 +4263,258 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   };
 
   const markThreadRead = (threadId: string) => {
-    setState((prev) => ({
-      ...prev,
-      threads: prev.threads.map((t) =>
-        t.id === threadId
-          ? { ...t, unreadBy: t.unreadBy.filter((id) => id !== prev.currentUserId) }
-          : t
-      ),
-    }));
+    const targetThread = state.threads.find((t) => t.id === threadId);
+    const myIds = Array.from(new Set([currentUser.id, currentUser.uid || ''].filter(Boolean)));
+    const myIdSet = new Set(myIds);
+    const now = Date.now();
+
+    threadReadWatermarkRef.current = {
+      ...threadReadWatermarkRef.current,
+      [threadId]: now,
+    };
+    saveThreadReadWatermarks(threadReadWatermarkRef.current);
+
+    const hasUnread =
+      targetThread &&
+      (targetThread.unreadBy.some((id) => myIdSet.has(id)) ||
+        targetThread.messages.some(
+          (m) =>
+            !myIdSet.has(m.senderId) &&
+            !(m.readBy || []).some((rId) => myIdSet.has(rId))
+        ));
+
+    const partnerIds = targetThread
+      ? targetThread.participantIds.filter((id) => !myIdSet.has(id))
+      : [];
+
+    const hasUnreadDmNotifs = state.notifications.some(
+      (n) =>
+        !n.read &&
+        n.type === 'mention' &&
+        !n.postId &&
+        myIdSet.has(n.recipientId) &&
+        partnerIds.includes(n.actorId)
+    );
+
+    if (!hasUnread && !hasUnreadDmNotifs) return;
+
+    let nextUpdatedThread: DirectThread | null = null;
+    setState((prev) => {
+      const prevThreads = prev.threads.map((t) => {
+        if (t.id !== threadId) return t;
+        const nextLastRead = { ...(t.lastReadBy || {}) };
+        for (const idVal of myIds) {
+          nextLastRead[idVal] = Math.max(nextLastRead[idVal] || 0, now);
+        }
+        const nextMessages = t.messages.map((m) => {
+          if (myIdSet.has(m.senderId)) return m;
+          const existingRead = m.readBy || [];
+          const hasAll = myIds.every((idVal) => existingRead.includes(idVal));
+          if (hasAll && m.seenAt) return m;
+          return {
+            ...m,
+            readBy: Array.from(new Set([...existingRead, ...myIds])),
+            seenAt: m.seenAt || now,
+          };
+        });
+        const nextThread: DirectThread = {
+          ...t,
+          unreadBy: t.unreadBy.filter((id) => !myIdSet.has(id)),
+          lastReadBy: nextLastRead,
+          messages: nextMessages,
+        };
+        nextUpdatedThread = nextThread;
+        return nextThread;
+      });
+
+      const nextNotifications = prev.notifications.map((n) =>
+        !n.read &&
+        n.type === 'mention' &&
+        !n.postId &&
+        myIdSet.has(n.recipientId) &&
+        partnerIds.includes(n.actorId)
+          ? { ...n, read: true }
+          : n
+      );
+
+      return {
+        ...prev,
+        threads: prevThreads,
+        notifications: nextNotifications,
+      };
+    });
+
+    if (!currentUser.isDemoSeed) {
+      void (async () => {
+        let serverSynced = false;
+        try {
+          const res = await fetch(`/api/social/threads/${encodeURIComponent(threadId)}/read`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ readerIds: myIds, readAt: now }),
+          });
+          if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+            const data = (await res.json()) as { supabaseSynced?: boolean };
+            serverSynced = Boolean(data.supabaseSynced);
+          }
+        } catch {
+          // Ignore on static hosting
+        }
+        if (!serverSynced) {
+          const sbConfig = getBrowserSupabaseConfig();
+          if (sbConfig.anonKey) {
+            await markThreadMessagesReadInSupabaseBrowser(sbConfig, threadId, myIds).catch(
+              () => false
+            );
+          }
+        }
+      })();
+    }
+
+    if (auth.currentUser && auth.currentUser.emailVerified && nextUpdatedThread) {
+      const participantUsers = (nextUpdatedThread as DirectThread).participantIds
+        .map((pid) => getUserById(pid))
+        .filter((u): u is UserProfile => Boolean(u));
+      const participantUids = [
+        auth.currentUser.uid,
+        ...participantUsers.map((u) => u.uid || '').filter(Boolean),
+      ];
+      void upsertThreadInCloud(nextUpdatedThread, participantUids, auth.currentUser).catch(() => {});
+    }
   };
 
   const reactToMessage = (threadId: string, messageId: string, emoji: string) => {
     const targetThread = state.threads.find((t) => t.id === threadId);
     const targetMsg = targetThread?.messages.find((m) => m.id === messageId);
-    const nextReaction = targetMsg?.reaction === emoji ? undefined : emoji;
+    if (!targetThread || !targetMsg) return;
+
+    const prevMap = { ...(targetMsg.reactions || {}) };
+    if (prevMap[currentUser.id] === emoji || (!Object.keys(prevMap).length && targetMsg.reaction === emoji)) {
+      delete prevMap[currentUser.id];
+    } else {
+      prevMap[currentUser.id] = emoji;
+    }
+    const vals = Object.values(prevMap);
+    const nextReaction = vals.length > 0 ? vals[vals.length - 1] : undefined;
+
+    const updatedThread: DirectThread = {
+      ...targetThread,
+      messages: targetThread.messages.map((m) =>
+        m.id === messageId
+          ? {
+              ...m,
+              reaction: nextReaction,
+              reactions: Object.keys(prevMap).length > 0 ? prevMap : undefined,
+            }
+          : m
+      ),
+      updatedAt: Date.now(),
+    };
 
     setState((prev) => ({
       ...prev,
-      threads: prev.threads.map((t) =>
-        t.id === threadId
-          ? {
-              ...t,
-              messages: t.messages.map((m) =>
-                m.id === messageId ? { ...m, reaction: nextReaction } : m
-              ),
-            }
-          : t
-      ),
+      threads: prev.threads.map((t) => (t.id === threadId ? updatedThread : t)),
     }));
 
-    const sbConfig = getBrowserSupabaseConfig();
-    if (sbConfig.anonKey) {
-      void reactToDirectMessageInSupabaseBrowser(sbConfig, messageId, nextReaction);
+    void (async () => {
+      let serverSynced = false;
+      try {
+        const res = await fetch(
+          `/api/social/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(messageId)}/react`,
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: currentUser.id, emoji }),
+          }
+        );
+        if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+          const data = (await res.json()) as { supabaseSynced?: boolean };
+          serverSynced = Boolean(data.supabaseSynced);
+        }
+      } catch {
+        // Static hosting fallback
+      }
+      if (!serverSynced) {
+        const sbConfig = getBrowserSupabaseConfig();
+        if (sbConfig.anonKey) {
+          await reactToDirectMessageInSupabaseBrowser(
+            sbConfig,
+            messageId,
+            nextReaction,
+            prevMap
+          ).catch(() => false);
+        }
+      }
+    })();
+
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      const participantUids = updatedThread.participantIds
+        .map((pid) => getUserById(pid)?.uid || '')
+        .filter(Boolean);
+      void upsertThreadInCloud(
+        updatedThread,
+        [auth.currentUser.uid, ...participantUids],
+        auth.currentUser
+      ).catch(() => {});
+    }
+  };
+
+  const setTypingStatus = (recipientId: string, isTyping: boolean, threadId?: string) => {
+    if (!state.isAuthenticated || !recipientId || currentUser.isDemoSeed) return;
+    const resolved = getUserById(recipientId);
+    const canonicalRecipientId = resolved?.id || recipientId;
+    const now = Date.now();
+    const emitKey = `${canonicalRecipientId}:${isTyping ? '1' : '0'}`;
+    if (isTyping && now - (lastTypingEmitRef.current[emitKey] || 0) < 1600) {
+      return;
+    }
+    lastTypingEmitRef.current[emitKey] = now;
+
+    channelRef.current?.postMessage({
+      senderTabId: tabIdRef.current,
+      type: 'typing_sync',
+      fromUserId: currentUser.id,
+      fromUid: currentUser.uid,
+      toUserId: canonicalRecipientId,
+      isTyping,
+    });
+
+    if (serverSyncAvailable) {
+      void fetch('/api/social/typing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromUserId: currentUser.id,
+          toUserId: canonicalRecipientId,
+          threadId,
+          isTyping,
+        }),
+      }).catch(() => {});
     }
   };
 
   const markNotificationsRead = () => {
+    const myIdSet = new Set([currentUser.id, currentUser.uid || ''].filter(Boolean));
+    const unreadIds = state.notifications
+      .filter((n) => myIdSet.has(n.recipientId) && !n.read)
+      .map((n) => n.id);
+    if (unreadIds.length === 0) return;
+
+    for (const id of unreadIds) {
+      readNotifIdsRef.current.add(id);
+    }
+    saveReadNotifIds(readNotifIdsRef.current);
+
     setState((prev) => ({
       ...prev,
       notifications: prev.notifications.map((n) =>
-        n.recipientId === prev.currentUserId ? { ...n, read: true } : n
+        myIdSet.has(n.recipientId) ? { ...n, read: true } : n
       ),
     }));
+
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      void markNotificationsReadInCloud(unreadIds, auth.currentUser).catch(() => {});
+    }
   };
 
   const addRecentSearch = (term: string) => {
@@ -3589,10 +4535,14 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
   const resetDemoData = () => {
     localStorage.removeItem(STORAGE_KEY);
+    const preservedRealUsers = readCachedProfilesSync();
     setState({
       currentUserId: 'user_daniel',
       isAuthenticated: true,
-      users: SEED_USERS,
+      users:
+        preservedRealUsers.length > 0
+          ? mergeUsersSmart(SEED_USERS, preservedRealUsers)
+          : SEED_USERS,
       posts: SEED_POSTS,
       stories: SEED_STORIES,
       threads: SEED_THREADS,
@@ -3903,6 +4853,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         sendMessage,
         markThreadRead,
         reactToMessage,
+        typingByUserId,
+        setTypingStatus,
         markNotificationsRead,
         addRecentSearch,
         clearRecentSearches,
