@@ -390,16 +390,19 @@ export function AdminPanelView() {
     serverAvailable: boolean;
     claimed: boolean;
     envConfigured: boolean;
+    diag?: string;
   }> => {
     try {
       const res = await fetch('/api/admin/auth/status', { cache: 'no-store' });
-      const contentType = res.headers.get('content-type') || '';
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
       if (!res.ok || !contentType.includes('application/json')) {
-        throw new Error('Backend indisponível');
+        throw new Error(
+          `HTTP ${res.status} (${contentType.split(';')[0] || 'sem content-type'})`
+        );
       }
       const data = (await res.json()) as { claimed?: boolean; envConfigured?: boolean };
       if (typeof data.claimed !== 'boolean') {
-        throw new Error('Resposta inválida');
+        throw new Error('JSON sem campo claimed');
       }
       const next = {
         loading: false,
@@ -409,7 +412,11 @@ export function AdminPanelView() {
       };
       setAuthStatus(next);
       return next;
-    } catch {
+    } catch (err) {
+      const diag =
+        err instanceof Error && err.message
+          ? err.message
+          : 'sem resposta do servidor';
       const next = {
         loading: false,
         claimed: hasStaticAdminPasscode(),
@@ -417,7 +424,7 @@ export function AdminPanelView() {
         serverAvailable: false,
       };
       setAuthStatus(next);
-      return next;
+      return { ...next, diag };
     }
   };
 
@@ -426,7 +433,12 @@ export function AdminPanelView() {
     const detectServerAuth = async () => {
       const status = await probeServerAuth();
       if (cancelled) return;
-      setAuthStatus({ loading: false, ...status });
+      setAuthStatus({
+        loading: false,
+        claimed: status.claimed,
+        envConfigured: status.envConfigured,
+        serverAvailable: status.serverAvailable,
+      });
     };
     void detectServerAuth();
     return () => {
@@ -1162,9 +1174,10 @@ export function AdminPanelView() {
     provider: 'aws' | 'supabase' | 'wordpress',
     url?: string
   ) => {
-    const serverLive = authStatus.serverAvailable
-      ? true
-      : (await probeServerAuth()).serverAvailable;
+    const probeResult = authStatus.serverAvailable
+      ? { serverAvailable: true, diag: undefined }
+      : await probeServerAuth();
+    const serverLive = probeResult.serverAvailable;
 
     if (!serverLive) {
       if (provider === 'supabase') {
@@ -1242,22 +1255,88 @@ export function AdminPanelView() {
       }
 
       if (provider === 'aws') {
-        const rawRegion = (overview?.state.aws.region || 'sa-east-1').trim();
+        const rawRegion = (overview?.state.aws.region || 'sa-east-1').trim().toLowerCase();
         const rawBucket = (overview?.state.aws.bucket || 'lumina-media-prod').trim().toLowerCase();
+        const rawCf = (overview?.state.aws.cloudFrontDomain || '')
+          .trim()
+          .toLowerCase()
+          .replace(/^https?:\/\//, '')
+          .replace(/\/+$/, '');
+        const validRegion = /^[a-z]{2}(-[a-z0-9]+)+-\d+$/.test(rawRegion);
         const validBucket =
           rawBucket.length >= 3 &&
           rawBucket.length <= 63 &&
           /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(rawBucket) &&
           !rawBucket.includes('..');
-        const msg = !validBucket
-          ? `Nome de bucket S3 inválido ("${rawBucket}"). Use 3 a 63 caracteres minúsculos, números, pontos ou hífens.`
-          : `Configuração S3 validada localmente (${rawRegion} · s3://${rawBucket}), mas o servidor Node.js (/api) não está respondendo neste endereço. Execute o app com servidor ativo (npm start) e defina AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY nos Segredos para testar a conexão real.`;
-        setAwsTestStatus(msg);
-        showToast(
-          validBucket
-            ? 'Servidor Node (/api) indisponível neste endereço — requer npm start para testar AWS S3'
-            : 'Nome de bucket S3 inválido'
-        );
+
+        if (!validRegion || !validBucket) {
+          const invalidMsg = !validRegion
+            ? `Região AWS inválida ("${rawRegion}"). Use ex.: sa-east-1 ou us-east-1.`
+            : `Nome de bucket S3 inválido ("${rawBucket}"). Use 3 a 63 caracteres minúsculos, números, pontos ou hífens.`;
+          setAwsTestStatus(invalidMsg);
+          showToast(!validRegion ? 'Região AWS inválida' : 'Nome de bucket S3 inválido');
+          return;
+        }
+
+        setTestingKey('aws');
+        try {
+          const origin = typeof window !== 'undefined' ? window.location.origin : 'este domínio';
+          const s3Url = `https://${rawBucket}.s3.${rawRegion}.amazonaws.com/`;
+          const apiHint = probeResult.diag ? ` (/api retornou ${probeResult.diag})` : '';
+          let cfNote = '';
+          if (overview?.state.aws.cloudFrontEnabled && rawCf && rawCf !== 'cdn.lumina.social') {
+            try {
+              await fetch(`https://${rawCf}/`, { method: 'HEAD', mode: 'no-cors', cache: 'no-store' });
+              cfNote = ` · CloudFront (${rawCf}) alcançável`;
+            } catch {
+              cfNote = ` · CloudFront (${rawCf}) não respondeu`;
+            }
+          }
+
+          try {
+            const corsRes = await fetch(s3Url, { method: 'HEAD', mode: 'cors', cache: 'no-store' });
+            if (corsRes.status === 200 || corsRes.status === 403) {
+              setAwsTestStatus(
+                `Bucket s3://${rawBucket} (${rawRegion}) encontrado na AWS e com CORS ativo para ${origin} (HTTP ${corsRes.status})${cfNote}. Atenção: este endereço (${origin}) é estático${apiHint}; para autenticar chaves AWS_ACCESS_KEY_ID e gerar uploads assinados, rode com servidor Node.js (npm start).`
+              );
+              showToast(`Bucket s3://${rawBucket} encontrado com CORS OK!`);
+              return;
+            }
+            if (corsRes.status === 404) {
+              setAwsTestStatus(
+                `Bucket s3://${rawBucket} não encontrado na AWS (HTTP 404). Verifique o nome exato do bucket no Console S3.`
+              );
+              showToast('Bucket S3 não encontrado (404)');
+              return;
+            }
+            if (corsRes.status === 301 || corsRes.status === 400) {
+              setAwsTestStatus(
+                `Bucket s3://${rawBucket} respondeu HTTP ${corsRes.status} — a Região AWS (${rawRegion}) pode estar diferente da região real do bucket.`
+              );
+              showToast(`Verifique a região do bucket (HTTP ${corsRes.status})`);
+              return;
+            }
+            setAwsTestStatus(
+              `Bucket s3://${rawBucket} (${rawRegion}) respondeu HTTP ${corsRes.status}${cfNote}.`
+            );
+            showToast(`S3 respondeu HTTP ${corsRes.status}`);
+          } catch {
+            try {
+              await fetch(s3Url, { method: 'HEAD', mode: 'no-cors', cache: 'no-store' });
+              setAwsTestStatus(
+                `Endpoint ${s3Url} alcançável via HTTPS${cfNote}, mas sem resposta CORS para ${origin} (baixe "CORS S3 (.json)" abaixo e aplique no bucket). Este domínio (${origin}) está em modo estático${apiHint} — credenciais secretas AWS exigem servidor Node.js (npm start).`
+              );
+              showToast('S3 alcançável — aplique o CORS S3 (.json) e use servidor Node para chaves');
+            } catch {
+              setAwsTestStatus(
+                `Não foi possível alcançar ${s3Url} pelo navegador. Verifique o nome do bucket, região (${rawRegion}) e sua conexão.`
+              );
+              showToast('Falha ao alcançar o endpoint Amazon S3');
+            }
+          }
+        } finally {
+          setTestingKey(null);
+        }
         return;
       }
 
@@ -2264,6 +2343,34 @@ notify pgrst, 'reload schema';
       `aws-iam-policy-${bucket}.json`
     );
     showToast('Política IAM da AWS baixada');
+  };
+
+  const handleDownloadAwsCors = () => {
+    const bucket = overview?.state.aws.bucket || 'lumina-media-prod';
+    const currentOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+    const origins = Array.from(
+      new Set(
+        [
+          currentOrigin,
+          'https://lumina-rede-social.appwrite.network',
+          'http://localhost:3000',
+        ].filter(Boolean)
+      )
+    );
+    const corsRules = [
+      {
+        AllowedHeaders: ['*'],
+        AllowedMethods: ['GET', 'HEAD', 'PUT', 'POST'],
+        AllowedOrigins: origins,
+        ExposeHeaders: ['ETag'],
+        MaxAgeSeconds: 3600,
+      },
+    ];
+    triggerBlobDownload(
+      new Blob([JSON.stringify(corsRules, null, 2)], { type: 'application/json' }),
+      `aws-s3-cors-${bucket}.json`
+    );
+    showToast('Regra CORS do S3 baixada — cole em Permissões > CORS no bucket');
   };
 
   const handleExportWordPressWxr = () => {
@@ -3417,6 +3524,14 @@ ${itemsXml}
               >
                 <Download className="h-3.5 w-3.5" />
                 <span>Política IAM (.json)</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadAwsCors}
+                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>CORS S3 (.json)</span>
               </button>
             </div>
           </section>
