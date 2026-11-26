@@ -1270,6 +1270,173 @@ export function AdminPanelView() {
     }
   };
 
+  const testWordPressDirectFromBrowser = async (rawUrl: string) => {
+    const trimmed = rawUrl.trim();
+    if (!trimmed) {
+      const msg = 'Informe a URL pública do seu WordPress antes de testar.';
+      setWpTestStatus(msg);
+      showToast(msg);
+      return;
+    }
+
+    let parsed: URL;
+    try {
+      const candidate = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+      parsed = new URL(candidate);
+    } catch {
+      const msg = 'URL do WordPress inválida. Use o formato https://seudominio.com.br';
+      setWpTestStatus(msg);
+      showToast(msg);
+      return;
+    }
+
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host.endsWith('.local') ||
+      host.endsWith('.internal')
+    ) {
+      const msg =
+        'Use um domínio ou IP público com HTTPS/HTTP — hosts locais (localhost/.local) não são acessíveis externamente.';
+      setWpTestStatus(msg);
+      showToast(msg);
+      return;
+    }
+
+    setTestingKey('wordpress');
+    try {
+      const endpoint = `${parsed.origin}/wp-json/wp/v2/posts?per_page=5`;
+      let posts: WordPressPostPreview[] = [];
+      let wpJsonStatus = 0;
+
+      try {
+        const res = await fetch(endpoint, {
+          method: 'GET',
+          mode: 'cors',
+          headers: { Accept: 'application/json' },
+          cache: 'no-store',
+          signal: AbortSignal.timeout(6000),
+        });
+        wpJsonStatus = res.status;
+
+        if (res.ok) {
+          const data = (await res.json().catch(() => null)) as Array<{
+            id?: number;
+            title?: { rendered?: string };
+            link?: string;
+            date?: string;
+          }> | null;
+          if (Array.isArray(data)) {
+            posts = data.slice(0, 5).map((item) => ({
+              id: Number(item.id || 0),
+              title: String(item.title?.rendered || 'Post sem título').replace(/<[^>]+>/g, ''),
+              link: String(item.link || parsed.origin),
+              date: String(item.date || ''),
+            }));
+          }
+
+          setWpSyncedPosts(posts);
+          setOverview((prev) => {
+            if (!prev) return prev;
+            const nextState: ServerOverview['state'] = {
+              ...prev.state,
+              wordpress: {
+                ...prev.state.wordpress,
+                siteUrl: parsed.origin,
+                lastSyncedAt: Date.now(),
+              },
+            };
+            saveLocalAdminState(nextState);
+            return { ...prev, state: nextState };
+          });
+
+          const okMsg = `WordPress REST API conectada diretamente (${posts.length} posts obtidos de ${parsed.origin})`;
+          setWpTestStatus(okMsg);
+          showToast(`WordPress conectado (${posts.length} posts)!`);
+          return;
+        }
+
+        const httpHint =
+          res.status === 404
+            ? `WordPress respondeu HTTP 404 em /wp-json/wp/v2/posts — verifique Configurações > Links Permanentes e selecione "Nome do post".`
+            : res.status === 401 || res.status === 403
+            ? `WordPress bloqueou /wp-json/wp/v2/posts (HTTP ${res.status}). Desative bloqueios de REST API no plugin de segurança.`
+            : `Endpoint ${parsed.origin}/wp-json/wp/v2/posts respondeu HTTP ${res.status}.`;
+        setWpTestStatus(httpHint);
+        showToast(`WordPress respondeu HTTP ${res.status}`);
+        return;
+      } catch {
+        // Fallback: check if public-api.wordpress.com works for *.wordpress.com sites, or no-cors reachability probe
+        if (host.endsWith('.wordpress.com')) {
+          try {
+            const wpComRes = await fetch(
+              `https://public-api.wordpress.com/wp/v2/sites/${encodeURIComponent(host)}/posts?per_page=5`,
+              { method: 'GET', mode: 'cors', cache: 'no-store', signal: AbortSignal.timeout(6000) }
+            );
+            if (wpComRes.ok) {
+              const data = (await wpComRes.json().catch(() => null)) as Array<{
+                id?: number;
+                title?: { rendered?: string };
+                link?: string;
+                date?: string;
+              }> | null;
+              if (Array.isArray(data)) {
+                posts = data.slice(0, 5).map((item) => ({
+                  id: Number(item.id || 0),
+                  title: String(item.title?.rendered || 'Post sem título').replace(/<[^>]+>/g, ''),
+                  link: String(item.link || parsed.origin),
+                  date: String(item.date || ''),
+                }));
+              }
+              setWpSyncedPosts(posts);
+              setOverview((prev) => {
+                if (!prev) return prev;
+                const nextState: ServerOverview['state'] = {
+                  ...prev.state,
+                  wordpress: {
+                    ...prev.state.wordpress,
+                    siteUrl: parsed.origin,
+                    lastSyncedAt: Date.now(),
+                  },
+                };
+                saveLocalAdminState(nextState);
+                return { ...prev, state: nextState };
+              });
+              const wpComMsg = `WordPress.com conectado (${posts.length} posts obtidos de ${host}).`;
+              setWpTestStatus(wpComMsg);
+              showToast(`WordPress conectado (${posts.length} posts)!`);
+              return;
+            }
+          } catch {
+            // Fall through to reachability probe
+          }
+        }
+
+        try {
+          await fetch(`${parsed.origin}/wp-json/`, {
+            method: 'GET',
+            mode: 'no-cors',
+            cache: 'no-store',
+            signal: AbortSignal.timeout(5000),
+          });
+          const corsMsg =
+            `O domínio ${parsed.origin} está online, mas o navegador não conseguiu ler o JSON por CORS` +
+            (wpJsonStatus ? ` (HTTP ${wpJsonStatus})` : '') +
+            `. Baixe e ative o "Plugin Bridge (.zip)" atualizado no WordPress para liberar CORS ou acesse pelo ambiente com servidor Node.js.`;
+          setWpTestStatus(corsMsg);
+          showToast('WordPress online, mas precisa de CORS (ative o Plugin Bridge .zip)');
+        } catch {
+          const netMsg = `Não foi possível alcançar ${parsed.origin}. Confira se o domínio está online, com HTTPS válido e sem bloqueio de firewall.`;
+          setWpTestStatus(netMsg);
+          showToast('Falha ao conectar no endereço do WordPress');
+        }
+      }
+    } finally {
+      setTestingKey(null);
+    }
+  };
+
   const testIntegration = async (
     provider: 'aws' | 'supabase' | 'wordpress' | 'gcp',
     url?: string
@@ -1549,12 +1716,22 @@ export function AdminPanelView() {
         return;
       }
 
+      if (provider === 'wordpress') {
+        await testWordPressDirectFromBrowser(url || overview?.state.wordpress.siteUrl || '');
+        return;
+      }
+
       const msg =
-        'Teste de rede via proxy exige o servidor Node.js ativo (npm start). Em hospedagem estática, exporte o Kit WP normalmente.';
+        'Teste de rede via proxy exige o servidor Node.js ativo (npm start).';
       setWpTestStatus(msg);
       showToast('Servidor Node (/api) indisponível neste endereço');
       return;
     }
+
+    const normalizedUrl =
+      provider === 'wordpress' && url && !/^https?:\/\//i.test(url.trim())
+        ? `https://${url.trim()}`
+        : url;
 
     setTestingKey(provider);
     try {
@@ -1570,6 +1747,11 @@ export function AdminPanelView() {
 
       const serverToken = await ensureServerAdminToken();
       if (!serverToken) {
+        if (provider === 'wordpress') {
+          await testWordPressDirectFromBrowser(
+            normalizedUrl || overview?.state.wordpress.siteUrl || ''
+          );
+        }
         return;
       }
 
@@ -1581,7 +1763,7 @@ export function AdminPanelView() {
           method: 'POST',
           body: JSON.stringify({
             provider,
-            url,
+            url: normalizedUrl,
             anonKey: candidateAnon,
             aws: provider === 'aws' ? overview?.state.aws : undefined,
             gcp: provider === 'gcp' ? overview?.state.gcp : undefined,
@@ -1594,12 +1776,17 @@ export function AdminPanelView() {
       const contentType = res.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
         setAuthStatus((prev) => ({ ...prev, serverAvailable: false }));
+        if (provider === 'wordpress') {
+          await testWordPressDirectFromBrowser(
+            normalizedUrl || overview?.state.wordpress.siteUrl || ''
+          );
+          return;
+        }
         const fallbackMsg =
           'O endpoint /api não respondeu JSON neste endereço. Confirme que o servidor Node.js (npm start) está ativo.';
         if (provider === 'aws') setAwsTestStatus(fallbackMsg);
         if (provider === 'gcp') setGcpTestStatus(fsPing ? `${fsPing.note} · ${fallbackMsg}` : fallbackMsg);
         if (provider === 'supabase') setSupabaseTestStatus(fallbackMsg);
-        if (provider === 'wordpress') setWpTestStatus(fallbackMsg);
         showToast('Servidor /api indisponível neste endereço');
         return;
       }

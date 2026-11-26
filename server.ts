@@ -5411,6 +5411,15 @@ add_action('rest_api_init', function () {
             return ['status' => 'ok', 'self_hosted' => true, 'version' => '${state.site.version}'];
         },
     ]);
+
+    add_filter('rest_pre_serve_request', function ($value) {
+        if (in_array($_SERVER['REQUEST_METHOD'] ?? 'GET', ['GET', 'HEAD', 'OPTIONS'], true)) {
+            header('Access-Control-Allow-Origin: *');
+            header('Access-Control-Allow-Methods: GET, HEAD, OPTIONS');
+            header('Access-Control-Allow-Headers: Content-Type, Accept');
+        }
+        return $value;
+    });
 });
 `;
 
