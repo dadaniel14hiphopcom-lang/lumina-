@@ -33,10 +33,17 @@ function FeedStage({ onAddStory }: { onAddStory: () => void }) {
               p.authorId === currentUser.id ||
               currentUser.following.includes(p.authorId)
           );
-    const boostedIds = new Set(users.filter((u) => u.boosted).map((u) => u.id));
+    const boostedIds = new Set<string>();
+    for (const u of users) {
+      if (!u.boosted) continue;
+      boostedIds.add(u.id);
+      if (u.uid) boostedIds.add(u.uid);
+    }
     return [...filtered].sort((a, b) => {
-      const aBoost = boostedIds.has(a.authorId) ? 1 : 0;
-      const bBoost = boostedIds.has(b.authorId) ? 1 : 0;
+      const aBoost =
+        boostedIds.has(a.authorId) || (a.authorUid && boostedIds.has(a.authorUid)) ? 1 : 0;
+      const bBoost =
+        boostedIds.has(b.authorId) || (b.authorUid && boostedIds.has(b.authorUid)) ? 1 : 0;
       if (aBoost !== bBoost) return bBoost - aBoost;
       return b.createdAt - a.createdAt;
     });

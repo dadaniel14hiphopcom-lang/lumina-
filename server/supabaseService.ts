@@ -710,6 +710,7 @@ export async function updateUserInSupabase(
     displayName: string;
     username: string;
     matchUsername: string;
+    matchUid: string;
     bio: string;
     website: string;
     avatarUrl: string;
@@ -757,10 +758,22 @@ export async function updateUserInSupabase(
       typeof patch.matchUsername === 'string'
         ? patch.matchUsername.trim().toLowerCase().replace(/^@/, '')
         : '';
-    if (cleanMatchHandle) {
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const candidateAuthUid =
+      typeof patch.matchUid === 'string' && uuidRegex.test(patch.matchUid.trim())
+        ? patch.matchUid.trim()
+        : uuidRegex.test(userId.trim())
+        ? userId.trim()
+        : '';
+    const orParts = [
+      `id.eq.${encodeURIComponent(userId)}`,
+      ...(candidateAuthUid ? [`auth_uid.eq.${encodeURIComponent(candidateAuthUid)}`] : []),
+      ...(cleanMatchHandle ? [`username.ilike.${encodeURIComponent(cleanMatchHandle)}`] : []),
+    ];
+    if (orParts.length > 1) {
       const lookupRes = await fetch(
         new URL(
-          `/rest/v1/lumina_users?select=id&or=(id.eq.${encodeURIComponent(userId)},username.ilike.${encodeURIComponent(cleanMatchHandle)})&limit=1`,
+          `/rest/v1/lumina_users?select=id&or=(${orParts.join(',')})&limit=1`,
           origin
         ).toString(),
         {

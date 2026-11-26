@@ -405,7 +405,7 @@ export function AdminPanelView() {
   // Users tab state
   const [userSearch, setUserSearch] = useState('');
   const [userFilter, setUserFilter] = useState<
-    'all' | 'verified' | 'boosted' | 'restricted'
+    'all' | 'real' | 'demo' | 'verified' | 'boosted' | 'restricted'
   >('all');
 
   // Invites tab state
@@ -858,6 +858,7 @@ export function AdminPanelView() {
       }
       setManualLock(false);
       setAdminToken(data.token);
+      setAdminMemoryToken(data.token);
       activateAdminProfileSession(data.token);
       setPasscodeInput('');
       setConfirmInput('');
@@ -926,6 +927,8 @@ export function AdminPanelView() {
     const q = userSearch.trim().toLowerCase();
     return allUsers
       .filter((u) => {
+        if (userFilter === 'real' && u.isDemoSeed) return false;
+        if (userFilter === 'demo' && !u.isDemoSeed) return false;
         if (userFilter === 'verified' && !u.verified) return false;
         if (userFilter === 'boosted' && !u.boosted) return false;
         if (userFilter === 'restricted' && !u.restricted) return false;
@@ -3109,6 +3112,29 @@ ${itemsXml}
             </button>
           </div>
 
+          {/* Cloud Sync Hint if admin unlocked without Google Firebase Auth */}
+          {!isExclusiveAdminUser(firebaseUser) && (
+            <div className="flex flex-col gap-3 rounded-2xl border border-amber-500/30 bg-amber-50 p-4 dark:bg-amber-950/25 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0 space-y-0.5">
+                <p className="text-xs font-semibold text-amber-900 dark:text-amber-200">
+                  Conecte sua conta Google Admin ({ADMIN_EMAIL}) para sincronizar perfis reais, selo verificado e impulsionamento no Firestore entre dispositivos.
+                </p>
+                <p className="text-[11px] text-amber-800/80 dark:text-amber-300/80">
+                  Sem o login Google Admin, as alterações ficam salvas neste servidor/navegador, mas perfis exclusivos do Firestore não são gravados na nuvem.
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={firebaseAdminLoading}
+                onClick={() => void handleExclusiveGoogleAdminLogin()}
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-amber-600 px-3.5 text-xs font-semibold text-white hover:bg-amber-700 disabled:opacity-50"
+              >
+                <Cloud className="h-3.5 w-3.5" />
+                <span>{firebaseAdminLoading ? 'Conectando...' : 'Conectar Google Admin'}</span>
+              </button>
+            </div>
+          )}
+
           {/* Search & Filter */}
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex flex-1 items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 dark:border-zinc-800 dark:bg-zinc-950">
@@ -3122,9 +3148,11 @@ ${itemsXml}
               />
             </div>
 
-            <div className="flex items-center gap-1 rounded-xl bg-zinc-100 p-1 dark:bg-zinc-900">
+            <div className="no-scrollbar flex items-center gap-1 overflow-x-auto rounded-xl bg-zinc-100 p-1 dark:bg-zinc-900">
               {[
                 { id: 'all' as const, label: 'Todos' },
+                { id: 'real' as const, label: `Contas reais (${userStats.real})` },
+                { id: 'demo' as const, label: `Demo (${userStats.total - userStats.real})` },
                 { id: 'verified' as const, label: 'Verificados' },
                 { id: 'boosted' as const, label: 'Impulsionados' },
                 { id: 'restricted' as const, label: 'Restritos' },
@@ -3133,7 +3161,7 @@ ${itemsXml}
                   key={f.id}
                   type="button"
                   onClick={() => setUserFilter(f.id)}
-                  className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
+                  className={`shrink-0 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
                     userFilter === f.id
                       ? 'bg-white text-zinc-950 shadow-xs dark:bg-zinc-800 dark:text-white'
                       : 'text-zinc-600 dark:text-zinc-400'
@@ -3159,8 +3187,22 @@ ${itemsXml}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-zinc-100 dark:divide-zinc-900">
+                  {filteredUsers.length === 0 && (
+                    <tr>
+                      <td
+                        colSpan={5}
+                        className="px-4 py-8 text-center text-xs text-zinc-500 dark:text-zinc-400"
+                      >
+                        Nenhum usuário encontrado neste filtro.
+                      </td>
+                    </tr>
+                  )}
                   {filteredUsers.map((user) => {
-                    const userPostsCount = allPosts.filter((p) => p.authorId === user.id).length;
+                    const userPostsCount = allPosts.filter(
+                      (p) =>
+                        p.authorId === user.id ||
+                        (user.uid && (p.authorId === user.uid || p.authorUid === user.uid))
+                    ).length;
                     const statusParts: string[] = [];
                     statusParts.push(user.restricted ? 'Restrito' : 'Ativo');
                     if (user.verified) statusParts.push('Selo verificado');
@@ -3230,7 +3272,7 @@ ${itemsXml}
                           <div className="flex items-center justify-end gap-1.5">
                             <button
                               type="button"
-                              onClick={() => toggleVerifyUser(user.id)}
+                              onClick={() => toggleVerifyUser(user.id, adminToken)}
                               className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-semibold transition-colors ${
                                 user.verified
                                   ? 'border-sky-500/40 bg-sky-50 text-sky-700 dark:bg-sky-950/40 dark:text-sky-300'
@@ -3243,7 +3285,7 @@ ${itemsXml}
 
                             <button
                               type="button"
-                              onClick={() => toggleBoostUser(user.id)}
+                              onClick={() => toggleBoostUser(user.id, adminToken)}
                               className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-semibold transition-colors ${
                                 user.boosted
                                   ? 'border-amber-500/40 bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300'
@@ -3256,7 +3298,7 @@ ${itemsXml}
 
                             <button
                               type="button"
-                              onClick={() => toggleRestrictUser(user.id)}
+                              onClick={() => toggleRestrictUser(user.id, adminToken)}
                               className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-semibold transition-colors ${
                                 user.restricted
                                   ? 'border-rose-500/40 bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300'

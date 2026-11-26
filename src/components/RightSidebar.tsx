@@ -65,12 +65,21 @@ export function RightSidebar() {
         interactions: prev.interactions + interactions,
         score: prev.score + weighted,
       });
+      if (p.authorUid && p.authorUid !== p.authorId) {
+        const prevUid = metricsByUser.get(p.authorUid) || { interactions: 0, score: 0 };
+        metricsByUser.set(p.authorUid, {
+          interactions: prevUid.interactions + interactions,
+          score: prevUid.score + weighted,
+        });
+      }
     }
 
     return users
       .filter((u) => u.id !== currentUser.id && !u.restricted)
       .map((u) => {
-        const m = metricsByUser.get(u.id) || { interactions: 0, score: 0 };
+        const mById = metricsByUser.get(u.id);
+        const mByUid = u.uid ? metricsByUser.get(u.uid) : undefined;
+        const m = mById || mByUid || { interactions: 0, score: 0 };
         const score = m.score + u.followers.length * 2 + (u.boosted ? 25 : 0);
         return {
           user: u,

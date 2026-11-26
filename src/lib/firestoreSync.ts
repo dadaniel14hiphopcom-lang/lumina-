@@ -154,21 +154,142 @@ export async function upsertOwnProfileInCloud(
 export async function adminUpdateProfileFlagsInCloud(
   profile: UserProfile,
   fbUser: FirebaseUser
-): Promise<void> {
-  if (!fbUser.emailVerified) return;
-  const profileId = toValidFirestoreId(profile.id);
-  const ref = doc(db, 'profiles', profileId);
+): Promise<boolean> {
+  if (!fbUser.emailVerified || fbUser.email?.toLowerCase() !== ADMIN_EMAIL.toLowerCase()) {
+    return false;
+  }
+
+  const candidateIds = Array.from(
+    new Set(
+      [
+        profile.id ? toValidFirestoreId(profile.id) : '',
+        profile.uid ? toValidFirestoreId(profile.uid) : '',
+      ].filter(Boolean)
+    )
+  );
+  const cleanHandle = profile.username ? toSafeUsername(profile.username) : '';
+
   try {
-    const snap = await getDoc(ref);
-    if (!snap.exists()) return;
-    await updateDoc(ref, {
+    const matchedRefs = new Map<string, ReturnType<typeof doc>>();
+    const matchedData = new Map<string, Record<string, unknown>>();
+
+    for (const cid of candidateIds) {
+      const ref = doc(db, 'profiles', cid);
+      const snap = await getDoc(ref);
+      if (snap.exists()) {
+        matchedRefs.set(snap.id, ref);
+        matchedData.set(snap.id, snap.data() as Record<string, unknown>);
+      }
+    }
+
+    if (profile.uid) {
+      const byUidSnap = await getDocs(
+        query(collection(db, 'profiles'), where('uid', '==', profile.uid), limit(3))
+      );
+      for (const d of byUidSnap.docs) {
+        matchedRefs.set(d.id, d.ref);
+        matchedData.set(d.id, d.data() as Record<string, unknown>);
+      }
+    }
+
+    if (cleanHandle) {
+      const byHandleSnap = await getDocs(
+        query(collection(db, 'profiles'), where('username', '==', cleanHandle), limit(3))
+      );
+      for (const d of byHandleSnap.docs) {
+        const dData = d.data() as Record<string, unknown>;
+        if (Boolean(dData.isDemoSeed) === Boolean(profile.isDemoSeed)) {
+          matchedRefs.set(d.id, d.ref);
+          matchedData.set(d.id, dData);
+        }
+      }
+    }
+
+    if (matchedRefs.size > 0) {
+      for (const [docId, ref] of matchedRefs.entries()) {
+        const existingData = matchedData.get(docId) || {};
+        const patchPayload: Record<string, unknown> = {
+          verified: Boolean(profile.verified),
+          boosted: Boolean(profile.boosted),
+          restricted: Boolean(profile.restricted),
+          updatedAt: serverTimestamp(),
+        };
+        if (typeof existingData.displayName !== 'string' || !existingData.displayName.trim()) {
+          patchPayload.displayName = (profile.displayName || cleanHandle || 'Usuário').slice(0, 80);
+        }
+        if (typeof existingData.avatarUrl !== 'string') {
+          patchPayload.avatarUrl = sanitizeAvatarForCloud(profile.avatarUrl || '/og-preview.jpg');
+        }
+        if (typeof existingData.bio !== 'string') {
+          patchPayload.bio = (profile.bio || '').slice(0, 220);
+        }
+        if (typeof existingData.isOnline !== 'boolean') {
+          patchPayload.isOnline = Boolean(profile.isOnline);
+        }
+        if (typeof existingData.isDemoSeed !== 'boolean') {
+          patchPayload.isDemoSeed = Boolean(profile.isDemoSeed);
+        }
+        if (!Array.isArray(existingData.followers)) {
+          patchPayload.followers = (profile.followers || []).slice(0, 500);
+        }
+        if (!Array.isArray(existingData.following)) {
+          patchPayload.following = (profile.following || []).slice(0, 500);
+        }
+        await updateDoc(ref, patchPayload);
+      }
+      return true;
+    }
+
+    // Create profile doc as admin if real user registered via email/Supabase before signing into Firebase
+    const createDocId = toValidFirestoreId(profile.uid || profile.id);
+    const createUid = toValidFirestoreId(profile.uid || profile.id);
+    const now = Date.now();
+    const createPayload: Record<string, unknown> = {
+      id: createDocId,
+      uid: createUid,
+      username: cleanHandle || `user.${now.toString(36)}`,
+      displayName: (profile.displayName || profile.username || 'Usuário').slice(0, 80),
+      avatarUrl: sanitizeAvatarForCloud(profile.avatarUrl || '/og-preview.jpg'),
+      bio: (profile.bio || '').slice(0, 220),
       verified: Boolean(profile.verified),
-      boosted: Boolean(profile.boosted),
+      isOnline: Boolean(profile.isOnline),
+      lastActiveAtMs: profile.lastActiveAtMs || now,
+      isDemoSeed: Boolean(profile.isDemoSeed),
       restricted: Boolean(profile.restricted),
+      boosted: Boolean(profile.boosted),
+      followers: (profile.followers || []).slice(0, 500),
+      following: (profile.following || []).slice(0, 500),
+      createdAtMs: now,
+      createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
-    });
+    };
+    const safeCover = sanitizeCoverForCloud(profile.coverUrl);
+    if (safeCover) createPayload.coverUrl = safeCover;
+    if (profile.website) createPayload.website = profile.website.slice(0, 200);
+    await setDoc(doc(db, 'profiles', createDocId), createPayload);
+    return true;
   } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, `profiles/${profileId}`);
+    handleFirestoreError(
+      error,
+      OperationType.UPDATE,
+      `profiles/${toValidFirestoreId(profile.uid || profile.id)}`
+    );
+  }
+}
+
+export async function fetchAllProfilesFromCloud(
+  fbUser: FirebaseUser | null
+): Promise<UserProfile[]> {
+  if (!fbUser || !fbUser.emailVerified) return [];
+  const isBootAdmin = fbUser.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+  try {
+    const q = isBootAdmin
+      ? query(collection(db, 'profiles'))
+      : query(collection(db, 'profiles'), where('restricted', '==', false));
+    const snap = await getDocs(q);
+    return snap.docs.map((d) => mapDocToProfile(d.id, d.data() as Record<string, unknown>));
+  } catch {
+    return [];
   }
 }
 

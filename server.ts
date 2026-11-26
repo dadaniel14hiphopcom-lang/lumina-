@@ -954,7 +954,8 @@ function applyAuthoritativeUserFlags(
   return users.map((u) => {
     const id = typeof u.id === 'string' ? u.id : '';
     const uid = typeof u.uid === 'string' ? u.uid : '';
-    const handle = typeof u.username === 'string' ? u.username.trim().toLowerCase() : '';
+    const handle =
+      typeof u.username === 'string' ? u.username.trim().toLowerCase().replace(/^@/, '') : '';
     const match =
       (id && userFlags[id]) ||
       (uid && userFlags[uid]) ||
@@ -3332,9 +3333,12 @@ async function startServer() {
         ...baseShared,
         version: (baseShared.version || 0) + 1,
         updatedAt: Date.now(),
-        users: mergeSharedUsersList(
-          mergeSharedUsersList(baseShared.users, sanitizedClientUsers),
-          pulledUsers
+        users: applyAuthoritativeUserFlags(
+          mergeSharedUsersList(
+            mergeSharedUsersList(baseShared.users, sanitizedClientUsers),
+            pulledUsers
+          ),
+          state.userFlags
         ),
         posts: mergeByIdRecords(
           mergeByIdRecords(baseShared.posts, mergedPostsToPush, 220, 'createdAt'),
@@ -4325,10 +4329,12 @@ async function startServer() {
     const social = readSharedSocialState();
     if (social) {
       const updatedUsers = social.users.map((u) => {
+        const uHandle =
+          typeof u.username === 'string' ? u.username.trim().toLowerCase().replace(/^@/, '') : '';
         const matchId =
           String(u.id || '') === userId ||
-          (rawUid && String(u.uid || '') === rawUid) ||
-          (rawUsername && typeof u.username === 'string' && u.username.trim().toLowerCase() === rawUsername);
+          (rawUid && (String(u.uid || '') === rawUid || String(u.id || '') === rawUid)) ||
+          (rawUsername && u.isDemoSeed !== true && uHandle === rawUsername);
         if (!matchId) return u;
         return {
           ...u,
@@ -4353,6 +4359,7 @@ async function startServer() {
         boosted,
         restricted,
         matchUsername: rawUsername || undefined,
+        matchUid: rawUid || undefined,
       });
     }
 

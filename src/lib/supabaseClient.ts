@@ -1531,8 +1531,8 @@ export async function fetchPublicUsersFromSupabaseBrowser(
     const origin = normalizeSupabaseOrigin(config.projectUrl);
     const schema = sanitizeSupabaseSchemaName(config.schemaName);
     const urls = [
-      `${origin}/rest/v1/lumina_users?select=${SELECT_USERS_EXTENDED}&or=(is_real_user.eq.true,is_real_user.is.null)&or=(restricted.eq.false,restricted.is.null)&order=created_at.desc&limit=250`,
-      `${origin}/rest/v1/lumina_users?select=${SELECT_USERS_CORE}&or=(is_real_user.eq.true,is_real_user.is.null)&or=(restricted.eq.false,restricted.is.null)&order=created_at.desc&limit=250`,
+      `${origin}/rest/v1/lumina_users?select=${SELECT_USERS_EXTENDED}&and=(or(is_real_user.eq.true,is_real_user.is.null),or(restricted.eq.false,restricted.is.null))&order=created_at.desc&limit=250`,
+      `${origin}/rest/v1/lumina_users?select=${SELECT_USERS_CORE}&and=(or(is_real_user.eq.true,is_real_user.is.null),or(restricted.eq.false,restricted.is.null))&order=created_at.desc&limit=250`,
       `${origin}/rest/v1/lumina_users?select=${SELECT_USERS_CORE}&order=created_at.desc&limit=250`,
     ];
     for (const url of urls) {

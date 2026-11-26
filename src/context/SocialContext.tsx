@@ -47,6 +47,7 @@ import {
   createStoryInCloud,
   deletePostInCloud,
   ensureAdminDocIfMatched,
+  fetchAllProfilesFromCloud,
   fetchProfileByUsernameFromCloud,
   fetchUserProfileAndMediaFromCloud,
   markNotificationsReadInCloud,
@@ -740,9 +741,9 @@ interface SocialContextValue {
   clearRecentSearches: () => void;
   resetDemoData: () => void;
 
-  toggleRestrictUser: (userId: string) => void;
-  toggleBoostUser: (userId: string) => void;
-  toggleVerifyUser: (userId: string) => void;
+  toggleRestrictUser: (userId: string, tokenOverride?: string | null) => void;
+  toggleBoostUser: (userId: string, tokenOverride?: string | null) => void;
+  toggleVerifyUser: (userId: string, tokenOverride?: string | null) => void;
 
   getUserById: (id: string) => UserProfile | undefined;
 }
@@ -789,7 +790,8 @@ function resolveFlagOverrideForUser(
   if (!flagOverrides) return undefined;
   const id = typeof user.id === 'string' ? user.id : '';
   const uid = typeof user.uid === 'string' ? user.uid : '';
-  const handle = typeof user.username === 'string' ? user.username.trim().toLowerCase() : '';
+  const handle =
+    typeof user.username === 'string' ? user.username.trim().toLowerCase().replace(/^@/, '') : '';
   const candidate =
     (id && flagOverrides[id]) ||
     (uid && flagOverrides[uid]) ||
@@ -1122,20 +1124,25 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
   const getActiveAdminFlagOverrides = (): AdminUserFlagOverrideMap => {
     const now = Date.now();
-    const combined: AdminUserFlagOverrideMap = {
-      ...(serverSyncAvailable ? {} : loadLocalAdminUserFlags()),
-      ...serverAdminFlagsRef.current,
-    };
-    for (const [key, entry] of Object.entries(pendingAdminFlagsRef.current)) {
-      if (!entry || (typeof entry.expiresAt === 'number' && entry.expiresAt < now)) {
-        delete pendingAdminFlagsRef.current[key];
-        continue;
+    const combined: AdminUserFlagOverrideMap = {};
+    const mergeSource = (src: AdminUserFlagOverrideMap, allowExpiredCheck = false) => {
+      for (const [key, entry] of Object.entries(src)) {
+        if (!entry) continue;
+        if (allowExpiredCheck && typeof entry.expiresAt === 'number' && entry.expiresAt < now) {
+          delete pendingAdminFlagsRef.current[key];
+          continue;
+        }
+        const prev = combined[key];
+        const prevTs = typeof prev?.updatedAt === 'number' ? prev.updatedAt : 0;
+        const nextTs = typeof entry.updatedAt === 'number' ? entry.updatedAt : 0;
+        if (!prev || nextTs >= prevTs) {
+          combined[key] = { ...prev, ...entry };
+        }
       }
-      combined[key] = {
-        ...(combined[key] || {}),
-        ...entry,
-      };
-    }
+    };
+    mergeSource(loadLocalAdminUserFlags());
+    mergeSource(serverAdminFlagsRef.current);
+    mergeSource(pendingAdminFlagsRef.current, true);
     return combined;
   };
 
@@ -1724,6 +1731,25 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       }
     } catch {
       // Static hosting without /api/social/state
+    }
+
+    if (isExclusiveAdminUser(auth.currentUser)) {
+      try {
+        const cloudProfiles = await fetchAllProfilesFromCloud(auth.currentUser);
+        if (cloudProfiles.length > 0) {
+          const activeFlags = getActiveAdminFlagOverrides();
+          collected = mergeUsersSmart(collected, cloudProfiles, activeFlags);
+          void upsertCachedProfiles(cloudProfiles.filter((u) => !u.isDemoSeed));
+          skipNextServerPushRef.current = true;
+          skipNextStateBroadcastRef.current = true;
+          setState((prev) => ({
+            ...prev,
+            users: mergeUsersSmart(prev.users, cloudProfiles, activeFlags),
+          }));
+        }
+      } catch {
+        // Non-fatal: continue with Supabase/Node fetch
+      }
     }
 
     const sbConfig = getBrowserSupabaseConfig();
@@ -6025,20 +6051,26 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const persistAdminFlagUpdate = (
     userId: string,
     target: UserProfile | undefined,
-    patch: Partial<{ verified: boolean; boosted: boolean; restricted: boolean }>
+    patch: Partial<{ verified: boolean; boosted: boolean; restricted: boolean }>,
+    tokenOverride?: string | null
   ) => {
     const now = Date.now();
-    const cleanHandle = target?.username ? target.username.trim().toLowerCase() : '';
+    const cleanHandle = target?.username
+      ? target.username.trim().toLowerCase().replace(/^@/, '')
+      : '';
     const keysToMark = [userId, target?.uid || '', cleanHandle ? `handle:${cleanHandle}` : ''].filter(
       Boolean
     );
 
+    const localMap = loadLocalAdminUserFlags();
     const prevMerged =
       pendingAdminFlagsRef.current[userId] ||
       serverAdminFlagsRef.current[userId] ||
+      localMap[userId] ||
       (cleanHandle
         ? pendingAdminFlagsRef.current[`handle:${cleanHandle}`] ||
-          serverAdminFlagsRef.current[`handle:${cleanHandle}`]
+          serverAdminFlagsRef.current[`handle:${cleanHandle}`] ||
+          localMap[`handle:${cleanHandle}`]
         : undefined);
 
     const entry: AdminUserFlagOverride = {
@@ -6050,36 +6082,45 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       expiresAt: now + 90_000,
     };
 
+    const persistentEntry: AdminUserFlagOverride = {
+      id: entry.id,
+      username: entry.username,
+      verified: entry.verified,
+      boosted: entry.boosted,
+      restricted: entry.restricted,
+      updatedAt: now,
+    };
+
     for (const k of keysToMark) {
       pendingAdminFlagsRef.current[k] = entry;
-      serverAdminFlagsRef.current[k] = {
-        id: entry.id,
-        username: entry.username,
-        verified: entry.verified,
-        boosted: entry.boosted,
-        restricted: entry.restricted,
-        updatedAt: now,
-      };
+      serverAdminFlagsRef.current[k] = persistentEntry;
+      localMap[k] = persistentEntry;
+    }
+    saveLocalAdminUserFlags(localMap);
+
+    if (target && !target.isDemoSeed) {
+      void upsertCachedProfiles([{ ...target, ...patch }]);
     }
 
-    if (!serverSyncAvailable) {
-      const localMap = loadLocalAdminUserFlags();
-      const persistentEntry: AdminUserFlagOverride = {
-        id: entry.id,
-        username: entry.username,
-        verified: entry.verified,
-        boosted: entry.boosted,
-        restricted: entry.restricted,
-        updatedAt: now,
-      };
-      for (const k of keysToMark) {
-        localMap[k] = persistentEntry;
-      }
-      saveLocalAdminUserFlags(localMap);
-    }
-
-    if (target && auth.currentUser && auth.currentUser.emailVerified) {
-      void adminUpdateProfileFlagsInCloud({ ...target, ...patch }, auth.currentUser).catch(() => {});
+    if (target && isExclusiveAdminUser(auth.currentUser)) {
+      void adminUpdateProfileFlagsInCloud(
+        {
+          ...target,
+          verified:
+            typeof patch.verified === 'boolean' ? patch.verified : Boolean(target.verified),
+          boosted:
+            typeof patch.boosted === 'boolean' ? patch.boosted : Boolean(target.boosted),
+          restricted:
+            typeof patch.restricted === 'boolean'
+              ? patch.restricted
+              : Boolean(target.restricted),
+        },
+        auth.currentUser!
+      ).catch(() => {
+        showToast(
+          'Alterado localmente, mas não foi possível gravar no Firestore. Verifique sua conexão.'
+        );
+      });
     }
 
     const sbConfig = getBrowserSupabaseConfig();
@@ -6093,8 +6134,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
     if (serverSyncAvailable) {
       void (async () => {
-        let token = adminMemoryToken;
-        if ((!token || token.startsWith('firebase_admin_')) && isExclusiveAdminUser(auth.currentUser)) {
+        const exchangeFirebaseAdminToken = async (): Promise<string | null> => {
+          if (!isExclusiveAdminUser(auth.currentUser)) return null;
           try {
             const idToken = await auth.currentUser!.getIdToken();
             const exRes = await fetch('/api/admin/auth/firebase', {
@@ -6107,23 +6148,30 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             if (exRes.ok && exRes.headers.get('content-type')?.includes('application/json')) {
               const exData = (await exRes.json()) as { token?: string };
               if (exData.token) {
-                token = exData.token;
                 setAdminMemoryToken(exData.token);
+                return exData.token;
               }
             }
           } catch {
             // Keep existing token
           }
+          return null;
+        };
+
+        let token = tokenOverride || adminMemoryToken;
+        if (!token || token.startsWith('firebase_admin_') || token === 'static_admin_local') {
+          const exchanged = await exchangeFirebaseAdminToken();
+          if (exchanged) token = exchanged;
         }
         if (!token || token.startsWith('firebase_admin_') || token === 'static_admin_local') {
           return;
         }
-        try {
-          const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/flags`, {
+        const sendFlagPatch = (bearer: string) =>
+          fetch(`/api/admin/users/${encodeURIComponent(userId)}/flags`, {
             method: 'PATCH',
             headers: {
               'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`,
+              Authorization: `Bearer ${bearer}`,
             },
             body: JSON.stringify({
               ...patch,
@@ -6131,6 +6179,14 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
               uid: target?.uid || undefined,
             }),
           });
+        try {
+          let res = await sendFlagPatch(token);
+          if (res.status === 401 && isExclusiveAdminUser(auth.currentUser)) {
+            const refreshed = await exchangeFirebaseAdminToken();
+            if (refreshed) {
+              res = await sendFlagPatch(refreshed);
+            }
+          }
           if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
             const data = (await res.json()) as {
               updatedAt?: number;
@@ -6138,6 +6194,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             };
             if (data.userFlags) {
               serverAdminFlagsRef.current = data.userFlags;
+              const mergedLocal = { ...loadLocalAdminUserFlags(), ...data.userFlags };
+              saveLocalAdminUserFlags(mergedLocal);
             }
             if (data.updatedAt) {
               lastServerUpdatedAtRef.current = Math.max(
@@ -6147,14 +6205,33 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             }
           }
         } catch {
-          // Non-fatal: pendingAdminFlagsRef keeps UI consistent
+          // Non-fatal: localMap + pendingAdminFlagsRef keep UI consistent
         }
       })();
     }
   };
 
-  const toggleRestrictUser = (userId: string) => {
-    const target = state.users.find((u) => u.id === userId);
+  const applyFlagPatchToMatchingUsers = (
+    usersList: UserProfile[],
+    userId: string,
+    target: UserProfile | undefined,
+    patch: Partial<{ verified: boolean; boosted: boolean; restricted: boolean }>
+  ): UserProfile[] => {
+    const cleanHandle = target?.username
+      ? target.username.trim().toLowerCase().replace(/^@/, '')
+      : '';
+    return usersList.map((u) => {
+      const uHandle = u.username.trim().toLowerCase().replace(/^@/, '');
+      const matches =
+        u.id === userId ||
+        (target?.uid && (u.uid === target.uid || u.id === target.uid)) ||
+        (!target?.isDemoSeed && !u.isDemoSeed && cleanHandle && uHandle === cleanHandle);
+      return matches ? { ...u, ...patch } : u;
+    });
+  };
+
+  const toggleRestrictUser = (userId: string, tokenOverride?: string | null) => {
+    const target = state.users.find((u) => u.id === userId || u.uid === userId);
     const nextVal = !target?.restricted;
     if (target) {
       showToast(
@@ -6163,17 +6240,17 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           : `Restrição removida de @${target.username}`
       );
     }
-    persistAdminFlagUpdate(userId, target, { restricted: nextVal });
+    persistAdminFlagUpdate(target?.id || userId, target, { restricted: nextVal }, tokenOverride);
     setState((prev) => ({
       ...prev,
-      users: prev.users.map((u) =>
-        u.id === userId ? { ...u, restricted: nextVal } : u
-      ),
+      users: applyFlagPatchToMatchingUsers(prev.users, target?.id || userId, target, {
+        restricted: nextVal,
+      }),
     }));
   };
 
-  const toggleBoostUser = (userId: string) => {
-    const target = state.users.find((u) => u.id === userId);
+  const toggleBoostUser = (userId: string, tokenOverride?: string | null) => {
+    const target = state.users.find((u) => u.id === userId || u.uid === userId);
     const nextVal = !target?.boosted;
     if (target) {
       showToast(
@@ -6182,17 +6259,17 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           : `Impulsionamento desativado para @${target.username}`
       );
     }
-    persistAdminFlagUpdate(userId, target, { boosted: nextVal });
+    persistAdminFlagUpdate(target?.id || userId, target, { boosted: nextVal }, tokenOverride);
     setState((prev) => ({
       ...prev,
-      users: prev.users.map((u) =>
-        u.id === userId ? { ...u, boosted: nextVal } : u
-      ),
+      users: applyFlagPatchToMatchingUsers(prev.users, target?.id || userId, target, {
+        boosted: nextVal,
+      }),
     }));
   };
 
-  const toggleVerifyUser = (userId: string) => {
-    const target = state.users.find((u) => u.id === userId);
+  const toggleVerifyUser = (userId: string, tokenOverride?: string | null) => {
+    const target = state.users.find((u) => u.id === userId || u.uid === userId);
     const nextVal = !target?.verified;
     if (target) {
       showToast(
@@ -6201,12 +6278,12 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           : `Selo de verificação removido de @${target.username}`
       );
     }
-    persistAdminFlagUpdate(userId, target, { verified: nextVal });
+    persistAdminFlagUpdate(target?.id || userId, target, { verified: nextVal }, tokenOverride);
     setState((prev) => ({
       ...prev,
-      users: prev.users.map((u) =>
-        u.id === userId ? { ...u, verified: nextVal } : u
-      ),
+      users: applyFlagPatchToMatchingUsers(prev.users, target?.id || userId, target, {
+        verified: nextVal,
+      }),
     }));
   };
 
