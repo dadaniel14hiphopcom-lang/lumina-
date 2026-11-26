@@ -25,7 +25,7 @@ import {
   X,
 } from 'lucide-react';
 import React, { useMemo, useRef, useState } from 'react';
-import { useSocial } from '../context/SocialContext';
+import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import { lookupCachedProfileInstant } from '../lib/userProfileCache';
 import { ASSETS, STUDIO_SAMPLE_IMAGES } from '../data/seed';
 import {
@@ -65,6 +65,7 @@ export function ProfileView() {
     changePassword,
     pendingProfileSlug,
     profileLookupLoading,
+    profileMediaLoading,
     setPendingProfileSlug,
     refreshPublicUsersFromSupabase,
     mergeExternalUsers,
@@ -428,7 +429,7 @@ export function ProfileView() {
               size="xl"
               hasStory={hasStory}
               hasUnseenStory={hasUnseenStory}
-              showOnlineIndicator={Boolean(targetUser.isOnline)}
+              showOnlineIndicator={isUserEffectivelyOnline(targetUser, currentUser.id)}
               onClick={() => {
                 if (hasStory) setActiveStoryAuthorId(targetUser.id);
               }}
@@ -692,18 +693,30 @@ export function ProfileView() {
 
       {/* 3-Column Photo Grid */}
       {displayedPosts.length === 0 ? (
-        <div className="py-16 text-center">
-          <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-            {activeTab === 'saved'
-              ? 'Nenhuma publicação salva ainda'
-              : 'Nenhuma publicação encontrada'}
-          </p>
-          <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-            {activeTab === 'saved'
-              ? 'Salve fotos que você gosta para revê-las aqui.'
-              : 'As fotos e reels publicados aparecerão nesta grade.'}
-          </p>
-        </div>
+        profileMediaLoading && activeTab !== 'saved' ? (
+          <div className="py-16 text-center">
+            <div className="mx-auto mb-3 h-7 w-7 animate-spin rounded-full border-2 border-sky-600 border-t-transparent" />
+            <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+              Carregando fotos e mídias...
+            </p>
+            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+              Sincronizando publicações do perfil na nuvem.
+            </p>
+          </div>
+        ) : (
+          <div className="py-16 text-center">
+            <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+              {activeTab === 'saved'
+                ? 'Nenhuma publicação salva ainda'
+                : 'Nenhuma publicação encontrada'}
+            </p>
+            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+              {activeTab === 'saved'
+                ? 'Salve fotos que você gosta para revê-las aqui.'
+                : 'As fotos e reels publicados aparecerão nesta grade.'}
+            </p>
+          </div>
+        )
       ) : (
         <div className="mt-3 grid grid-cols-3 gap-1 sm:gap-2">
           {displayedPosts.map((post) => {

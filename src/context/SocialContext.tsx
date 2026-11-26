@@ -48,12 +48,17 @@ import {
   deletePostInCloud,
   ensureAdminDocIfMatched,
   fetchProfileByUsernameFromCloud,
+  fetchUserProfileAndMediaFromCloud,
   markNotificationsReadInCloud,
+  migrateDemoDataToCloud,
+  sendCallSignalInCloud,
+  subscribeToCallSignalsInCloud,
   subscribeToCloudState,
   syncSiteMetaToCloud,
   updatePostInteractionInCloud,
   updateProfileFollowersInCloud,
   updateStoryInteractionInCloud,
+  updateUserPresenceInCloud,
   upsertOwnProfileInCloud,
   upsertThreadInCloud,
 } from '../lib/firestoreSync';
@@ -121,6 +126,20 @@ const THREAD_READ_WATERMARK_KEY = 'lumina_thread_read_v1';
 const NOTIF_READ_IDS_KEY = 'lumina_notif_read_ids_v1';
 const CHAT_PREFS_KEY = 'lumina_chat_prefs_v1';
 const REALTIME_CHANNEL = 'lumina_realtime_sync_v1';
+const PRESENCE_STALE_MS = 120_000;
+
+export function isUserEffectivelyOnline(
+  user?: Partial<UserProfile> | null,
+  currentUserId?: string
+): boolean {
+  if (!user || user.restricted) return false;
+  if (currentUserId && user.id === currentUserId) return true;
+  if (user.isOnline !== true) return false;
+  if (typeof user.lastActiveAtMs === 'number' && user.lastActiveAtMs > 0) {
+    return Date.now() - user.lastActiveAtMs <= PRESENCE_STALE_MS;
+  }
+  return true;
+}
 
 interface ChatPrefsStore {
   blockedByUser: Record<string, string[]>;
@@ -457,7 +476,7 @@ function loadInitialState(): PersistedState {
           const seedMatch = SEED_USERS.find((s) => s.id === u.id);
           return {
             ...u,
-            isOnline: u.isOnline !== undefined ? u.isOnline : seedMatch?.isOnline ?? true,
+            isOnline: u.isOnline !== undefined ? u.isOnline : seedMatch?.isOnline ?? false,
             coverUrl: u.coverUrl || seedMatch?.coverUrl,
             isDemoSeed: seedMatch
               ? seedMatch.isDemoSeed
@@ -515,6 +534,7 @@ interface SocialContextValue {
   pendingProfileSlug: string | null;
   setPendingProfileSlug: (slug: string | null) => void;
   profileLookupLoading: boolean;
+  profileMediaLoading: boolean;
   exploreQuery: string;
   selectedPostId: string | null;
   activeStoryAuthorId: string | null;
@@ -526,6 +546,22 @@ interface SocialContextValue {
   refreshSiteMeta: () => Promise<void>;
   refreshPublicUsersFromSupabase: () => Promise<UserProfile[]>;
   mergeExternalUsers: (incoming: UserProfile[]) => void;
+  demoMigrationStatus: {
+    running: boolean;
+    lastResult: {
+      profilesMigrated: number;
+      postsMigrated: number;
+      storiesMigrated: number;
+      skipped: number;
+    } | null;
+    error: string | null;
+  };
+  migrateDemoToFirestore: () => Promise<{
+    profilesMigrated: number;
+    postsMigrated: number;
+    storiesMigrated: number;
+    skipped: number;
+  }>;
 
   invites: InviteRecord[];
   setInvites: React.Dispatch<React.SetStateAction<InviteRecord[]>>;
@@ -818,11 +854,22 @@ function mergeUsersSmart(
       const ov =
         resolveFlagOverrideForUser(existing, flagOverrides) ||
         resolveFlagOverrideForUser(remote, flagOverrides);
+      const prevActive = typeof existing.lastActiveAtMs === 'number' ? existing.lastActiveAtMs : 0;
+      const incActive = typeof remote.lastActiveAtMs === 'number' ? remote.lastActiveAtMs : 0;
+      const mergedIsOnline =
+        typeof remote.isOnline === 'boolean' &&
+        (incActive >= prevActive || existing.isOnline === undefined)
+          ? remote.isOnline
+          : existing.isOnline;
+      const mergedLastActive = Math.max(prevActive, incActive) || undefined;
+
       result[matchIdx] = {
         ...existing,
         ...remote,
         id: existing.id,
         uid: remote.uid || existing.uid || (remote.id !== existing.id ? remote.id : undefined),
+        isOnline: mergedIsOnline,
+        ...(mergedLastActive ? { lastActiveAtMs: mergedLastActive } : {}),
         ...(ov && typeof ov.verified === 'boolean' ? { verified: ov.verified } : {}),
         ...(ov && typeof ov.boosted === 'boolean' ? { boosted: ov.boosted } : {}),
         ...(ov && typeof ov.restricted === 'boolean' ? { restricted: ov.restricted } : {}),
@@ -964,6 +1011,17 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     extractInitialProfileParam()
   );
   const [profileLookupLoading, setProfileLookupLoading] = useState(false);
+  const [profileMediaLoading, setProfileMediaLoading] = useState(false);
+  const [demoMigrationStatus, setDemoMigrationStatus] = useState<{
+    running: boolean;
+    lastResult: {
+      profilesMigrated: number;
+      postsMigrated: number;
+      storiesMigrated: number;
+      skipped: number;
+    } | null;
+    error: string | null;
+  }>({ running: false, lastResult: null, error: null });
   const [activeNav, setActiveNav] = useState<NavSection>(() =>
     extractInitialProfileParam() ? 'profile' : 'feed'
   );
@@ -1039,8 +1097,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const wsHandleRef = useRef<RealtimeSocketHandle | null>(null);
   const wsConnectedRef = useRef(false);
   const pullMessagesNowRef = useRef<(() => Promise<void>) | null>(null);
+  const pullServerStateNowRef = useRef<(() => Promise<void>) | null>(null);
   const handleCallSignalRef = useRef<((sig: CallSignalPayload) => void) | null>(null);
   const seenCallSignalsRef = useRef<Set<string>>(new Set());
+  const demoMigrationAttemptedUidRef = useRef<string | null>(null);
 
   const [activeCall, setActiveCall] = useState<ActiveCallSession | null>(null);
   const activeCallRef = useRef<ActiveCallSession | null>(null);
@@ -1054,7 +1114,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   const [callFacingMode, setCallFacingMode] = useState<'user' | 'environment'>('user');
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const pendingIncomingOfferRef = useRef<CallSignalPayload | null>(null);
-  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const callRingTimeoutRef = useRef<number | null>(null);
 
   const currentUserIdRef = useRef(state.currentUserId);
@@ -1143,6 +1203,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     void refreshSiteMeta();
+    const timer = window.setInterval(() => {
+      void refreshSiteMeta();
+    }, 15_000);
+    return () => window.clearInterval(timer);
   }, []);
 
   // Hydrate full persistent IndexedDB profile cache into memory on mount
@@ -1305,6 +1369,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         avatarUrl: existingMatch.avatarUrl || fbUser.photoURL || SEED_USERS[0].avatarUrl,
         verified: isExclusiveAdmin ? true : existingMatch.verified,
         isOnline: true,
+        lastActiveAtMs: Date.now(),
         isDemoSeed: false,
       };
       setState((prev) => ({
@@ -1342,6 +1407,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         email: cleanEmail || undefined,
         verified: isExclusiveAdmin,
         isOnline: true,
+        lastActiveAtMs: Date.now(),
         isDemoSeed: false,
         followers: [],
         following: [],
@@ -1409,9 +1475,35 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     return activeProfile;
   };
 
+  const migrateDemoToFirestore = async (): Promise<{
+    profilesMigrated: number;
+    postsMigrated: number;
+    storiesMigrated: number;
+    skipped: number;
+  }> => {
+    const fbUser = auth.currentUser;
+    if (!fbUser || !fbUser.emailVerified || !isExclusiveAdminUser(fbUser)) {
+      const msg = 'Entre como administrador verificado no Firebase para migrar os dados demo.';
+      setDemoMigrationStatus({ running: false, lastResult: null, error: msg });
+      showToast(msg);
+      return { profilesMigrated: 0, postsMigrated: 0, storiesMigrated: 0, skipped: 0 };
+    }
+    setDemoMigrationStatus((prev) => ({ ...prev, running: true, error: null }));
+    try {
+      const result = await migrateDemoDataToCloud(fbUser, SEED_USERS, SEED_POSTS, SEED_STORIES);
+      setDemoMigrationStatus({ running: false, lastResult: result, error: null });
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Erro ao migrar usuários demo para Firestore.';
+      setDemoMigrationStatus((prev) => ({ ...prev, running: false, error: msg }));
+      return { profilesMigrated: 0, postsMigrated: 0, storiesMigrated: 0, skipped: 0 };
+    }
+  };
+
   // Firebase Auth & Firestore real-time cross-device sync
   useEffect(() => {
     let unsubCloud: (() => void) | null = null;
+    let unsubCallSignals: (() => void) | null = null;
 
     getRedirectResult(auth)
       .then((result) => {
@@ -1441,6 +1533,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         unsubCloud();
         unsubCloud = null;
       }
+      if (unsubCallSignals) {
+        unsubCallSignals();
+        unsubCallSignals = null;
+      }
       if (!fbUser || !fbUser.emailVerified) return;
 
       void ensureAdminDocIfMatched(fbUser).catch(() => {});
@@ -1456,6 +1552,15 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           silent: true,
           openAdminIfEligible: openAdmin,
         });
+      }
+
+      if (isExclusiveAdminUser(fbUser) && demoMigrationAttemptedUidRef.current !== fbUser.uid) {
+        demoMigrationAttemptedUidRef.current = fbUser.uid;
+        void migrateDemoDataToCloud(fbUser, SEED_USERS, SEED_POSTS, SEED_STORIES)
+          .then((result) => {
+            setDemoMigrationStatus({ running: false, lastResult: result, error: null });
+          })
+          .catch(() => {});
       }
 
       unsubCloud = subscribeToCloudState(fbUser, {
@@ -1523,11 +1628,16 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           setSiteMeta(cloudMeta);
         },
       });
+
+      unsubCallSignals = subscribeToCallSignalsInCloud(fbUser, (sig) => {
+        handleCallSignalRef.current?.(sig);
+      });
     });
 
     return () => {
       unsubAuth();
       if (unsubCloud) unsubCloud();
+      if (unsubCallSignals) unsubCallSignals();
     };
   }, []);
 
@@ -1765,10 +1875,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
       const cloudPromise =
         auth.currentUser && auth.currentUser.emailVerified
-          ? fetchProfileByUsernameFromCloud(cleanSlug, auth.currentUser).catch(() => null)
+          ? fetchUserProfileAndMediaFromCloud(rawTrimmed, auth.currentUser).catch(() => null)
           : Promise.resolve(null);
 
-      const [nodeHit, sbHit, cloudHit] = await Promise.all([
+      const [nodeHit, sbHit, cloudBundle] = await Promise.all([
         nodePromise,
         sbPromise,
         cloudPromise,
@@ -1776,16 +1886,19 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
       if (cancelled) return;
 
+      const cloudPosts = cloudBundle?.posts || [];
+      const cloudStories = cloudBundle?.stories || [];
+
       if (nodeHit?.user) {
         applyResolvedUser(
           nodeHit.user,
-          Array.isArray(nodeHit.posts) ? nodeHit.posts : [],
-          Array.isArray(nodeHit.stories) ? nodeHit.stories : []
+          mergeRecordsById(Array.isArray(nodeHit.posts) ? nodeHit.posts : [], cloudPosts),
+          mergeRecordsById(Array.isArray(nodeHit.stories) ? nodeHit.stories : [], cloudStories)
         );
         return;
       }
 
-      let remoteUser = sbHit || cloudHit || null;
+      let remoteUser = sbHit || cloudBundle?.user || null;
 
       if (!remoteUser && canQuerySupabase) {
         const allPublic = await fetchPublicUsersFromSupabaseBrowser(sbConfig).catch(() => []);
@@ -1803,16 +1916,31 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (remoteUser && remoteUser.id) {
+        const authorFilters = [remoteUser.id, remoteUser.uid || ''].filter(Boolean);
         const [sbPosts, sbStories] = canQuerySupabase
           ? await Promise.all([
-              fetchPublicPostsFromSupabaseBrowser(sbConfig, remoteUser.id),
-              fetchPublicStoriesFromSupabaseBrowser(sbConfig, remoteUser.id),
+              fetchPublicPostsFromSupabaseBrowser(sbConfig, authorFilters),
+              fetchPublicStoriesFromSupabaseBrowser(sbConfig, authorFilters),
             ])
           : [[], []];
         if (!cancelled) {
-          applyResolvedUser(remoteUser, sbPosts, sbStories);
+          applyResolvedUser(
+            remoteUser,
+            mergeRecordsById(sbPosts, cloudPosts),
+            mergeRecordsById(sbStories, cloudStories)
+          );
           return;
         }
+      } else if (cloudPosts.length > 0 || cloudStories.length > 0) {
+        skipNextServerPushRef.current = true;
+        skipNextStateBroadcastRef.current = true;
+        setState((prev) => ({
+          ...prev,
+          posts: mergeRecordsById(prev.posts, cloudPosts).sort((a, b) => b.createdAt - a.createdAt),
+          stories: mergeRecordsById(prev.stories, cloudStories).sort(
+            (a, b) => b.createdAt - a.createdAt
+          ),
+        }));
       }
 
       if (!cancelled) {
@@ -1829,7 +1957,116 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [pendingProfileSlug, siteMetaReady, runtimeConfigVersion]);
+  }, [pendingProfileSlug, siteMetaReady, runtimeConfigVersion, firebaseUser?.uid]);
+
+  // Hydrate visited profile's photos, Reels, stories & fresh profile metadata on openProfile / navigation
+  const hydrateProfileMediaForTarget = async (identifier: string) => {
+    const clean = identifier.trim().replace(/^@/, '');
+    if (!clean) return;
+    setProfileMediaLoading(true);
+    try {
+      const existingUser =
+        usersRef.current.find(
+          (u) =>
+            u.id === clean ||
+            u.uid === clean ||
+            u.username.toLowerCase() === clean.toLowerCase()
+        ) || null;
+      const sbConfig = getBrowserSupabaseConfig();
+      const canQuerySupabase = Boolean(sbConfig.anonKey);
+      const authorFilters = Array.from(
+        new Set([clean, existingUser?.id, existingUser?.uid].filter((v): v is string => Boolean(v)))
+      );
+
+      const nodePromise = fetch(`/api/social/profile/${encodeURIComponent(existingUser?.username || clean)}`)
+        .then(async (res) => {
+          const ct = res.headers.get('content-type') || '';
+          if (!res.ok || !ct.includes('application/json')) return null;
+          const data = (await res.json()) as {
+            ok?: boolean;
+            user?: UserProfile;
+            posts?: Post[];
+            stories?: StoryItem[];
+          };
+          return data.ok ? data : null;
+        })
+        .catch(() => null);
+
+      const cloudPromise =
+        auth.currentUser && auth.currentUser.emailVerified
+          ? fetchUserProfileAndMediaFromCloud(existingUser?.username || clean, auth.currentUser).catch(
+              () => null
+            )
+          : Promise.resolve(null);
+
+      const sbPostsPromise =
+        canQuerySupabase && authorFilters.length > 0
+          ? fetchPublicPostsFromSupabaseBrowser(sbConfig, authorFilters).catch(() => [] as Post[])
+          : Promise.resolve([] as Post[]);
+
+      const sbStoriesPromise =
+        canQuerySupabase && authorFilters.length > 0
+          ? fetchPublicStoriesFromSupabaseBrowser(sbConfig, authorFilters).catch(
+              () => [] as StoryItem[]
+            )
+          : Promise.resolve([] as StoryItem[]);
+
+      const sbUserPromise =
+        canQuerySupabase && !existingUser
+          ? fetchPublicUserByUsernameFromSupabaseBrowser(sbConfig, clean).catch(() => null)
+          : Promise.resolve(null);
+
+      const [nodeHit, cloudBundle, sbPosts, sbStories, sbUser] = await Promise.all([
+        nodePromise,
+        cloudPromise,
+        sbPostsPromise,
+        sbStoriesPromise,
+        sbUserPromise,
+      ]);
+
+      const mergedUsers = [nodeHit?.user, sbUser, cloudBundle?.user].filter(
+        (u): u is UserProfile => Boolean(u && u.id)
+      );
+      const mergedPosts = mergeRecordsById(
+        mergeRecordsById(Array.isArray(nodeHit?.posts) ? nodeHit!.posts! : [], sbPosts),
+        cloudBundle?.posts || []
+      );
+      const mergedStories = mergeRecordsById(
+        mergeRecordsById(Array.isArray(nodeHit?.stories) ? nodeHit!.stories! : [], sbStories),
+        cloudBundle?.stories || []
+      );
+
+      if (mergedUsers.length > 0 || mergedPosts.length > 0 || mergedStories.length > 0) {
+        if (mergedUsers.length > 0) {
+          void upsertCachedProfiles(mergedUsers.filter((u) => !u.isDemoSeed));
+        }
+        const activeFlags = getActiveAdminFlagOverrides();
+        skipNextServerPushRef.current = true;
+        skipNextStateBroadcastRef.current = true;
+        setState((prev) => ({
+          ...prev,
+          users: mergedUsers.length > 0 ? mergeUsersSmart(prev.users, mergedUsers, activeFlags) : prev.users,
+          posts:
+            mergedPosts.length > 0
+              ? mergeRecordsById(prev.posts, mergedPosts).sort((a, b) => b.createdAt - a.createdAt)
+              : prev.posts,
+          stories:
+            mergedStories.length > 0
+              ? mergeRecordsById(prev.stories, mergedStories).sort(
+                  (a, b) => b.createdAt - a.createdAt
+                )
+              : prev.stories,
+        }));
+      }
+    } finally {
+      setProfileMediaLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeNav !== 'profile' || !viewingProfileId) return;
+    void hydrateProfileMediaForTarget(viewingProfileId);
+  }, [activeNav, viewingProfileId, firebaseUser?.uid, runtimeConfigVersion]);
 
   // Node server + Supabase cross-device sync (parallelized for lower latency)
   useEffect(() => {
@@ -1989,12 +2226,14 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         }
       }
     };
+    pullServerStateNowRef.current = pullServerState;
     void pullServerState();
     const timer = window.setInterval(() => {
       void pullServerState();
-    }, 8000);
+    }, 3000);
     return () => {
       active = false;
+      pullServerStateNowRef.current = null;
       window.clearInterval(timer);
     };
   }, [runtimeConfigVersion, state.currentUserId, state.isAuthenticated]);
@@ -2133,6 +2372,27 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           handleCallSignalRef.current?.(event.signal);
         } else if (event.type === 'chat_message' || event.type === 'chat_read') {
           void pullMessagesNowRef.current?.();
+        } else if (event.type === 'social_update') {
+          void pullServerStateNowRef.current?.();
+        } else if (event.type === 'site_meta_update') {
+          void refreshSiteMeta();
+        } else if (event.type === 'presence_update' && event.userId) {
+          skipNextServerPushRef.current = true;
+          skipNextStateBroadcastRef.current = true;
+          setState((prev) => ({
+            ...prev,
+            users: prev.users.map((u) => {
+              const matches =
+                u.id === event.userId ||
+                (event.uid && (u.uid === event.uid || u.id === event.uid));
+              if (!matches) return u;
+              return {
+                ...u,
+                isOnline: event.isOnline,
+                lastActiveAtMs: event.lastActiveAtMs,
+              };
+            }),
+          }));
         } else if (event.type === 'chat_typing' && event.fromUserId) {
           setTypingByUserId((prev) => {
             const next = { ...prev };
@@ -2177,10 +2437,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       }
     })();
 
-    // HTTP REST polling fallback for call signals when WS is unavailable or ringing
+    // HTTP REST polling fallback for call signals (catches cross-device calls reliably)
     const pollCallSignals = async () => {
       if (!active) return;
-      if (wsConnectedRef.current && !activeCallRef.current) return;
       try {
         const res = await fetch(
           `/api/social/calls/poll?userIds=${encodeURIComponent(activeIds.join(','))}`
@@ -2197,9 +2456,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       }
     };
 
+    void pollCallSignals();
     const callPollTimer = window.setInterval(() => {
       void pollCallSignals();
-    }, 1800);
+    }, 1500);
 
     return () => {
       active = false;
@@ -2211,6 +2471,85 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       wsConnectedRef.current = false;
     };
   }, [state.isAuthenticated, state.currentUserId, runtimeConfigVersion]);
+
+  // Real-time online/offline presence heartbeat for real authenticated users
+  useEffect(() => {
+    if (!state.isAuthenticated) return;
+    const activeUser = usersRef.current.find((u) => u.id === currentUserIdRef.current);
+    if (!activeUser || activeUser.isDemoSeed) return;
+
+    const profileId = activeUser.id;
+    const profileUid = activeUser.uid;
+
+    const sendPresence = (online: boolean, useBeacon = false) => {
+      const now = Date.now();
+      skipNextServerPushRef.current = true;
+      setState((prev) => ({
+        ...prev,
+        users: prev.users.map((u) =>
+          u.id === profileId ? { ...u, isOnline: online, lastActiveAtMs: now } : u
+        ),
+      }));
+
+      const payload = JSON.stringify({
+        userId: profileId,
+        uid: profileUid,
+        isOnline: online,
+      });
+
+      if (useBeacon && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+        try {
+          navigator.sendBeacon('/api/social/presence', new Blob([payload], { type: 'text/plain' }));
+        } catch {
+          // Ignore beacon errors on static hosts
+        }
+      } else {
+        void fetch('/api/social/presence', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: payload,
+          keepalive: !online,
+        }).catch(() => {});
+      }
+
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        void updateUserPresenceInCloud(profileId, online, auth.currentUser).catch(() => {});
+      }
+    };
+
+    sendPresence(true);
+
+    const heartbeatTimer = window.setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
+        sendPresence(true);
+      }
+    }, 20_000);
+
+    const onVisibilityOrFocus = () => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        sendPresence(true);
+      }
+    };
+
+    const onOfflineOrUnload = () => {
+      sendPresence(false, true);
+    };
+
+    window.addEventListener('focus', onVisibilityOrFocus);
+    window.addEventListener('online', onVisibilityOrFocus);
+    document.addEventListener('visibilitychange', onVisibilityOrFocus);
+    window.addEventListener('beforeunload', onOfflineOrUnload);
+    window.addEventListener('pagehide', onOfflineOrUnload);
+
+    return () => {
+      window.clearInterval(heartbeatTimer);
+      window.removeEventListener('focus', onVisibilityOrFocus);
+      window.removeEventListener('online', onVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', onVisibilityOrFocus);
+      window.removeEventListener('beforeunload', onOfflineOrUnload);
+      window.removeEventListener('pagehide', onOfflineOrUnload);
+    };
+  }, [state.isAuthenticated, state.currentUserId, firebaseUser?.uid]);
 
   // Cross-tab real-time synchronization for real user messages, posts, and profiles
   useEffect(() => {
@@ -2436,7 +2775,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         threads: state.threads,
         notifications: state.notifications,
       });
-    }, 320);
+    }, 150);
 
     let pushTimer: number | null = null;
     if (skipNextServerPushRef.current) {
@@ -2461,7 +2800,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             }
           })
           .catch(() => {});
-      }, 650);
+      }, 150);
     }
 
     return () => {
@@ -2587,9 +2926,11 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
 
   const openProfile = (userId: string) => {
     const matched = getUserById(userId);
+    const resolvedId = matched?.id || userId;
     setPendingProfileSlug(null);
-    setViewingProfileId(matched?.id || userId);
+    setViewingProfileId(resolvedId);
     setActiveNav('profile');
+    void hydrateProfileMediaForTarget(matched?.username || resolvedId);
   };
 
   const openChatWithUser = (userId: string) => {
@@ -2726,6 +3067,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             email: existing.email || ADMIN_EMAIL,
             verified: true,
             isOnline: true,
+            lastActiveAtMs: Date.now(),
             isDemoSeed: false,
           }
         : {
@@ -2738,6 +3080,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             email: ADMIN_EMAIL,
             verified: true,
             isOnline: true,
+            lastActiveAtMs: Date.now(),
             isDemoSeed: false,
             followers: [],
             following: [],
@@ -2756,6 +3099,22 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = () => {
+    const leavingUser = usersRef.current.find((u) => u.id === currentUserIdRef.current);
+    const offlineTs = Date.now();
+    if (leavingUser && !leavingUser.isDemoSeed) {
+      void fetch('/api/social/presence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: leavingUser.id,
+          uid: leavingUser.uid,
+          isOnline: false,
+        }),
+      }).catch(() => {});
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        void updateUserPresenceInCloud(leavingUser.id, false, auth.currentUser).catch(() => {});
+      }
+    }
     clearBrowserSupabaseSession();
     setSelectedPostId(null);
     setActiveStoryAuthorId(null);
@@ -2765,7 +3124,13 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     setViewingProfileId(null);
     setAdminMemoryToken(null);
     setActiveNav('feed');
-    setState((prev) => ({ ...prev, isAuthenticated: false }));
+    setState((prev) => ({
+      ...prev,
+      isAuthenticated: false,
+      users: prev.users.map((u) =>
+        u.id === prev.currentUserId ? { ...u, isOnline: false, lastActiveAtMs: offlineTs } : u
+      ),
+    }));
     if (auth.currentUser) {
       void signOut(auth).catch(() => {});
     }
@@ -4934,23 +5299,34 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  // --- Real-Time Audio & Video Calls (WebRTC + WebSocket/REST/BroadcastChannel) ---
+  // --- Real-Time Audio & Video Calls (WebRTC + WebSocket/REST/BroadcastChannel + Firestore) ---
   const sendCallSignal = (signal: CallSignalPayload) => {
+    const peerUser = getUserById(signal.toUserId);
+    const resolvedToUid = signal.toUid || peerUser?.uid;
+    const enrichedSignal: CallSignalPayload = {
+      ...signal,
+      ...(resolvedToUid ? { toUid: resolvedToUid } : {}),
+    };
+
     channelRef.current?.postMessage({
       senderTabId: tabIdRef.current,
       type: 'call_signal',
-      signal,
+      signal: enrichedSignal,
     });
     const sentViaWs = wsHandleRef.current?.send({
       type: 'call_signal',
-      signal,
+      signal: enrichedSignal,
     });
     if (!sentViaWs && serverSyncAvailable) {
       void fetch('/api/social/calls/signal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ signal }),
+        body: JSON.stringify({ signal: enrichedSignal }),
       }).catch(() => {});
+    }
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      const participantUids = [auth.currentUser.uid, resolvedToUid || ''].filter(Boolean);
+      void sendCallSignalInCloud(enrichedSignal, participantUids, auth.currentUser).catch(() => {});
     }
   };
 
@@ -4976,7 +5352,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       localCallStreamRef.current = null;
     }
     pendingIncomingOfferRef.current = null;
-    pendingIceCandidatesRef.current = [];
+    pendingIceCandidatesRef.current.clear();
+    activeCallRef.current = null;
     setLocalCallStream(null);
     setRemoteCallStream(null);
     setIsCallMicMuted(false);
@@ -5142,7 +5519,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       });
       await pc.setLocalDescription(offer);
 
-      setActiveCall({
+      const outgoingSession: ActiveCallSession = {
         callId,
         threadId,
         peerId: canonicalPeerId,
@@ -5151,7 +5528,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         callType,
         status: 'ringing',
         minimized: false,
-      });
+      };
+      activeCallRef.current = outgoingSession;
+      setActiveCall(outgoingSession);
 
       startCallRingtone('outgoing');
       sendCallSignal({
@@ -5239,14 +5618,15 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
       await pc.setRemoteDescription(new RTCSessionDescription(offerSignal.sdp));
-      for (const ice of pendingIceCandidatesRef.current) {
+      const queuedIce = pendingIceCandidatesRef.current.get(session.callId) || [];
+      for (const ice of queuedIce) {
         try {
           await pc.addIceCandidate(new RTCIceCandidate(ice));
         } catch {
           // Ignore stale ICE
         }
       }
-      pendingIceCandidatesRef.current = [];
+      pendingIceCandidatesRef.current.delete(session.callId);
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
@@ -5448,9 +5828,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       }
 
       pendingIncomingOfferRef.current = sig;
-      pendingIceCandidatesRef.current = [];
       const threadId = sig.threadId || canonicalThreadIdForPair(currentUser.id, sig.fromUserId);
-      setActiveCall({
+      const incomingSession: ActiveCallSession = {
         callId: sig.callId,
         threadId,
         peerId: sig.fromUserId,
@@ -5459,7 +5838,9 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         callType: sig.callType || 'audio',
         status: 'ringing',
         minimized: false,
-      });
+      };
+      activeCallRef.current = incomingSession;
+      setActiveCall(incomingSession);
 
       const mutedList = chatPrefsRef.current.mutedByUser[currentUser.id] || [];
       if (!mutedList.includes(threadId)) {
@@ -5477,6 +5858,24 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
+    // Buffer early ICE candidates per callId even before activeCall state finishes mounting
+    if (sig.type === 'call:ice' && sig.candidate) {
+      const currentSession = activeCallRef.current;
+      if (
+        currentSession &&
+        currentSession.callId === sig.callId &&
+        pcRef.current &&
+        pcRef.current.remoteDescription
+      ) {
+        void pcRef.current.addIceCandidate(new RTCIceCandidate(sig.candidate)).catch(() => {});
+      } else {
+        const list = pendingIceCandidatesRef.current.get(sig.callId) || [];
+        list.push(sig.candidate);
+        pendingIceCandidatesRef.current.set(sig.callId, list);
+      }
+      return;
+    }
+
     const currentSession = activeCallRef.current;
     if (!currentSession || currentSession.callId !== sig.callId) return;
 
@@ -5489,14 +5888,15 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       void (async () => {
         try {
           await pcRef.current?.setRemoteDescription(new RTCSessionDescription(sig.sdp!));
-          for (const ice of pendingIceCandidatesRef.current) {
+          const queuedIce = pendingIceCandidatesRef.current.get(sig.callId) || [];
+          for (const ice of queuedIce) {
             try {
               await pcRef.current?.addIceCandidate(new RTCIceCandidate(ice));
             } catch {
               // Ignore stale ICE
             }
           }
-          pendingIceCandidatesRef.current = [];
+          pendingIceCandidatesRef.current.delete(sig.callId);
           setActiveCall((prev) =>
             prev && prev.callId === sig.callId
               ? { ...prev, status: 'connecting', startedAt: prev.startedAt || Date.now() }
@@ -5506,15 +5906,6 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           endActiveCall('missed');
         }
       })();
-      return;
-    }
-
-    if (sig.type === 'call:ice' && sig.candidate) {
-      if (pcRef.current && pcRef.current.remoteDescription) {
-        void pcRef.current.addIceCandidate(new RTCIceCandidate(sig.candidate)).catch(() => {});
-      } else {
-        pendingIceCandidatesRef.current.push(sig.candidate);
-      }
       return;
     }
 
@@ -5849,6 +6240,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         pendingProfileSlug,
         setPendingProfileSlug,
         profileLookupLoading,
+        profileMediaLoading,
         exploreQuery,
         selectedPostId,
         activeStoryAuthorId,
@@ -5860,6 +6252,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         refreshSiteMeta,
         refreshPublicUsersFromSupabase,
         mergeExternalUsers,
+        demoMigrationStatus,
+        migrateDemoToFirestore,
         invites,
         setInvites,
         pendingInviteCode,

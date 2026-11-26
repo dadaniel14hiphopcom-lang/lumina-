@@ -1,6 +1,6 @@
 import { Plus } from 'lucide-react';
 import { useMemo } from 'react';
-import { useSocial } from '../context/SocialContext';
+import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import { AvatarRing } from './AvatarRing';
 import { ProfileHoverCard } from './ProfileHoverCard';
 
@@ -112,7 +112,7 @@ export function StoryBar({ onAddStory }: StoryBarProps) {
                   size="lg"
                   hasStory
                   hasUnseenStory={entry.hasUnseen}
-                  showOnlineIndicator={Boolean(author.isOnline)}
+                  showOnlineIndicator={isUserEffectivelyOnline(author, currentUser.id)}
                 />
                 <span
                   className={`w-full truncate text-center text-xs ${

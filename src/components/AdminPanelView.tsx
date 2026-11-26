@@ -32,7 +32,12 @@ import {
 } from 'lucide-react';
 import { signInWithEmailAndPassword } from 'firebase/auth';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { DEFAULT_VIDEO_RULES, encodeInviteMeta, useSocial } from '../context/SocialContext';
+import {
+  DEFAULT_VIDEO_RULES,
+  encodeInviteMeta,
+  isUserEffectivelyOnline,
+  useSocial,
+} from '../context/SocialContext';
 import { ADMIN_EMAIL, auth, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
 import {
   DEFAULT_SUPABASE_URL,
@@ -55,6 +60,12 @@ import {
   upsertStoryToSupabaseBrowser,
 } from '../lib/supabaseClient';
 import { InviteRecord, VideoRulesConfig } from '../types';
+import {
+  fetchMediaDeliveryStatus,
+  getConfiguredS3ApiBaseUrl,
+  normalizeApiBaseUrl,
+  setConfiguredS3ApiBaseUrl,
+} from '../utils/media';
 import {
   claimOrUpdateStaticAdminPasscode,
   clearStaticAdminPasscode,
@@ -301,6 +312,8 @@ export function AdminPanelView() {
     purgeDemoUsers,
     refreshPublicUsersFromSupabase,
     mergeExternalUsers,
+    demoMigrationStatus,
+    migrateDemoToFirestore,
     firebaseUser,
     adminMemoryToken,
     setAdminMemoryToken,
@@ -362,6 +375,7 @@ export function AdminPanelView() {
 
   // Integrations test feedback
   const [awsTestStatus, setAwsTestStatus] = useState<string | null>(null);
+  const [s3ApiUrlInput, setS3ApiUrlInput] = useState<string>(() => getConfiguredS3ApiBaseUrl());
   const [supabaseTestStatus, setSupabaseTestStatus] = useState<string | null>(null);
   const [showSupabaseAnonKey, setShowSupabaseAnonKey] = useState(false);
   const [syncingSupabase, setSyncingSupabase] = useState(false);
@@ -1056,6 +1070,10 @@ export function AdminPanelView() {
       });
     }
 
+    if (normalizedPatch.aws) {
+      setConfiguredS3ApiBaseUrl(s3ApiUrlInput);
+    }
+
     const serverLive = authStatus.serverAvailable
       ? true
       : (await probeServerAuth()).serverAvailable;
@@ -1280,9 +1298,28 @@ export function AdminPanelView() {
 
         setTestingKey('aws');
         try {
+          const configuredExternalS3Api = normalizeApiBaseUrl(s3ApiUrlInput);
+          if (configuredExternalS3Api) {
+            setConfiguredS3ApiBaseUrl(configuredExternalS3Api);
+            const extStatus = await fetchMediaDeliveryStatus(configuredExternalS3Api);
+            if (extStatus?.awsCredentialsConfigured) {
+              setAwsTestStatus(
+                `Servidor Node S3 conectado em ${configuredExternalS3Api} (s3://${extStatus.bucket} · ${extStatus.region})${
+                  extStatus.cloudFrontActive ? ' · CloudFront ativo' : ''
+                }. Uploads de imagem e vídeo usarão este servidor.`
+              );
+              showToast(`Servidor Node S3 conectado (${extStatus.bucket})!`);
+              return;
+            }
+          }
+
           const origin = typeof window !== 'undefined' ? window.location.origin : 'este domínio';
           const s3Url = `https://${rawBucket}.s3.${rawRegion}.amazonaws.com/`;
-          const apiHint = probeResult.diag ? ` (/api retornou ${probeResult.diag})` : '';
+          const apiHint = configuredExternalS3Api
+            ? ` (a API ${configuredExternalS3Api}/api/media/status não respondeu como conectado)`
+            : probeResult.diag
+            ? ` (/api retornou ${probeResult.diag})`
+            : '';
           let cfNote = '';
           if (overview?.state.aws.cloudFrontEnabled && rawCf && rawCf !== 'cdn.lumina.social') {
             try {
@@ -2775,6 +2812,49 @@ ${itemsXml}
             ))}
           </div>
 
+          {/* Firestore Demo Migration Card */}
+          <div className="flex flex-col gap-3 rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0 space-y-1">
+              <div className="flex items-center gap-2">
+                <Cloud className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                <p className="text-sm font-semibold text-zinc-950 dark:text-white">
+                  Migrar usuários demo para Firestore
+                </p>
+              </div>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                Publica perfis, posts e stories demo no banco Firestore para ficarem visíveis em qualquer dispositivo.
+              </p>
+              {demoMigrationStatus.lastResult && (
+                <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                  Última execução: {demoMigrationStatus.lastResult.profilesMigrated} perfis,{' '}
+                  {demoMigrationStatus.lastResult.postsMigrated} posts e{' '}
+                  {demoMigrationStatus.lastResult.storiesMigrated} stories migrados (
+                  {demoMigrationStatus.lastResult.skipped} ignorados/já existentes).
+                </p>
+              )}
+              {demoMigrationStatus.error && (
+                <p className="text-xs font-medium text-rose-600 dark:text-rose-400">
+                  {demoMigrationStatus.error}
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              disabled={demoMigrationStatus.running}
+              onClick={() => void migrateDemoToFirestore()}
+              className="inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-xl bg-sky-600 px-4 text-xs font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${demoMigrationStatus.running ? 'animate-spin' : ''}`}
+              />
+              <span>
+                {demoMigrationStatus.running
+                  ? 'Migrando para Firestore...'
+                  : 'Migrar usuários demo para Firestore'}
+              </span>
+            </button>
+          </div>
+
           {/* Search & Filter */}
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex flex-1 items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 dark:border-zinc-800 dark:bg-zinc-950">
@@ -2847,7 +2927,7 @@ ${itemsXml}
                               src={user.avatarUrl}
                               alt={user.username}
                               size="sm"
-                              showOnlineIndicator={Boolean(user.isOnline)}
+                              showOnlineIndicator={isUserEffectivelyOnline(user, currentUser.id)}
                             />
                             <div className="min-w-0">
                               <div className="flex items-center gap-1">
@@ -3446,6 +3526,19 @@ ${itemsXml}
                     )
                   }
                   className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                />
+              </label>
+
+              <label className="block space-y-1 sm:col-span-2">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  URL do Servidor Node S3 (opcional — para sites estáticos ou Express externo)
+                </span>
+                <input
+                  type="url"
+                  value={s3ApiUrlInput}
+                  onChange={(e) => setS3ApiUrlInput(e.target.value)}
+                  placeholder="http://localhost:3000 ou https://api-s3.seudominio.com"
+                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 font-mono text-xs text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
                 />
               </label>
             </div>

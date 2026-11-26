@@ -289,6 +289,94 @@ function sendRealtimeToUserIds(userIds: string[], payload: Record<string, unknow
   }
 }
 
+function broadcastRealtimeEvent(payload: Record<string, unknown>, excludeUserIds: string[] = []): void {
+  const serialized = JSON.stringify(payload);
+  const excludeSockets = new Set<WebSocket>();
+  for (const uid of excludeUserIds) {
+    if (!uid) continue;
+    const set = wsClientsByUserId.get(uid);
+    if (!set) continue;
+    for (const sock of set) excludeSockets.add(sock);
+  }
+  const delivered = new Set<WebSocket>();
+  for (const sockets of wsClientsByUserId.values()) {
+    for (const sock of sockets) {
+      if (delivered.has(sock) || excludeSockets.has(sock)) continue;
+      if (sock.readyState === WebSocket.OPEN) {
+        try {
+          sock.send(serialized);
+          delivered.add(sock);
+        } catch {
+          // Ignore broken socket write
+        }
+      }
+    }
+  }
+}
+
+function resolveCallRecipientIds(toId: string, toUid?: string): string[] {
+  const ids = new Set<string>();
+  if (toId) ids.add(toId);
+  if (toUid) ids.add(toUid);
+  const social = readSharedSocialState();
+  if (social?.users) {
+    const matched = social.users.find(
+      (u) =>
+        (toId && String(u.id || '') === toId) ||
+        (toId && typeof u.uid === 'string' && u.uid === toId) ||
+        (toUid && (String(u.id || '') === toUid || u.uid === toUid))
+    );
+    if (matched) {
+      if (typeof matched.id === 'string' && matched.id) ids.add(matched.id);
+      if (typeof matched.uid === 'string' && matched.uid) ids.add(matched.uid);
+    }
+  }
+  return Array.from(ids);
+}
+
+function setUserPresenceInSharedState(
+  targetIds: string[],
+  isOnline: boolean,
+  lastActiveAtMs: number
+): { userId?: string; uid?: string; changed: boolean } {
+  const cleanIds = Array.from(new Set(targetIds.map((s) => s.trim()).filter(Boolean)));
+  if (cleanIds.length === 0) return { changed: false };
+  const idSet = new Set(cleanIds);
+  const social = readSharedSocialState();
+  if (!social) return { changed: false };
+  let matchedUserId: string | undefined;
+  let matchedUid: string | undefined;
+  let changed = false;
+
+  const updatedUsers = social.users.map((u) => {
+    const uid = typeof u.uid === 'string' ? u.uid : undefined;
+    const id = typeof u.id === 'string' ? u.id : undefined;
+    if ((id && idSet.has(id)) || (uid && idSet.has(uid))) {
+      matchedUserId = id;
+      matchedUid = uid;
+      if (u.isOnline !== isOnline || Number(u.lastActiveAtMs || 0) < lastActiveAtMs) {
+        changed = true;
+      }
+      return {
+        ...u,
+        isOnline,
+        lastActiveAtMs,
+      };
+    }
+    return u;
+  });
+
+  if (changed) {
+    writeSharedSocialState({
+      ...social,
+      version: (social.version || 0) + 1,
+      updatedAt: lastActiveAtMs,
+      users: updatedUsers,
+    });
+  }
+  return { userId: matchedUserId || cleanIds[0], uid: matchedUid, changed };
+}
+
 function enqueueCallSignalForUserIds(recipientIds: string[], signal: Record<string, unknown>): void {
   const now = Date.now();
   const cutoff = now - 45_000;
@@ -765,11 +853,23 @@ function mergeSharedUsersList(
       const incFollowers = Array.isArray(item.followers) ? item.followers : [];
       const prevFollowing = Array.isArray(prev.following) ? prev.following : [];
       const incFollowing = Array.isArray(item.following) ? item.following : [];
+      const prevActive = typeof prev.lastActiveAtMs === 'number' ? prev.lastActiveAtMs : 0;
+      const incActive = typeof item.lastActiveAtMs === 'number' ? item.lastActiveAtMs : 0;
+      const mergedIsOnline =
+        typeof item.isOnline === 'boolean' && (incActive >= prevActive || prev.isOnline === undefined)
+          ? item.isOnline
+          : typeof prev.isOnline === 'boolean'
+          ? prev.isOnline
+          : false;
+      const mergedLastActive = Math.max(prevActive, incActive) || undefined;
+
       list[matchIdx] = {
         ...prev,
         ...item,
         id: String(prev.id || item.id),
         uid: item.uid || prev.uid,
+        isOnline: mergedIsOnline,
+        ...(mergedLastActive ? { lastActiveAtMs: mergedLastActive } : {}),
         // Preserve existing moderation/verification flags against unauthenticated sync payloads
         verified: prev.verified !== undefined ? Boolean(prev.verified) : Boolean(item.verified),
         boosted: prev.boosted !== undefined ? Boolean(prev.boosted) : Boolean(item.boosted),
@@ -1293,7 +1393,10 @@ function injectLinkPreviewMeta(html: string, req: Request): string {
     );
 }
 
-const ALLOWED_MEDIA_MIME_EXT: Record<string, { ext: string; kind: 'video' | 'image' }> = {
+const ALLOWED_MEDIA_MIME_EXT: Record<
+  string,
+  { ext: string; kind: 'video' | 'image' | 'audio' | 'file' }
+> = {
   'video/mp4': { ext: 'mp4', kind: 'video' },
   'video/webm': { ext: 'webm', kind: 'video' },
   'video/quicktime': { ext: 'mov', kind: 'video' },
@@ -1310,11 +1413,44 @@ const ALLOWED_MEDIA_MIME_EXT: Record<string, { ext: string; kind: 'video' | 'ima
   'image/png': { ext: 'png', kind: 'image' },
   'image/webp': { ext: 'webp', kind: 'image' },
   'image/gif': { ext: 'gif', kind: 'image' },
+  'audio/webm': { ext: 'weba', kind: 'audio' },
+  'audio/mpeg': { ext: 'mp3', kind: 'audio' },
+  'audio/mp3': { ext: 'mp3', kind: 'audio' },
+  'audio/mp4': { ext: 'm4a', kind: 'audio' },
+  'audio/x-m4a': { ext: 'm4a', kind: 'audio' },
+  'audio/ogg': { ext: 'ogg', kind: 'audio' },
+  'audio/wav': { ext: 'wav', kind: 'audio' },
+  'audio/x-wav': { ext: 'wav', kind: 'audio' },
+  'audio/aac': { ext: 'aac', kind: 'audio' },
+  'audio/opus': { ext: 'opus', kind: 'audio' },
+  'audio/flac': { ext: 'flac', kind: 'audio' },
+  'application/pdf': { ext: 'pdf', kind: 'file' },
+  'text/plain': { ext: 'txt', kind: 'file' },
+  'text/csv': { ext: 'csv', kind: 'file' },
+  'application/json': { ext: 'json', kind: 'file' },
+  'application/zip': { ext: 'zip', kind: 'file' },
+  'application/x-zip-compressed': { ext: 'zip', kind: 'file' },
+  'application/msword': { ext: 'doc', kind: 'file' },
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
+    ext: 'docx',
+    kind: 'file',
+  },
+  'application/vnd.ms-excel': { ext: 'xls', kind: 'file' },
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': {
+    ext: 'xlsx',
+    kind: 'file',
+  },
+  'application/vnd.ms-powerpoint': { ext: 'ppt', kind: 'file' },
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': {
+    ext: 'pptx',
+    kind: 'file',
+  },
 };
 
 const EXT_TO_CONTENT_TYPE: Record<string, string> = {
   mp4: 'video/mp4',
   webm: 'video/webm',
+  weba: 'audio/webm',
   mov: 'video/quicktime',
   m4v: 'video/x-m4v',
   ogv: 'video/ogg',
@@ -1326,6 +1462,24 @@ const EXT_TO_CONTENT_TYPE: Record<string, string> = {
   png: 'image/png',
   webp: 'image/webp',
   gif: 'image/gif',
+  mp3: 'audio/mpeg',
+  m4a: 'audio/mp4',
+  ogg: 'audio/ogg',
+  wav: 'audio/wav',
+  aac: 'audio/aac',
+  opus: 'audio/opus',
+  flac: 'audio/flac',
+  pdf: 'application/pdf',
+  txt: 'text/plain; charset=utf-8',
+  csv: 'text/csv; charset=utf-8',
+  json: 'application/json',
+  zip: 'application/zip',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 };
 
 let resolvedUploadsDirCache: string | null = null;
@@ -1355,7 +1509,7 @@ interface PendingChunkUpload {
   objectKey: string;
   fileName: string;
   contentType: string;
-  kind: 'video' | 'image';
+  kind: 'video' | 'image' | 'audio' | 'file';
   expectedBytes: number;
   receivedBytes: number;
   nextIndex: number;
@@ -1393,6 +1547,11 @@ async function startServer() {
   const httpServer = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true });
   app.use(express.json({ limit: '4mb' }));
+  app.use(['/api/site/meta', '/api/social'], (_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    next();
+  });
 
   httpServer.on('upgrade', (req, socket, head) => {
     try {
@@ -1434,6 +1593,18 @@ async function startServer() {
       set.add(ws);
     }
 
+    if (boundIds.length > 0) {
+      const now = Date.now();
+      const pres = setUserPresenceInSharedState(boundIds, true, now);
+      broadcastRealtimeEvent({
+        type: 'presence_update',
+        userId: pres.userId || boundIds[0],
+        uid: pres.uid || boundIds[1],
+        isOnline: true,
+        lastActiveAtMs: now,
+      });
+    }
+
     ws.on('message', (rawData) => {
       try {
         const parsed = JSON.parse(String(rawData || '')) as {
@@ -1466,7 +1637,7 @@ async function startServer() {
             return;
           }
 
-          enqueueCallSignalForUserIds([toId, toUid].filter(Boolean), sig);
+          enqueueCallSignalForUserIds(resolveCallRecipientIds(toId, toUid), sig);
         }
       } catch {
         // Ignore malformed client WS frame
@@ -1474,11 +1645,24 @@ async function startServer() {
     });
 
     ws.on('close', () => {
+      let anyStillConnected = false;
       for (const uid of boundIds) {
         const set = wsClientsByUserId.get(uid);
         if (!set) continue;
         set.delete(ws);
         if (set.size === 0) wsClientsByUserId.delete(uid);
+        else anyStillConnected = true;
+      }
+      if (boundIds.length > 0 && !anyStillConnected) {
+        const now = Date.now();
+        const pres = setUserPresenceInSharedState(boundIds, false, now);
+        broadcastRealtimeEvent({
+          type: 'presence_update',
+          userId: pres.userId || boundIds[0],
+          uid: pres.uid || boundIds[1],
+          isOnline: false,
+          lastActiveAtMs: now,
+        });
       }
     });
   });
@@ -1599,7 +1783,7 @@ async function startServer() {
     if (!spec) {
       res.status(415).json({
         error:
-          'Formato de mídia não suportado. Envie MP4, WebM, MOV, M4V, 3GP, MKV, JPG, PNG ou WebP.',
+          'Formato de arquivo não suportado para envio na nuvem.',
       });
       return;
     }
@@ -1611,12 +1795,18 @@ async function startServer() {
     }
 
     const maxVideoBytes = state.site.videoRules.maxVideoSizeMB * 1024 * 1024;
-    const maxImageBytes = 15 * 1024 * 1024;
-    const maxAllowedBytes = spec.kind === 'video' ? maxVideoBytes : maxImageBytes;
+    const maxAudioBytes = 30 * 1024 * 1024;
+    const maxOtherBytes = 25 * 1024 * 1024;
+    const maxAllowedBytes =
+      spec.kind === 'video' ? maxVideoBytes : spec.kind === 'audio' ? maxAudioBytes : maxOtherBytes;
     if (totalBytes > maxAllowedBytes) {
       res.status(413).json({
         error: `Arquivo excede o limite de ${
-          spec.kind === 'video' ? `${state.site.videoRules.maxVideoSizeMB} MB` : '15 MB'
+          spec.kind === 'video'
+            ? `${state.site.videoRules.maxVideoSizeMB} MB`
+            : spec.kind === 'audio'
+            ? '30 MB'
+            : '25 MB'
         }.`,
       });
       return;
@@ -1849,7 +2039,7 @@ async function startServer() {
       if (!spec) {
         res.status(415).json({
           error:
-            'Formato de mídia não suportado. Envie MP4, WebM, MOV, M4V, 3GP, MKV, JPG, PNG ou WebP.',
+            'Formato de arquivo não suportado para envio na nuvem.',
         });
         return;
       }
@@ -1861,12 +2051,18 @@ async function startServer() {
       }
 
       const maxVideoBytes = state.site.videoRules.maxVideoSizeMB * 1024 * 1024;
-      const maxImageBytes = 15 * 1024 * 1024;
-      const maxAllowedBytes = spec.kind === 'video' ? maxVideoBytes : maxImageBytes;
+      const maxAudioBytes = 30 * 1024 * 1024;
+      const maxOtherBytes = 25 * 1024 * 1024;
+      const maxAllowedBytes =
+        spec.kind === 'video' ? maxVideoBytes : spec.kind === 'audio' ? maxAudioBytes : maxOtherBytes;
       if (bodyBuffer.length > maxAllowedBytes) {
         res.status(413).json({
           error: `Arquivo excede o limite de ${
-            spec.kind === 'video' ? `${state.site.videoRules.maxVideoSizeMB} MB` : '15 MB'
+            spec.kind === 'video'
+              ? `${state.site.videoRules.maxVideoSizeMB} MB`
+              : spec.kind === 'audio'
+              ? '30 MB'
+              : '25 MB'
           }.`,
         });
         return;
@@ -1988,7 +2184,7 @@ async function startServer() {
   app.get('/api/media/file/:filename', (req, res) => {
     const filename = String(req.params.filename || '').trim();
     const match = filename.match(
-      /^([a-zA-Z0-9_-]{4,80})\.(mp4|webm|mov|m4v|ogv|3gp|3g2|mkv|mpg|jpg|png|webp|gif)$/i
+      /^([a-zA-Z0-9_-]{4,80})\.(mp4|webm|weba|mov|m4v|ogv|3gp|3g2|mkv|mpg|jpg|png|webp|gif|mp3|m4a|ogg|wav|aac|opus|flac|pdf|txt|csv|json|zip|doc|docx|xls|xlsx|ppt|pptx)$/i
     );
     if (!match) {
       res.status(400).json({ error: 'Nome de arquivo inválido.' });
@@ -3011,6 +3207,7 @@ async function startServer() {
     state.site.updateHistory = state.site.updateHistory.slice(0, 20);
 
     writeAdminState(state);
+    broadcastRealtimeEvent({ type: 'site_meta_update', updatedAt: Date.now() });
     res.json({ ok: true, site: state.site });
   });
 
@@ -3039,6 +3236,7 @@ async function startServer() {
       }
     }
     writeAdminState(state);
+    broadcastRealtimeEvent({ type: 'site_meta_update', updatedAt: Date.now() });
     res.json({ ok: true, site: state.site });
   });
 
@@ -3675,10 +3873,11 @@ async function startServer() {
 
     let sbPosts: Record<string, unknown>[] = [];
     let sbStories: Record<string, unknown>[] = [];
-    if (adminState.supabase.projectUrl && publicFields.id) {
+    if (adminState.supabase.projectUrl && targetIds.size > 0) {
+      const targetIdList = Array.from(targetIds);
       [sbPosts, sbStories] = await Promise.all([
-        fetchPublicPostsFromSupabase(adminState.supabase, String(publicFields.id)),
-        fetchPublicStoriesFromSupabase(adminState.supabase, String(publicFields.id)),
+        fetchPublicPostsFromSupabase(adminState.supabase, targetIdList),
+        fetchPublicStoriesFromSupabase(adminState.supabase, targetIdList),
       ]);
     }
 
@@ -3704,7 +3903,7 @@ async function startServer() {
     if (
       adminState.supabase.autoSyncUsers &&
       adminState.supabase.projectUrl &&
-      (!supabaseUsersCache || Date.now() - supabaseUsersCache.fetchedAt > 10_000)
+      (!supabaseUsersCache || Date.now() - supabaseUsersCache.fetchedAt > 1_500)
     ) {
       const sbUsers = await fetchPublicRealUsersFromSupabase(adminState.supabase);
       supabaseUsersCache = { fetchedAt: Date.now(), users: sbUsers };
@@ -3713,7 +3912,7 @@ async function startServer() {
     if (
       adminState.supabase.autoSyncPosts &&
       adminState.supabase.projectUrl &&
-      (!supabaseContentCache || Date.now() - supabaseContentCache.fetchedAt > 10_000)
+      (!supabaseContentCache || Date.now() - supabaseContentCache.fetchedAt > 1_500)
     ) {
       const [sbPosts, sbStories] = await Promise.all([
         fetchPublicPostsFromSupabase(adminState.supabase),
@@ -3869,6 +4068,38 @@ async function startServer() {
       updatedAt: now,
       userFlags: nextUserFlags,
     });
+    broadcastRealtimeEvent({ type: 'social_update', scope: 'users', updatedAt: now });
+  });
+
+  // Real-time presence heartbeat & immediate online/offline endpoint (supports JSON & sendBeacon text/plain)
+  app.post('/api/social/presence', express.text({ type: 'text/plain', limit: '8kb' }), (req, res) => {
+    let body: Record<string, unknown> = {};
+    if (typeof req.body === 'string') {
+      try {
+        body = JSON.parse(req.body) as Record<string, unknown>;
+      } catch {
+        body = {};
+      }
+    } else if (req.body && typeof req.body === 'object') {
+      body = req.body as Record<string, unknown>;
+    }
+    const userId = typeof body.userId === 'string' ? body.userId.trim().slice(0, 128) : '';
+    const uid = typeof body.uid === 'string' ? body.uid.trim().slice(0, 128) : '';
+    if (!userId && !uid) {
+      res.status(400).json({ error: 'userId obrigatório.' });
+      return;
+    }
+    const isOnline = body.isOnline !== false;
+    const now = Date.now();
+    const resPres = setUserPresenceInSharedState([userId, uid].filter(Boolean), isOnline, now);
+    broadcastRealtimeEvent({
+      type: 'presence_update',
+      userId: resPres.userId || userId,
+      uid: resPres.uid || (uid || undefined),
+      isOnline,
+      lastActiveAtMs: now,
+    });
+    res.json({ ok: true, isOnline, lastActiveAtMs: now });
   });
 
   app.put('/api/social/state', express.json({ limit: '10mb' }), (req, res) => {
@@ -3924,6 +4155,17 @@ async function startServer() {
       ),
     };
     writeSharedSocialState(nextState);
+    const senderScopeIds = incomingUsers
+      .slice(0, 2)
+      .flatMap((u) => [
+        typeof u.id === 'string' ? u.id : '',
+        typeof u.uid === 'string' ? u.uid : '',
+      ])
+      .filter(Boolean);
+    broadcastRealtimeEvent(
+      { type: 'social_update', scope: 'all', updatedAt: nextState.updatedAt },
+      senderScopeIds
+    );
     res.json({ ok: true, version: nextState.version, updatedAt: nextState.updatedAt });
   });
 
@@ -4032,6 +4274,7 @@ async function startServer() {
       }
       synced = sbRes.synced;
     }
+    broadcastRealtimeEvent({ type: 'social_update', scope: 'posts', updatedAt: Date.now() });
     res.json({ ok: true, supabaseSynced: synced });
   });
 
@@ -4056,6 +4299,7 @@ async function startServer() {
     if (adminState.supabase.projectUrl) {
       await deletePostFromSupabase(adminState.supabase, postId);
     }
+    broadcastRealtimeEvent({ type: 'social_update', scope: 'posts', updatedAt: Date.now() });
     res.json({ ok: true });
   });
 
@@ -4108,6 +4352,7 @@ async function startServer() {
         synced = await upsertStoryToSupabase(adminState.supabase, storyPayload);
       }
     }
+    broadcastRealtimeEvent({ type: 'social_update', scope: 'stories', updatedAt: Date.now() });
     res.json({ ok: true, supabaseSynced: synced });
   });
 
@@ -4541,7 +4786,7 @@ async function startServer() {
       return;
     }
 
-    enqueueCallSignalForUserIds([toId, toUid].filter(Boolean), signal);
+    enqueueCallSignalForUserIds(resolveCallRecipientIds(toId, toUid), signal);
     res.json({ ok: true });
   });
 
@@ -4619,6 +4864,7 @@ async function startServer() {
         following: Array.isArray(patch.following) ? (patch.following as string[]) : undefined,
       });
     }
+    broadcastRealtimeEvent({ type: 'social_update', scope: 'users', updatedAt: Date.now() });
     res.json({ ok: true, supabaseSynced: synced });
   });
 

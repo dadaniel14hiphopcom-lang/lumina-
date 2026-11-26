@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useSocial } from '../context/SocialContext';
+import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import { formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -64,7 +64,7 @@ export function NotificationsView() {
                       src={actor.avatarUrl}
                       alt={actor.username}
                       size="md"
-                      showOnlineIndicator={Boolean(actor.isOnline)}
+                      showOnlineIndicator={isUserEffectivelyOnline(actor, currentUser.id)}
                       onClick={() => openProfile(actor.id)}
                     />
                   </ProfileHoverCard>

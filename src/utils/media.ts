@@ -80,7 +80,57 @@ export interface MediaUploadFallback {
   fallbackNeeded: true;
 }
 
-function inferMediaMimeType(blob: Blob, fileName?: string): string {
+const S3_API_BASE_STORAGE_KEY = 'lumina_s3_api_base_url';
+
+export function normalizeApiBaseUrl(raw?: string | null): string {
+  const trimmed = (raw || '').trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
+    }
+    return parsed.origin + parsed.pathname.replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+}
+
+export function getConfiguredS3ApiBaseUrl(): string {
+  const envUrl =
+    typeof import.meta !== 'undefined' &&
+    import.meta.env &&
+    typeof import.meta.env.VITE_S3_API_URL === 'string'
+      ? normalizeApiBaseUrl(import.meta.env.VITE_S3_API_URL)
+      : '';
+  if (typeof window !== 'undefined') {
+    try {
+      const stored = normalizeApiBaseUrl(window.localStorage.getItem(S3_API_BASE_STORAGE_KEY));
+      if (stored) return stored;
+    } catch {
+      // Ignore storage access errors
+    }
+  }
+  return envUrl;
+}
+
+export function setConfiguredS3ApiBaseUrl(rawUrl: string): string {
+  const normalized = normalizeApiBaseUrl(rawUrl);
+  if (typeof window !== 'undefined') {
+    try {
+      if (normalized) {
+        window.localStorage.setItem(S3_API_BASE_STORAGE_KEY, normalized);
+      } else {
+        window.localStorage.removeItem(S3_API_BASE_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage access errors
+    }
+  }
+  return normalized;
+}
+
+export function inferMediaMimeType(blob: Blob, fileName?: string): string {
   const raw = (blob.type || '').split(';')[0].trim().toLowerCase();
   if (
     raw &&
@@ -91,17 +141,36 @@ function inferMediaMimeType(blob: Blob, fileName?: string): string {
   }
   const ext = (fileName || '').split('.').pop()?.toLowerCase() || '';
   if (ext === 'webm') return 'video/webm';
+  if (ext === 'weba') return 'audio/webm';
   if (ext === 'mov') return 'video/quicktime';
   if (ext === 'm4v') return 'video/x-m4v';
-  if (ext === 'ogg' || ext === 'ogv') return 'video/ogg';
+  if (ext === 'ogv') return 'video/ogg';
   if (ext === '3gp') return 'video/3gpp';
   if (ext === '3g2') return 'video/3gpp2';
   if (ext === 'mkv') return 'video/x-matroska';
   if (ext === 'mpg' || ext === 'mpeg') return 'video/mpeg';
+  if (ext === 'mp3') return 'audio/mpeg';
+  if (ext === 'm4a') return 'audio/mp4';
+  if (ext === 'ogg' || ext === 'oga') return 'audio/ogg';
+  if (ext === 'wav') return 'audio/wav';
+  if (ext === 'aac') return 'audio/aac';
+  if (ext === 'opus') return 'audio/opus';
+  if (ext === 'flac') return 'audio/flac';
   if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
   if (ext === 'png') return 'image/png';
   if (ext === 'webp') return 'image/webp';
   if (ext === 'gif') return 'image/gif';
+  if (ext === 'pdf') return 'application/pdf';
+  if (ext === 'txt') return 'text/plain';
+  if (ext === 'csv') return 'text/csv';
+  if (ext === 'json') return 'application/json';
+  if (ext === 'zip') return 'application/zip';
+  if (ext === 'doc') return 'application/msword';
+  if (ext === 'docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (ext === 'xls') return 'application/vnd.ms-excel';
+  if (ext === 'xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  if (ext === 'ppt') return 'application/vnd.ms-powerpoint';
+  if (ext === 'pptx') return 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
   return 'video/mp4';
 }
 
@@ -122,13 +191,34 @@ function isStaticSpaFallbackResponse(res: Response): boolean {
   return false;
 }
 
-export async function fetchMediaDeliveryStatus(): Promise<MediaStatusInfo | null> {
+export async function fetchMediaDeliveryStatus(
+  apiBaseUrlOverride?: string
+): Promise<MediaStatusInfo | null> {
+  const baseUrl = normalizeApiBaseUrl(apiBaseUrlOverride) || getConfiguredS3ApiBaseUrl();
   try {
-    const res = await fetch('/api/media/status');
+    const res = await fetch(`${baseUrl}/api/media/status`, { cache: 'no-store' });
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (!res.ok || !ct.includes('application/json')) return null;
-    const data = (await res.json()) as MediaStatusInfo;
-    return data && typeof data.uploadAvailable === 'boolean' ? data : null;
+    const raw = (await res.json()) as Partial<MediaStatusInfo> & {
+      ok?: boolean;
+      cloudFrontDomain?: string | null;
+    };
+    if (typeof raw.uploadAvailable === 'boolean') {
+      return raw as MediaStatusInfo;
+    }
+    if (typeof raw.awsCredentialsConfigured === 'boolean') {
+      return {
+        uploadAvailable: Boolean(raw.ok ?? raw.awsCredentialsConfigured),
+        storageProvider: raw.awsCredentialsConfigured ? 'aws-s3' : 'server-disk',
+        awsCredentialsConfigured: raw.awsCredentialsConfigured,
+        s3Enabled: Boolean(raw.ok ?? raw.awsCredentialsConfigured),
+        cloudFrontActive: Boolean(raw.cloudFrontDomain),
+        region: raw.region || 'sa-east-1',
+        bucket: raw.bucket || 'lumina-media-prod',
+        maxVideoSizeMB: raw.maxVideoSizeMB,
+      };
+    }
+    return null;
   } catch {
     return null;
   }

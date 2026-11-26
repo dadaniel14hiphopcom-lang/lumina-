@@ -9,7 +9,7 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
-import { useSocial } from '../context/SocialContext';
+import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import { PostCategory } from '../types';
 import { isVideoAsset, resolvePlayableMediaUrl } from '../utils/media';
 import { formatCompactCount } from '../utils/time';
@@ -32,6 +32,7 @@ export function ExploreView() {
     posts,
     users,
     allUsers,
+    currentUser,
     getUserById,
     refreshPublicUsersFromSupabase,
     exploreQuery,
@@ -204,7 +205,7 @@ export function ExploreView() {
                     src={u.avatarUrl}
                     alt={u.username}
                     size="sm"
-                    showOnlineIndicator={Boolean(u.isOnline)}
+                    showOnlineIndicator={isUserEffectivelyOnline(u, currentUser.id)}
                   />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1">

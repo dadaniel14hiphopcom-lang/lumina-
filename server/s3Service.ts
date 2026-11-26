@@ -132,12 +132,15 @@ export function isSafeS3ObjectKey(key: string): boolean {
   return /^[a-zA-Z0-9/_.-]{4,240}$/.test(clean);
 }
 
-export function buildReelObjectKey(ext: string, kind: 'video' | 'image' = 'video'): string {
+export function buildReelObjectKey(
+  ext: string,
+  kind: 'video' | 'image' | 'audio' | 'file' = 'video'
+): string {
   const safeExt = ext
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]/g, '')
-    .slice(0, 8) || (kind === 'video' ? 'mp4' : 'jpg');
+    .slice(0, 8) || (kind === 'video' ? 'mp4' : kind === 'audio' ? 'weba' : kind === 'file' ? 'bin' : 'jpg');
   const now = new Date();
   const ym = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
   const uniqueId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;

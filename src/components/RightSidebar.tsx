@@ -12,7 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import React, { useMemo, useState } from 'react';
-import { useSocial } from '../context/SocialContext';
+import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import { formatCompactCount } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { ProfileHoverCard } from './ProfileHoverCard';
@@ -149,7 +149,7 @@ export function RightSidebar() {
                   src={currentUser.avatarUrl}
                   alt={currentUser.username}
                   size="md"
-                  showOnlineIndicator={Boolean(currentUser.isOnline)}
+                  showOnlineIndicator={isUserEffectivelyOnline(currentUser, currentUser.id)}
                 />
                 <div className="min-w-0">
                   <div className="flex items-center gap-1">
@@ -244,7 +244,7 @@ export function RightSidebar() {
                             src={user.avatarUrl}
                             alt={user.username}
                             size="sm"
-                            showOnlineIndicator={Boolean(user.isOnline)}
+                            showOnlineIndicator={isUserEffectivelyOnline(user, currentUser.id)}
                           />
                           <div className="min-w-0">
                             <div className="flex items-center gap-1">
@@ -306,7 +306,7 @@ export function RightSidebar() {
                         src={user.avatarUrl}
                         alt={user.username}
                         size="sm"
-                        showOnlineIndicator={Boolean(user.isOnline)}
+                        showOnlineIndicator={isUserEffectivelyOnline(user, currentUser.id)}
                       />
                       <div className="min-w-0">
                         <div className="flex items-center gap-1">

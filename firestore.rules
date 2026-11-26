@@ -51,7 +51,7 @@ service cloud.firestore {
       ]) &&
       data.keys().hasOnly([
         'id', 'uid', 'username', 'displayName', 'avatarUrl', 'coverUrl', 'bio', 'website',
-        'verified', 'isOnline', 'isDemoSeed', 'restricted', 'boosted',
+        'verified', 'isOnline', 'lastActiveAtMs', 'isDemoSeed', 'restricted', 'boosted',
         'followers', 'following', 'createdAtMs', 'createdAt', 'updatedAt'
       ]) &&
       isValidId(data.id) &&
@@ -64,6 +64,7 @@ service cloud.firestore {
       (!('website' in data) || (data.website is string && data.website.size() <= 200)) &&
       data.verified is bool &&
       data.isOnline is bool &&
+      (!('lastActiveAtMs' in data) || (data.lastActiveAtMs is number && data.lastActiveAtMs >= 0)) &&
       data.isDemoSeed is bool &&
       data.restricted is bool &&
       data.boosted is bool &&
@@ -249,6 +250,44 @@ service cloud.firestore {
       data.createdAt is timestamp;
     }
 
+    function isValidCallSignal(data) {
+      return data.keys().hasAll([
+        'id', 'callId', 'type', 'fromUserId', 'fromUid',
+        'toUserId', 'toUid', 'participantUids', 'consumed',
+        'createdAtMs', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'callId', 'type', 'fromUserId', 'fromUid',
+        'fromUsername', 'fromDisplayName', 'fromAvatarUrl',
+        'toUserId', 'toUid', 'participantUids', 'callType', 'threadId',
+        'sdp', 'candidate', 'reason', 'micMuted', 'camOff',
+        'consumed', 'createdAtMs', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.callId is string && data.callId.size() >= 1 && data.callId.size() <= 128 &&
+      data.type in ['call:invite', 'call:answer', 'call:ice', 'call:reject', 'call:end', 'call:busy', 'call:media-state'] &&
+      isValidId(data.fromUserId) &&
+      isValidId(data.fromUid) &&
+      (!('fromUsername' in data) || (data.fromUsername is string && data.fromUsername.size() <= 40)) &&
+      (!('fromDisplayName' in data) || (data.fromDisplayName is string && data.fromDisplayName.size() <= 80)) &&
+      (!('fromAvatarUrl' in data) || (data.fromAvatarUrl is string && data.fromAvatarUrl.size() <= 450000)) &&
+      isValidId(data.toUserId) &&
+      isValidId(data.toUid) &&
+      data.participantUids is list && data.participantUids.size() >= 1 && data.participantUids.size() <= 6 &&
+      data.participantUids[0] is string &&
+      (!('callType' in data) || data.callType in ['audio', 'video']) &&
+      (!('threadId' in data) || (data.threadId is string && data.threadId.size() <= 128)) &&
+      (!('sdp' in data) || data.sdp is map) &&
+      (!('candidate' in data) || data.candidate is map) &&
+      (!('reason' in data) || (data.reason is string && data.reason.size() <= 120)) &&
+      (!('micMuted' in data) || data.micMuted is bool) &&
+      (!('camOff' in data) || data.camOff is bool) &&
+      data.consumed is bool &&
+      data.createdAtMs is number &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
     // Connectivity probe doc
     match /test/{docId} {
       allow get: if isValidId(docId) && isSignedIn();
@@ -265,12 +304,17 @@ service cloud.firestore {
       allow create: if isVerifiedUser() &&
         isValidId(profileId) &&
         isValidPublicProfile(incoming()) &&
-        incoming().uid == request.auth.uid &&
-        incoming().verified == false &&
-        incoming().boosted == false &&
-        incoming().restricted == false &&
         incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time;
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            incoming().uid == request.auth.uid &&
+            incoming().verified == false &&
+            incoming().boosted == false &&
+            incoming().restricted == false &&
+            incoming().isDemoSeed == false
+          )
+        );
       allow update: if isVerifiedUser() &&
         isValidId(profileId) &&
         isValidPublicProfile(incoming()) &&
@@ -286,7 +330,7 @@ service cloud.firestore {
             incoming().boosted == existing().boosted &&
             incoming().restricted == existing().restricted &&
             incoming().diff(existing()).affectedKeys().hasOnly([
-              'username', 'displayName', 'avatarUrl', 'coverUrl', 'bio', 'website', 'isOnline', 'following', 'updatedAt'
+              'username', 'displayName', 'avatarUrl', 'coverUrl', 'bio', 'website', 'isOnline', 'lastActiveAtMs', 'following', 'updatedAt'
             ])
           ) ||
           (
@@ -327,7 +371,7 @@ service cloud.firestore {
       allow create: if isVerifiedUser() &&
         isValidId(postId) &&
         isValidPost(incoming()) &&
-        incoming().authorUid == request.auth.uid &&
+        (incoming().authorUid == request.auth.uid || isAdmin()) &&
         exists(/databases/$(database)/documents/profiles/$(incoming().authorId)) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
@@ -365,7 +409,7 @@ service cloud.firestore {
       allow create: if isVerifiedUser() &&
         isValidId(storyId) &&
         isValidStory(incoming()) &&
-        incoming().authorUid == request.auth.uid &&
+        (incoming().authorUid == request.auth.uid || isAdmin()) &&
         exists(/databases/$(database)/documents/profiles/$(incoming().authorId)) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
@@ -517,6 +561,51 @@ service cloud.firestore {
           )
         );
       allow update, delete: if isValidId(uid) && isAdmin();
+    }
+
+    // Cross-device WebRTC Call Signaling
+    match /call_signals/{signalId} {
+      allow get: if isValidId(signalId) && isVerifiedUser() && (
+        request.auth.uid in existing().participantUids ||
+        existing().fromUid == request.auth.uid ||
+        existing().toUid == request.auth.uid ||
+        isAdmin()
+      );
+      allow list: if isVerifiedUser() && (
+        request.auth.uid in existing().participantUids ||
+        existing().fromUid == request.auth.uid ||
+        existing().toUid == request.auth.uid ||
+        isBootstrappedAdmin()
+      );
+      allow create: if isVerifiedUser() &&
+        isValidId(signalId) &&
+        isValidCallSignal(incoming()) &&
+        incoming().fromUid == request.auth.uid &&
+        request.auth.uid in incoming().participantUids &&
+        incoming().consumed == false &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser() &&
+        isValidId(signalId) &&
+        isValidCallSignal(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().callId == existing().callId &&
+        incoming().fromUid == existing().fromUid &&
+        incoming().participantUids == existing().participantUids &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            request.auth.uid in existing().participantUids &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['consumed', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(signalId) && isVerifiedUser() && (
+        request.auth.uid in existing().participantUids ||
+        existing().fromUid == request.auth.uid ||
+        existing().toUid == request.auth.uid ||
+        isAdmin()
+      );
     }
   }
 }

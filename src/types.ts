@@ -27,6 +27,7 @@ export interface UserProfile {
   website?: string;
   verified?: boolean;
   isOnline?: boolean;
+  lastActiveAtMs?: number;
   isDemoSeed?: boolean;
   restricted?: boolean;
   boosted?: boolean;

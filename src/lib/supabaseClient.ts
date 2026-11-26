@@ -20,7 +20,7 @@ export interface BrowserSupabaseSession {
 }
 
 const SELECT_USERS_EXTENDED =
-  'id,auth_uid,username,display_name,bio,website,avatar_url,cover_url,verified,boosted,restricted,followers,following,created_at';
+  'id,auth_uid,username,display_name,bio,website,avatar_url,cover_url,verified,boosted,restricted,followers,following,updated_at,created_at';
 const SELECT_USERS_CORE =
   'id,auth_uid,username,display_name,bio,avatar_url,cover_url,verified,boosted,restricted,created_at';
 
@@ -677,7 +677,7 @@ function compactBrowserAttachmentUrl(raw?: string, maxDataLen = 450_000): string
   if (/^https?:\/\//i.test(trimmed)) return trimmed.slice(0, 1000);
   if (/^\/[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]+$/.test(trimmed)) return trimmed.slice(0, 300);
   if (
-    /^data:(?:image\/(?:png|jpeg|jpg|webp|gif)|application\/pdf|text\/plain|text\/csv|application\/zip|application\/x-zip-compressed|application\/msword|application\/vnd\.|application\/octet-stream);/i.test(
+    /^data:(?:image\/(?:png|jpeg|jpg|webp|gif)|audio\/(?:webm|ogg|mp4|mpeg|wav|aac)|video\/(?:mp4|webm|quicktime)|application\/(?:pdf|json|zip|x-zip-compressed|msword|octet-stream)|text\/(?:plain|csv)|application\/vnd\.);/i.test(
       trimmed
     ) &&
     trimmed.length <= maxDataLen
@@ -1490,6 +1490,12 @@ function parseStringArray(val: unknown): string[] {
 
 function mapBrowserSupabaseUserRow(r: Record<string, unknown>): UserProfile {
   const username = String(r.username || '');
+  const updatedMs =
+    typeof r.last_active_at === 'string'
+      ? Date.parse(r.last_active_at)
+      : typeof r.updated_at === 'string'
+      ? Date.parse(r.updated_at)
+      : undefined;
   return {
     id: String(r.id || ''),
     uid: typeof r.auth_uid === 'string' && r.auth_uid ? r.auth_uid : undefined,
@@ -1508,7 +1514,9 @@ function mapBrowserSupabaseUserRow(r: Record<string, unknown>): UserProfile {
     verified: Boolean(r.verified),
     boosted: Boolean(r.boosted),
     restricted: Boolean(r.restricted),
-    isOnline: false,
+    isOnline: typeof r.is_online === 'boolean' ? r.is_online : undefined,
+    lastActiveAtMs:
+      typeof updatedMs === 'number' && Number.isFinite(updatedMs) ? updatedMs : undefined,
     isDemoSeed: false,
     followers: parseStringArray(r.followers),
     following: parseStringArray(r.following),
@@ -1829,18 +1837,39 @@ function mapBrowserSupabasePostRow(r: Record<string, unknown>): Post | null {
 
 export async function fetchPublicPostsFromSupabaseBrowser(
   config: BrowserSupabaseConfig,
-  authorIdFilter?: string
+  authorIdFilter?: string | string[]
 ): Promise<Post[]> {
   if (!config.anonKey || isServiceRoleOrSecretKey(config.anonKey)) return [];
   try {
     const origin = normalizeSupabaseOrigin(config.projectUrl);
     const schema = sanitizeSupabaseSchemaName(config.schemaName);
-    const authorClause = authorIdFilter
-      ? `&author_id=eq.${encodeURIComponent(authorIdFilter)}`
-      : '';
+    const ids = (
+      Array.isArray(authorIdFilter)
+        ? authorIdFilter
+        : authorIdFilter
+        ? [authorIdFilter]
+        : []
+    )
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const cleanIds = Array.from(new Set(ids));
+    const quotedList = cleanIds.map((id) => `"${id.replace(/"/g, '')}"`).join(',');
+    const extendedAuthorClause =
+      cleanIds.length === 1
+        ? `&or=(author_id.eq.${encodeURIComponent(cleanIds[0])},author_uid.eq.${encodeURIComponent(cleanIds[0])})`
+        : cleanIds.length > 1
+        ? `&or=(author_id.in.(${encodeURIComponent(quotedList)}),author_uid.in.(${encodeURIComponent(quotedList)}))`
+        : '';
+    const coreAuthorClause =
+      cleanIds.length === 1
+        ? `&author_id=eq.${encodeURIComponent(cleanIds[0])}`
+        : cleanIds.length > 1
+        ? `&author_id=in.(${encodeURIComponent(quotedList)})`
+        : '';
     const urls = [
-      `${origin}/rest/v1/lumina_posts?select=${SELECT_POSTS_EXTENDED}${authorClause}&order=created_at.desc&limit=150`,
-      `${origin}/rest/v1/lumina_posts?select=${SELECT_POSTS_CORE}${authorClause}&order=created_at.desc&limit=150`,
+      `${origin}/rest/v1/lumina_posts?select=${SELECT_POSTS_EXTENDED}${extendedAuthorClause}&order=created_at.desc&limit=150`,
+      `${origin}/rest/v1/lumina_posts?select=${SELECT_POSTS_EXTENDED}${coreAuthorClause}&order=created_at.desc&limit=150`,
+      `${origin}/rest/v1/lumina_posts?select=${SELECT_POSTS_CORE}${coreAuthorClause}&order=created_at.desc&limit=150`,
     ];
     for (const url of urls) {
       const res = await fetch(url, {
@@ -2026,31 +2055,57 @@ function mapBrowserSupabaseStoryRow(r: Record<string, unknown>): StoryItem | nul
 
 export async function fetchPublicStoriesFromSupabaseBrowser(
   config: BrowserSupabaseConfig,
-  authorIdFilter?: string
+  authorIdFilter?: string | string[]
 ): Promise<StoryItem[]> {
   if (!config.anonKey || isServiceRoleOrSecretKey(config.anonKey)) return [];
   try {
     const origin = normalizeSupabaseOrigin(config.projectUrl);
     const schema = sanitizeSupabaseSchemaName(config.schemaName);
     const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const authorClause = authorIdFilter
-      ? `&author_id=eq.${encodeURIComponent(authorIdFilter)}`
-      : '';
-    const res = await fetch(
-      `${origin}/rest/v1/lumina_stories?select=${SELECT_STORIES}&created_at=gte.${encodeURIComponent(sinceIso)}${authorClause}&order=created_at.desc&limit=100`,
-      {
-        method: 'GET',
-        headers: {
-          ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
-          'Accept-Profile': schema,
-        },
-        signal: AbortSignal.timeout(5000),
+    const ids = (
+      Array.isArray(authorIdFilter)
+        ? authorIdFilter
+        : authorIdFilter
+        ? [authorIdFilter]
+        : []
+    )
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const cleanIds = Array.from(new Set(ids));
+    const quotedList = cleanIds.map((id) => `"${id.replace(/"/g, '')}"`).join(',');
+    const extendedAuthorClause =
+      cleanIds.length === 1
+        ? `&or=(author_id.eq.${encodeURIComponent(cleanIds[0])},author_uid.eq.${encodeURIComponent(cleanIds[0])})`
+        : cleanIds.length > 1
+        ? `&or=(author_id.in.(${encodeURIComponent(quotedList)}),author_uid.in.(${encodeURIComponent(quotedList)}))`
+        : '';
+    const coreAuthorClause =
+      cleanIds.length === 1
+        ? `&author_id=eq.${encodeURIComponent(cleanIds[0])}`
+        : cleanIds.length > 1
+        ? `&author_id=in.(${encodeURIComponent(quotedList)})`
+        : '';
+
+    for (const clause of [extendedAuthorClause, coreAuthorClause]) {
+      const res = await fetch(
+        `${origin}/rest/v1/lumina_stories?select=${SELECT_STORIES}&created_at=gte.${encodeURIComponent(sinceIso)}${clause}&order=created_at.desc&limit=100`,
+        {
+          method: 'GET',
+          headers: {
+            ...buildBrowserSupabaseHeaders(config.anonKey, undefined, true),
+            'Accept-Profile': schema,
+          },
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+      if (res.ok) {
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        if (!Array.isArray(rows)) return [];
+        return rows.map(mapBrowserSupabaseStoryRow).filter((s): s is StoryItem => s !== null);
       }
-    );
-    if (!res.ok) return [];
-    const rows = (await res.json()) as Array<Record<string, unknown>>;
-    if (!Array.isArray(rows)) return [];
-    return rows.map(mapBrowserSupabaseStoryRow).filter((s): s is StoryItem => s !== null);
+      if (res.status !== 400 || !clause) break;
+    }
+    return [];
   } catch {
     return [];
   }

@@ -6,7 +6,8 @@
 3. **Privilege & Moderation Lock**: Regular authenticated users cannot self-assign or modify `verified`, `boosted`, or `restricted` flags on `profiles`, nor write to `admins/{uid}`, `invites/{inviteId}` (except accepting a pending invite), or `site_meta/{docId}`. Only verified administrators (`admins/{uid}` or bootstrapped verified admin email) can mutate those controls.
 4. **Immutable Ownership & Server Timestamps**: `createdAt` and ownership UIDs (`uid`, `authorUid`, `createdByUid`) are immutable after creation, and `createdAt` / `updatedAt` are strictly validated against `request.time`.
 5. **Bounded Fields & Arrays**: Every string field has an explicit `.size()` limit, every document ID matches `^[a-zA-Z0-9_\-]+$` with length `<= 128`, and every array (`followers`, `following`, `likes`, `savedBy`, `comments`, `viewedBy`, `reactions`, `media`, `messages`, `participantIds`, `participantUids`, `unreadBy`) is strictly bounded in length.
-6. **Participant-Scoped Messaging & Recipient-Scoped Notifications**: `threads/{threadId}` is readable/writable only by listed participants (`request.auth.uid in participantUids`) or admins. `notifications/{notifId}` is readable only by the `recipientUid` or admins.
+6. **Participant-Scoped Messaging, Calls & Recipient-Scoped Notifications**: `threads/{threadId}` is readable/writable only by listed participants (`request.auth.uid in participantUids`) or admins. `call_signals/{signalId}` is readable and writable strictly by call participants (`request.auth.uid in participantUids` / `fromUid` / `toUid`) and binds `fromUid == request.auth.uid` on creation. `notifications/{notifId}` is readable only by the `recipientUid` or admins.
+7. **Admin-Only Demo Seed Migration**: Only verified administrators (`isAdmin()`) can create `profiles/{profileId}`, `posts/{postId}`, or `stories/{storyId}` with `isDemoSeed: true` or foreign author/UID ownership during demo migration. Regular users can only create profiles with `isDemoSeed == false`, `verified == false`, `boosted == false`, and `restricted == false`.
 
 ## 2. The "Dirty Dozen" Adversarial Payloads
 1. **Unauthenticated Profile Create**: `request.auth == null` writing to `profiles/user_1` -> `PERMISSION_DENIED`.
@@ -21,3 +22,6 @@
 10. **Ghost Field Injection on Like Update**: User B updates `posts/post_1` changing `caption` alongside `likes` -> `PERMISSION_DENIED`.
 11. **Invite Forgery**: Non-admin user creates `invites/inv_fake` -> `PERMISSION_DENIED`.
 12. **Terminal Invite Replay**: Accepting an already `revoked` or `accepted` invite -> `PERMISSION_DENIED`.
+13. **Non-Participant Call Signal Snooping**: User C reads or listens to `call_signals/sig_ab` between User A and User B -> `PERMISSION_DENIED`.
+14. **Call Caller Spoofing**: User A creates `call_signals/sig_spoof` with `fromUid: "uid_b"` -> `PERMISSION_DENIED`.
+15. **Non-Admin Demo Seed Escalation**: Regular user A creates `profiles/demo_fake` with `isDemoSeed: true` -> `PERMISSION_DENIED`.

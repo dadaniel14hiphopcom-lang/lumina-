@@ -38,8 +38,9 @@ import {
   X,
 } from 'lucide-react';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useSocial } from '../context/SocialContext';
+import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import type { DirectMessage } from '../types';
+import { resolvePlayableMediaUrl, uploadMediaToCloud } from '../utils/media';
 import { formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { MediaImage } from './MediaImage';
@@ -108,7 +109,7 @@ function VoiceNoteBubble({
     >
       <audio
         ref={audioRef}
-        src={audioUrl}
+        src={resolvePlayableMediaUrl(audioUrl)}
         preload="metadata"
         onLoadedMetadata={(e) => {
           const d = e.currentTarget.duration;
@@ -368,6 +369,32 @@ export function MessagesView() {
   const audioFileInputRef = useRef<HTMLInputElement | null>(null);
   const videoFileInputRef = useRef<HTMLInputElement | null>(null);
   const attachmentFileInputRef = useRef<HTMLInputElement | null>(null);
+  const recordedVideoBlobRef = useRef<Blob | null>(null);
+
+  const INLINE_CHAT_DATA_URL_MAX_BYTES = 220_000;
+
+  const uploadChatMedia = async (blob: Blob, fileName: string): Promise<string | null> => {
+    if (blob.size <= INLINE_CHAT_DATA_URL_MAX_BYTES) {
+      return await readBlobAsDataUrl(blob);
+    }
+    try {
+      const res = await uploadMediaToCloud(blob, fileName);
+      if (!res.fallbackNeeded && res.url) {
+        return res.url;
+      }
+      showToast(
+        'Para enviar arquivos grandes entre dispositivos, ative o servidor Node/Amazon S3 no Painel ADM.'
+      );
+      return null;
+    } catch (err) {
+      showToast(
+        err instanceof Error
+          ? err.message
+          : 'Não foi possível enviar o arquivo para o servidor.'
+      );
+      return null;
+    }
+  };
 
   // Tick every 1.2s while any typing timestamp exists so expired indicators vanish cleanly
   useEffect(() => {
@@ -687,13 +714,15 @@ export function MessagesView() {
       setRecordingSec(0);
 
       if (blob.size > 0) {
-        const dataUrl = await readBlobAsDataUrl(blob);
-        sendMessage(recipientId, 'Mensagem de voz', {
-          audioUrl: dataUrl,
-          audioDurationSec: duration,
-          ...replyOpts,
-        });
-        setReplyingTo(null);
+        const audioUrl = await uploadChatMedia(blob, `voice-${Date.now()}.weba`);
+        if (audioUrl) {
+          sendMessage(recipientId, 'Mensagem de voz', {
+            audioUrl,
+            audioDurationSec: duration,
+            ...replyOpts,
+          });
+          setReplyingTo(null);
+        }
       }
     };
     rec.stop();
@@ -703,7 +732,8 @@ export function MessagesView() {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file || !selectedRecipientId || recipientBlocked) return;
-    const url = file.size <= 2_500_000 ? await readBlobAsDataUrl(file) : URL.createObjectURL(file);
+    const url = await uploadChatMedia(file, file.name);
+    if (!url) return;
     sendMessage(selectedRecipientId, file.name, {
       audioUrl: url,
       ...buildReplyOptions(),
@@ -735,8 +765,9 @@ export function MessagesView() {
         );
         return;
       }
-      const videoUrl =
-        file.size <= 2_500_000 ? await readBlobAsDataUrl(file) : URL.createObjectURL(file);
+      showToast('Enviando vídeo...');
+      const videoUrl = await uploadChatMedia(file, file.name);
+      if (!videoUrl) return;
       sendMessage(selectedRecipientId, draft.trim() || 'Vídeo enviado', {
         videoUrl,
         videoName: file.name,
@@ -764,13 +795,14 @@ export function MessagesView() {
       return;
     }
 
-    if (file.size > 380 * 1024) {
-      showToast('Para envio rápido entre dispositivos, selecione documentos de até 380 KB.');
+    if (file.size > 25 * 1024 * 1024) {
+      showToast('Arquivo muito grande. O limite para documentos é 25 MB.');
       return;
     }
-    const dataUrl = await readBlobAsDataUrl(file);
+    const fileUrl = await uploadChatMedia(file, file.name);
+    if (!fileUrl) return;
     setPendingAttachment({
-      fileUrl: dataUrl,
+      fileUrl,
       fileName: file.name,
       fileMime: mime,
       fileSize: file.size,
@@ -795,8 +827,9 @@ export function MessagesView() {
       return;
     }
 
-    const videoUrl =
-      file.size <= 2_500_000 ? await readBlobAsDataUrl(file) : URL.createObjectURL(file);
+    showToast('Enviando vídeo...');
+    const videoUrl = await uploadChatMedia(file, file.name);
+    if (!videoUrl) return;
     sendMessage(selectedRecipientId, draft.trim() || 'Vídeo enviado', {
       videoUrl,
       videoName: file.name,
@@ -866,6 +899,10 @@ export function MessagesView() {
     cleanupVideoStream();
     setIsRecordingVideo(false);
     setCameraModalOpen(false);
+    if (previewVideoUrl && previewVideoUrl.startsWith('blob:')) {
+      URL.revokeObjectURL(previewVideoUrl);
+    }
+    recordedVideoBlobRef.current = null;
     setPreviewVideoUrl(null);
     setPreviewPhotoUrl(null);
     setCameraError(null);
@@ -919,6 +956,7 @@ export function MessagesView() {
       return;
     }
     videoChunksRef.current = [];
+    recordedVideoBlobRef.current = null;
     const recorder = new MediaRecorder(videoStreamRef.current);
     videoRecorderRef.current = recorder;
 
@@ -931,9 +969,12 @@ export function MessagesView() {
         type: recorder.mimeType || 'video/webm',
       });
       if (blob.size > 0) {
-        const url =
-          blob.size <= 2_500_000 ? await readBlobAsDataUrl(blob) : URL.createObjectURL(blob);
-        setPreviewVideoUrl(url);
+        recordedVideoBlobRef.current = blob;
+        const previewUrl =
+          blob.size <= INLINE_CHAT_DATA_URL_MAX_BYTES
+            ? await readBlobAsDataUrl(blob)
+            : URL.createObjectURL(blob);
+        setPreviewVideoUrl(previewUrl);
       }
       setIsRecordingVideo(false);
       if (videoTimerRef.current) {
@@ -957,10 +998,20 @@ export function MessagesView() {
     }
   };
 
-  const sendRecordedVideo = () => {
+  const sendRecordedVideo = async () => {
     if (!selectedRecipientId || !previewVideoUrl) return;
+    let finalVideoUrl = previewVideoUrl;
+    if (finalVideoUrl.startsWith('blob:') && recordedVideoBlobRef.current) {
+      showToast('Enviando vídeo...');
+      const uploadedUrl = await uploadChatMedia(
+        recordedVideoBlobRef.current,
+        `camera-video-${Date.now()}.webm`
+      );
+      if (!uploadedUrl) return;
+      finalVideoUrl = uploadedUrl;
+    }
     sendMessage(selectedRecipientId, 'Mensagem de vídeo', {
-      videoUrl: previewVideoUrl,
+      videoUrl: finalVideoUrl,
       ...buildReplyOptions(),
     });
     setReplyingTo(null);
@@ -1173,7 +1224,7 @@ export function MessagesView() {
                     src={contact.avatarUrl}
                     alt={contact.username}
                     size="md"
-                    showOnlineIndicator={Boolean(contact.isOnline && !contactBlocked)}
+                    showOnlineIndicator={isUserEffectivelyOnline(contact, currentUser.id) && !contactBlocked}
                   />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
@@ -1255,7 +1306,7 @@ export function MessagesView() {
                     src={recipient.avatarUrl}
                     alt={recipient.username}
                     size="sm"
-                    showOnlineIndicator={Boolean(recipient.isOnline && !recipientBlocked)}
+                    showOnlineIndicator={isUserEffectivelyOnline(recipient, currentUser.id) && !recipientBlocked}
                   />
                   <div className="min-w-0">
                     <div className="flex items-center gap-1.5">
@@ -1276,7 +1327,7 @@ export function MessagesView() {
                       </p>
                     ) : (
                       <p className="truncate text-[11px] text-zinc-500 dark:text-zinc-400">
-                        {recipient.isOnline ? 'Ativo agora' : `@${recipient.username}`}
+                        {isUserEffectivelyOnline(recipient, currentUser.id) ? 'Ativo agora' : `@${recipient.username}`}
                       </p>
                     )}
                   </div>
@@ -1604,7 +1655,7 @@ export function MessagesView() {
                               }`}
                             >
                               <video
-                                src={msg.videoUrl}
+                                src={resolvePlayableMediaUrl(msg.videoUrl)}
                                 controls
                                 playsInline
                                 className="max-h-60 w-full max-w-[220px] bg-black object-contain sm:max-h-72 sm:max-w-[280px]"
@@ -1631,11 +1682,11 @@ export function MessagesView() {
                             >
                               <button
                                 type="button"
-                                onClick={() => setLightboxImageUrl(msg.fileUrl!)}
+                                onClick={() => setLightboxImageUrl(resolvePlayableMediaUrl(msg.fileUrl!))}
                                 className="block w-full overflow-hidden bg-black/5 text-left"
                               >
                                 <img
-                                  src={msg.fileUrl}
+                                  src={resolvePlayableMediaUrl(msg.fileUrl)}
                                   alt={msg.fileName || 'Foto enviada'}
                                   className="max-h-60 w-full max-w-[220px] object-cover sm:max-h-72 sm:max-w-[280px]"
                                 />
@@ -1661,8 +1712,10 @@ export function MessagesView() {
                               }`}
                             >
                               <a
-                                href={msg.fileUrl}
+                                href={resolvePlayableMediaUrl(msg.fileUrl)}
                                 download={msg.fileName || 'arquivo'}
+                                target="_blank"
+                                rel="noopener noreferrer"
                                 className={`flex items-center gap-2 rounded-xl px-2.5 py-2 transition-colors ${
                                   isMine
                                     ? 'bg-white/15 hover:bg-white/25'
@@ -2300,7 +2353,7 @@ export function MessagesView() {
                             className="aspect-square overflow-hidden rounded-xl bg-zinc-100 dark:bg-zinc-900"
                           >
                             <img
-                              src={p.fileUrl}
+                              src={resolvePlayableMediaUrl(p.fileUrl)}
                               alt={p.fileName || 'Foto'}
                               className="h-full w-full object-cover"
                             />
@@ -2319,8 +2372,10 @@ export function MessagesView() {
                         {sharedMediaStats.files.map((f) => (
                           <a
                             key={f.id}
-                            href={f.fileUrl}
+                            href={resolvePlayableMediaUrl(f.fileUrl)}
                             download={f.fileName || 'arquivo'}
+                            target="_blank"
+                            rel="noopener noreferrer"
                             className="flex items-center gap-2.5 rounded-xl border border-zinc-200 px-3 py-2 text-xs hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
                           >
                             <FileText className="h-4 w-4 shrink-0 text-sky-600" />
@@ -2351,7 +2406,7 @@ export function MessagesView() {
                         src={recipient.avatarUrl}
                         alt={recipient.username}
                         size="md"
-                        showOnlineIndicator={Boolean(recipient.isOnline && !recipientBlocked)}
+                        showOnlineIndicator={isUserEffectivelyOnline(recipient, currentUser.id) && !recipientBlocked}
                       />
                       <div className="min-w-0">
                         <p className="truncate text-sm font-bold text-zinc-950 dark:text-zinc-100">

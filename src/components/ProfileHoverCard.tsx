@@ -1,7 +1,7 @@
 import { BadgeCheck, Globe, Mail, MessageCircle, UserCheck, UserPlus } from 'lucide-react';
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { useSocial } from '../context/SocialContext';
+import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import { ASSETS } from '../data/seed';
 import { formatCompactCount } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
@@ -138,6 +138,7 @@ export function ProfileHoverCard({
   }
 
   const isOwn = user.id === currentUser.id;
+  const isOnlineNow = isUserEffectivelyOnline(user, currentUser.id);
   const isFollowing = currentUser.following.includes(user.id);
   const userPostCount = posts.filter((p) => p.authorId === user.id).length;
   const safeWebsiteUrl = getSafeExternalUrl(user.website);
@@ -190,7 +191,7 @@ export function ProfileHoverCard({
                     src={user.avatarUrl}
                     alt={user.username}
                     size="md"
-                    showOnlineIndicator={Boolean(user.isOnline)}
+                    showOnlineIndicator={isOnlineNow}
                     onClick={() => {
                       setOpen(false);
                       onBeforeNavigate?.();
@@ -198,7 +199,7 @@ export function ProfileHoverCard({
                     }}
                   />
                 </div>
-                {user.isOnline && (
+                {isOnlineNow && (
                   <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
                     <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
                     Ativo agora

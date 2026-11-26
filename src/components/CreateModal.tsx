@@ -23,12 +23,13 @@ import {
   FILTER_PRESETS,
   renderFilteredImage,
 } from '../utils/filters';
+import { useS3Upload } from '../hooks/useS3Upload';
 import {
   compressImageFile,
   fetchMediaDeliveryStatus,
+  getConfiguredS3ApiBaseUrl,
   MediaStatusInfo,
   resolvePlayableMediaUrl,
-  uploadMediaToCloud,
 } from '../utils/media';
 import { MediaImage } from './MediaImage';
 
@@ -50,15 +51,6 @@ const CATEGORIES: PostCategory[] = [
   'Design',
   'Arte',
 ];
-
-function readBlobAsDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('Falha ao ler mídia'));
-    reader.readAsDataURL(blob);
-  });
-}
 
 function readVideoDuration(url: string): Promise<number> {
   return new Promise((resolve) => {
@@ -91,13 +83,23 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
   const [category, setCategory] = useState<PostCategory>('Fotografia');
   const [audioTrack, setAudioTrack] = useState('Luz Natural · Instrumental');
   const [isPublishing, setIsPublishing] = useState(false);
-  const [uploadingMedia, setUploadingMedia] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [uploadStage, setUploadStage] = useState('');
-  const [uploadBytes, setUploadBytes] = useState<{ loaded: number; total: number } | null>(null);
   const [mediaDeliveryStatus, setMediaDeliveryStatus] = useState<MediaStatusInfo | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [previewVideoError, setPreviewVideoError] = useState(false);
+
+  const {
+    uploadFile: uploadMediaWithS3,
+    cancelUpload: cancelS3Upload,
+    reset: resetS3Upload,
+    isUploading: uploadingMedia,
+    progress: uploadProgress,
+    stage: uploadStage,
+    loadedBytes: uploadLoadedBytes,
+    totalBytes: uploadTotalBytes,
+    error: s3UploadError,
+  } = useS3Upload({
+    fallbackToInlineMaxBytes: 3_500_000,
+  });
 
   // Short-video camera recorder for Reels
   const [camOpen, setCamOpen] = useState(false);
@@ -142,11 +144,20 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     };
   }, [isCreateOpen]);
 
+  useEffect(() => {
+    if (s3UploadError) {
+      setMediaError(s3UploadError);
+      showToast(s3UploadError);
+    }
+  }, [s3UploadError, showToast]);
+
   if (!isCreateOpen) return null;
 
   const { maxVideoSizeMB, maxReelDurationSec, allowVideoReels } = siteMeta.videoRules;
 
   const resetAndClose = () => {
+    cancelS3Upload();
+    resetS3Upload();
     stopCamera();
     setStep('pick');
     setMediaItems([]);
@@ -156,10 +167,6 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     setLocation('');
     setMediaError(null);
     setPreviewVideoError(false);
-    setUploadingMedia(false);
-    setUploadProgress(0);
-    setUploadStage('');
-    setUploadBytes(null);
     setIsCreateOpen(false);
   };
 
@@ -169,54 +176,16 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
     blob: Blob,
     fileName?: string
   ): Promise<string | null> => {
-    setUploadingMedia(true);
-    setUploadProgress(5);
-    setUploadStage('Preparando envio do vídeo...');
-    setUploadBytes({ loaded: 0, total: blob.size });
-    try {
-      const result = await uploadMediaToCloud(
-        blob,
-        fileName,
-        (pct, stage, loadedBytes, totalBytes) => {
-          setUploadProgress(pct);
-          if (stage) setUploadStage(stage);
-          if (typeof loadedBytes === 'number' && typeof totalBytes === 'number') {
-            setUploadBytes({ loaded: loadedBytes, total: totalBytes });
-          }
-        }
-      );
-      if (!result.fallbackNeeded) {
-        if (result.storageProvider === 'aws-cloudfront' || result.storageProvider === 'aws-s3') {
-          showToast('Vídeo hospedado na Amazon AWS S3');
-        } else {
-          showToast('Vídeo enviado para streaming de mídia');
-        }
-        return result.url;
-      }
+    setMediaError(null);
+    const result = await uploadMediaWithS3(blob, fileName);
+    if (!result) return null;
 
-      if (blob.size <= 3_500_000) {
-        return await readBlobAsDataUrl(blob);
-      }
-
-      const msg =
-        'Este servidor estático não suporta arquivos acima de 3,5 MB. Ative o servidor Lumina + Amazon AWS S3 para hospedar vídeos maiores.';
-      setMediaError(msg);
-      showToast(msg);
-      return null;
-    } catch (err) {
-      const msg =
-        err instanceof Error
-          ? err.message
-          : 'Não foi possível enviar o vídeo para a nuvem.';
-      setMediaError(msg);
-      showToast(msg);
-      return null;
-    } finally {
-      setUploadingMedia(false);
-      setUploadProgress(0);
-      setUploadStage('');
-      setUploadBytes(null);
+    if (result.storageProvider === 'aws-cloudfront' || result.storageProvider === 'aws-s3') {
+      showToast('Vídeo hospedado na Amazon AWS S3');
+    } else if (result.storageProvider === 'server-disk') {
+      showToast('Vídeo enviado para streaming de mídia');
     }
+    return result.url;
   };
 
   const validateAndLoadVideoFile = async (file: File) => {
@@ -285,21 +254,35 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
       return;
     }
 
-    const urls = await Promise.all(
-      files.map((file) =>
-        compressImageFile(file, {
-          maxWidth: 1280,
-          maxHeight: 1600,
-          quality: 0.82,
-          maxChars: 340_000,
-        }).catch(() => '')
-      )
-    );
+    const preferS3Images =
+      mediaDeliveryStatus?.storageProvider === 'aws-s3' || Boolean(getConfiguredS3ApiBaseUrl());
+
+    const urls: string[] = [];
+    for (const file of files) {
+      if (preferS3Images) {
+        const s3Res = await uploadMediaWithS3(file, file.name);
+        if (s3Res?.url) {
+          urls.push(s3Res.url);
+          continue;
+        }
+      }
+      const compressed = await compressImageFile(file, {
+        maxWidth: 1280,
+        maxHeight: 1600,
+        quality: 0.82,
+        maxChars: 340_000,
+      }).catch(() => '');
+      if (compressed) urls.push(compressed);
+    }
+
     const valid = urls.filter(Boolean).map((url) => ({
       url,
       mediaType: 'image' as const,
     }));
     if (valid.length > 0) {
+      if (preferS3Images && valid.some((item) => !item.url.startsWith('data:'))) {
+        showToast('Imagem enviada para Amazon AWS S3');
+      }
       setMediaItems(valid);
       setActiveIdx(0);
       if (mode === 'story' || mode === 'reel') setAspectRatio('9:16');
@@ -627,19 +610,29 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                   <div className="flex min-w-0 items-center gap-2.5">
                     <Loader2 className="h-4 w-4 shrink-0 animate-spin text-sky-600 dark:text-sky-400" />
                     <span className="truncate text-xs font-semibold text-sky-950 dark:text-sky-100">
-                      {mediaDeliveryStatus?.storageProvider === 'aws-s3'
-                        ? `Enviando vídeo para Amazon S3 (${mediaDeliveryStatus.bucket})`
-                        : 'Enviando vídeo para armazenamento na nuvem'}
+                      {mediaDeliveryStatus?.storageProvider === 'aws-s3' ||
+                      Boolean(getConfiguredS3ApiBaseUrl())
+                        ? `Enviando mídia para Amazon S3 (${mediaDeliveryStatus?.bucket || 'S3'})`
+                        : 'Enviando mídia para armazenamento na nuvem'}
                     </span>
                   </div>
-                  <span className="shrink-0 font-mono text-xs font-bold text-sky-700 tabular-nums dark:text-sky-300">
-                    {uploadProgress}%
-                  </span>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span className="font-mono text-xs font-bold text-sky-700 tabular-nums dark:text-sky-300">
+                      {uploadProgress}%
+                    </span>
+                    <button
+                      type="button"
+                      onClick={cancelS3Upload}
+                      className="rounded-lg border border-sky-300 px-2 py-0.5 text-[11px] font-semibold text-sky-900 hover:bg-sky-100 dark:border-sky-700 dark:text-sky-200 dark:hover:bg-sky-900/60"
+                    >
+                      Cancelar
+                    </button>
+                  </div>
                 </div>
 
                 <div
                   role="progressbar"
-                  aria-label="Progresso do envio do vídeo"
+                  aria-label="Progresso do envio para Amazon S3"
                   aria-valuenow={uploadProgress}
                   aria-valuemin={0}
                   aria-valuemax={100}
@@ -655,9 +648,9 @@ export function CreateModal({ initialMode = 'post' }: CreateModalProps) {
                   <span className="truncate">
                     {uploadStage || 'Processando arquivo...'}
                   </span>
-                  {uploadBytes && uploadBytes.total > 0 && (
+                  {uploadTotalBytes > 0 && (
                     <span className="shrink-0 font-mono tabular-nums">
-                      {formatMegabytes(uploadBytes.loaded)} / {formatMegabytes(uploadBytes.total)}
+                      {formatMegabytes(uploadLoadedBytes)} / {formatMegabytes(uploadTotalBytes)}
                     </span>
                   )}
                 </div>

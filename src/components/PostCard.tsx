@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import React, { useEffect, useRef, useState } from 'react';
-import { useSocial } from '../context/SocialContext';
+import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import { Post } from '../types';
 import {
   diagnoseVideoPlaybackError,
@@ -220,7 +220,7 @@ export function PostCard({ post }: PostCardProps) {
               size="sm"
               hasStory={hasStory}
               hasUnseenStory={hasUnseenStory}
-              showOnlineIndicator={Boolean(author.isOnline)}
+              showOnlineIndicator={isUserEffectivelyOnline(author, currentUser.id)}
               onClick={() => {
                 if (hasStory) setActiveStoryAuthorId(author.id);
                 else openProfile(author.id);

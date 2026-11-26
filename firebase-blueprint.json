@@ -20,6 +20,7 @@
         "boosted": { "type": "boolean" },
         "followers": { "type": "array" },
         "following": { "type": "array" },
+        "lastActiveAtMs": { "type": "number" },
         "createdAtMs": { "type": "number" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
@@ -258,12 +259,58 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["uid", "email", "createdAt"]
+    },
+    "CallSignal": {
+      "title": "CallSignal",
+      "description": "Ephemeral WebRTC audio/video call signaling frame delivered between verified call participants.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "callId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": {
+          "type": "string",
+          "enum": ["call:invite", "call:answer", "call:ice", "call:reject", "call:end", "call:busy", "call:media-state"]
+        },
+        "fromUserId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "fromUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "fromUsername": { "type": "string", "maxLength": 40 },
+        "fromDisplayName": { "type": "string", "maxLength": 80 },
+        "fromAvatarUrl": { "type": "string", "maxLength": 450000 },
+        "toUserId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "toUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "participantUids": { "type": "array" },
+        "callType": { "type": "string", "enum": ["audio", "video"] },
+        "threadId": { "type": "string", "maxLength": 160 },
+        "sdp": { "type": "object" },
+        "candidate": { "type": "object" },
+        "reason": { "type": "string", "maxLength": 64 },
+        "micMuted": { "type": "boolean" },
+        "camOff": { "type": "boolean" },
+        "consumed": { "type": "boolean" },
+        "createdAtMs": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "callId",
+        "type",
+        "fromUserId",
+        "fromUid",
+        "toUserId",
+        "toUid",
+        "participantUids",
+        "consumed",
+        "createdAtMs",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
     "/profiles/{profileId}": {
       "schema": { "$ref": "#/entities/PublicProfile" },
-      "description": "Public profile records (avatars, covers, bios, followers/following) synced across devices."
+      "description": "Public profile records (avatars, covers, bios, followers/following, online heartbeat) synced across devices."
     },
     "/users_private/{userId}": {
       "schema": { "$ref": "#/entities/PrivateUser" },
@@ -296,6 +343,10 @@
     "/admins/{uid}": {
       "schema": { "$ref": "#/entities/AdminRole" },
       "description": "Administrator registry."
+    },
+    "/call_signals/{signalId}": {
+      "schema": { "$ref": "#/entities/CallSignal" },
+      "description": "Real-time cross-device WebRTC audio/video call signaling scoped strictly to call participants."
     }
   }
 }

@@ -4,12 +4,23 @@ export type RealtimeServerEvent =
   | { type: 'call_signal'; signal: CallSignalPayload }
   | { type: 'chat_message'; threadId: string; senderId: string; recipientId: string }
   | { type: 'chat_typing'; fromUserId: string; toUserId: string; isTyping: boolean }
-  | { type: 'chat_read'; threadId: string; readerIds: string[] };
+  | { type: 'chat_read'; threadId: string; readerIds: string[] }
+  | { type: 'social_update'; scope: 'posts' | 'stories' | 'users' | 'all'; updatedAt?: number }
+  | { type: 'site_meta_update'; updatedAt?: number }
+  | {
+      type: 'presence_update';
+      userId: string;
+      uid?: string;
+      isOnline: boolean;
+      lastActiveAtMs: number;
+    };
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' },
 ];
 
 export function createCallPeerConnection(handlers: {

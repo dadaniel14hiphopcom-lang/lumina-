@@ -10,7 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import React, { useEffect, useRef, useState } from 'react';
-import { useSocial } from '../context/SocialContext';
+import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import { isVideoAsset, resolvePlayableMediaUrl } from '../utils/media';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
@@ -167,7 +167,7 @@ export function PostDetailModal() {
                   src={author.avatarUrl}
                   alt={author.username}
                   size="sm"
-                  showOnlineIndicator={Boolean(author.isOnline)}
+                  showOnlineIndicator={isUserEffectivelyOnline(author, currentUser.id)}
                 />
                 <div>
                   <div className="flex items-center gap-1">
