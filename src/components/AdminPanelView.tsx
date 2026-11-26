@@ -75,7 +75,11 @@ import {
   verifyStaticAdminPasscode,
 } from '../utils/staticAdminAuth';
 import { formatCompactCount, formatRelativeTime } from '../utils/time';
-import { buildWordPressKitEntries, createBrowserZipBlob } from '../utils/zipClient';
+import {
+  buildWordPressKitEntries,
+  buildWordPressPluginEntries,
+  createBrowserZipBlob,
+} from '../utils/zipClient';
 import { AvatarRing } from './AvatarRing';
 
 type AdminTab = 'users' | 'invites' | 'integrations' | 'updates' | 'wordpress';
@@ -183,6 +187,29 @@ function escapeXml(str: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
+}
+
+function escapeCdata(str: string): string {
+  return str.replace(/\]\]>/g, ']]]]><![CDATA[>');
+}
+
+function toWpSlug(str: string, fallback: string): string {
+  const cleaned = str
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return cleaned || fallback;
+}
+
+function formatWpDateTime(ts: number): string {
+  const d = new Date(Number.isFinite(ts) ? ts : Date.now());
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(
+    d.getUTCHours()
+  )}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
 function triggerBlobDownload(blob: Blob, filename: string) {
@@ -2667,47 +2694,130 @@ images:
     showToast('Regra CORS do Google Cloud Storage baixada');
   };
 
+  const handleDownloadWordPressPluginZip = () => {
+    const entries = buildWordPressPluginEntries({
+      siteTitle: overview?.state.wordpress.siteTitle || 'Lumina Editorial WP',
+      siteVersion: overview?.state.site.version || '2.5.0',
+    });
+    const blob = createBrowserZipBlob(entries);
+    triggerBlobDownload(blob, 'lumina-bridge-plugin.zip');
+    showToast('Plugin Bridge (.zip) pronto para enviar em Plugins > Adicionar novo');
+  };
+
   const handleExportWordPressWxr = () => {
-    const siteUrl = overview?.state.wordpress.siteUrl || 'https://meudominio.com.br';
+    const rawSiteUrl = (overview?.state.wordpress.siteUrl || '').trim() || 'https://meudominio.com.br';
+    const siteUrl = rawSiteUrl.replace(/\/+$/, '');
     const title = overview?.state.wordpress.siteTitle || 'Lumina Editorial WP';
+    const nowRfc = new Date().toUTCString();
+
+    const authorMap = new Map<string, { id: number; login: string; displayName: string }>();
+    const resolvePostAuthor = (postAuthorId: string, postAuthorUid?: string) => {
+      const user = allUsers.find(
+        (u) => u.id === postAuthorId || (postAuthorUid && u.uid === postAuthorUid)
+      );
+      const login = toWpSlug(user?.username || 'admin', 'admin').replace(/-/g, '_');
+      const existing = authorMap.get(login);
+      if (existing) return existing;
+      const entry = {
+        id: authorMap.size + 1,
+        login,
+        displayName: user?.displayName || user?.username || 'Administrador Lumina',
+      };
+      authorMap.set(login, entry);
+      return entry;
+    };
 
     const itemsXml = allPosts
-      .map((post) => {
-        const author = allUsers.find((u) => u.id === post.authorId);
-        const pubDate = new Date(post.createdAt).toUTCString();
-        const imgTag = post.media[0]?.url
-          ? `<p><img src="${escapeXml(post.media[0].url)}" alt="${escapeXml(post.caption.slice(0, 60))}" /></p>`
+      .map((post, index) => {
+        const wpPostId = index + 1;
+        const author = resolvePostAuthor(post.authorId, post.authorUid);
+        const pubDate = new Date(post.createdAt || Date.now()).toUTCString();
+        const wpDate = formatWpDateTime(post.createdAt || Date.now());
+        const postTitle = (post.caption || '').trim().slice(0, 72) || `Publicação ${wpPostId}`;
+        const postSlug = toWpSlug(postTitle, `post-${wpPostId}`);
+        const catLabel = (post.category || 'Geral').trim();
+        const catSlug = toWpSlug(catLabel, 'geral');
+        const firstMediaUrl = (post.media[0]?.url || '').trim();
+        const isHttpMedia = /^https?:\/\//i.test(firstMediaUrl);
+        const imgTag = isHttpMedia
+          ? `<p><img src="${escapeXml(firstMediaUrl)}" alt="${escapeXml(postTitle)}" /></p>`
           : '';
+        const bodyHtml = `${imgTag}<p>${escapeXml(post.caption || '')}</p>`;
+        const postLink = `${siteUrl}/${postSlug}/`;
+
         return `  <item>
-    <title>${escapeXml(post.caption.slice(0, 64) || `Publicação ${post.id}`)}</title>
+    <title>${escapeXml(postTitle)}</title>
+    <link>${escapeXml(postLink)}</link>
     <pubDate>${pubDate}</pubDate>
-    <dc:creator><![CDATA[${author?.username || 'admin'}]]></dc:creator>
-    <content:encoded><![CDATA[${imgTag}<p>${escapeXml(post.caption)}</p>]]></content:encoded>
-    <wp:post_id>${escapeXml(post.id.replace(/\D/g, '') || '1')}</wp:post_id>
-    <wp:status>publish</wp:status>
-    <wp:post_type>post</wp:post_type>
-    <category domain="category" nicename="${escapeXml(post.category.toLowerCase())}">${escapeXml(post.category)}</category>
+    <dc:creator><![CDATA[${escapeCdata(author.login)}]]></dc:creator>
+    <guid isPermaLink="false">${escapeXml(`${siteUrl}/?p=${wpPostId}`)}</guid>
+    <description></description>
+    <content:encoded><![CDATA[${escapeCdata(bodyHtml)}]]></content:encoded>
+    <excerpt:encoded><![CDATA[]]></excerpt:encoded>
+    <wp:post_id>${wpPostId}</wp:post_id>
+    <wp:post_date><![CDATA[${wpDate}]]></wp:post_date>
+    <wp:post_date_gmt><![CDATA[${wpDate}]]></wp:post_date_gmt>
+    <wp:post_modified><![CDATA[${wpDate}]]></wp:post_modified>
+    <wp:post_modified_gmt><![CDATA[${wpDate}]]></wp:post_modified_gmt>
+    <wp:comment_status><![CDATA[open]]></wp:comment_status>
+    <wp:ping_status><![CDATA[open]]></wp:ping_status>
+    <wp:post_name><![CDATA[${escapeCdata(postSlug)}]]></wp:post_name>
+    <wp:status><![CDATA[publish]]></wp:status>
+    <wp:post_parent>0</wp:post_parent>
+    <wp:menu_order>0</wp:menu_order>
+    <wp:post_type><![CDATA[post]]></wp:post_type>
+    <wp:post_password><![CDATA[]]></wp:post_password>
+    <wp:is_sticky>0</wp:is_sticky>
+    <category domain="category" nicename="${escapeXml(catSlug)}"><![CDATA[${escapeCdata(catLabel)}]]></category>
   </item>`;
       })
       .join('\n');
 
+    if (authorMap.size === 0) {
+      authorMap.set('admin', { id: 1, login: 'admin', displayName: 'Administrador Lumina' });
+    }
+
+    const authorsXml = Array.from(authorMap.values())
+      .map(
+        (a) => `  <wp:author>
+    <wp:author_id>${a.id}</wp:author_id>
+    <wp:author_login><![CDATA[${escapeCdata(a.login)}]]></wp:author_login>
+    <wp:author_email><![CDATA[${escapeCdata(`${a.login}@lumina.local`)}]]></wp:author_email>
+    <wp:author_display_name><![CDATA[${escapeCdata(a.displayName)}]]></wp:author_display_name>
+    <wp:author_first_name><![CDATA[]]></wp:author_first_name>
+    <wp:author_last_name><![CDATA[]]></wp:author_last_name>
+  </wp:author>`
+      )
+      .join('\n');
+
     const wxr = `<?xml version="1.0" encoding="UTF-8" ?>
+<!-- WordPress eXtended RSS (WXR 1.2) gerado pela plataforma Lumina -->
 <rss version="2.0"
   xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
   xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wfw="http://wellformedweb.org/CommentAPI/"
   xmlns:dc="http://purl.org/dc/elements/1.1/"
   xmlns:wp="http://wordpress.org/export/1.2/">
 <channel>
   <title>${escapeXml(title)}</title>
   <link>${escapeXml(siteUrl)}</link>
+  <description>${escapeXml(`Exportação de conteúdo ${title}`)}</description>
+  <pubDate>${nowRfc}</pubDate>
   <language>pt-BR</language>
   <wp:wxr_version>1.2</wp:wxr_version>
+  <wp:base_site_url>${escapeXml(siteUrl)}</wp:base_site_url>
+  <wp:base_blog_url>${escapeXml(siteUrl)}</wp:base_blog_url>
+${authorsXml}
+  <generator>https://wordpress.org/?v=6.7</generator>
 ${itemsXml}
 </channel>
 </rss>`;
 
-    triggerBlobDownload(new Blob([wxr], { type: 'application/xml' }), 'lumina-wordpress-wxr.xml');
-    showToast('Arquivo WXR (.xml) exportado para WordPress');
+    triggerBlobDownload(
+      new Blob([wxr], { type: 'text/xml;charset=utf-8' }),
+      'lumina-wordpress-wxr.xml'
+    );
+    showToast('Arquivo WXR (.xml) exportado no padrão WordPress 1.2');
   };
 
   // Render Admin Auth Gate if not authenticated
@@ -5344,7 +5454,16 @@ ${itemsXml}
                 className="inline-flex h-10 items-center gap-2 rounded-xl bg-sky-600 px-4 text-xs font-semibold text-white hover:bg-sky-700"
               >
                 <Download className="h-4 w-4" />
-                <span>Baixar Kit Auto-Hospedado (.zip)</span>
+                <span>Baixar Kit Servidor Docker (.zip)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleDownloadWordPressPluginZip}
+                className="inline-flex h-10 items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-4 text-xs font-semibold text-sky-800 hover:bg-sky-100 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-300 dark:hover:bg-sky-950"
+              >
+                <Download className="h-4 w-4" />
+                <span>Baixar Plugin Bridge (.zip)</span>
               </button>
 
               <button
@@ -5353,7 +5472,7 @@ ${itemsXml}
                 className="inline-flex h-10 items-center gap-2 rounded-xl border border-zinc-200 px-4 text-xs font-semibold text-zinc-800 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
               >
                 <Download className="h-4 w-4" />
-                <span>Exportar WXR (.xml)</span>
+                <span>Exportar Posts WXR (.xml)</span>
               </button>
 
               <button
@@ -5371,35 +5490,38 @@ ${itemsXml}
           <div className="space-y-6">
             <section className="rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
               <h3 className="mb-3 text-sm font-bold text-zinc-950 dark:text-white">
-                Arquivos no Kit Auto-Hospedado
+                Onde usar cada arquivo no WordPress
               </h3>
               <ul className="space-y-2 text-xs text-zinc-600 dark:text-zinc-400">
                 <li>
                   <strong className="font-mono text-zinc-900 dark:text-zinc-200">
-                    docker-compose.yml
+                    lumina-wordpress-wxr.xml
                   </strong>{' '}
-                  — Stack completa (WordPress PHP {state.wordpress.phpVersion},{' '}
-                  {state.wordpress.dbEngine}, Nginx{state.wordpress.redisCache ? ', Redis' : ''})
+                  — Envie em <strong>Ferramentas &gt; Importar &gt; WordPress</strong> para
+                  importar suas publicações.
                 </li>
                 <li>
                   <strong className="font-mono text-zinc-900 dark:text-zinc-200">
-                    wp-config.php
+                    lumina-bridge-plugin.zip
                   </strong>{' '}
-                  — Prefixo <code className="font-mono">{state.wordpress.tablePrefix}</code>,
-                  SSL e segurança reforçada
+                  — Envie em <strong>Plugins &gt; Adicionar novo &gt; Enviar plugin</strong> (ativa{' '}
+                  <code className="font-mono">[lumina_feed]</code> e{' '}
+                  <code className="font-mono">/wp-json/lumina/v1/health</code>).
                 </li>
                 <li>
                   <strong className="font-mono text-zinc-900 dark:text-zinc-200">
-                    nginx.conf
+                    lumina-wordpress-selfhosted.zip
                   </strong>{' '}
-                  — Proxy FastCGI e bloqueio XML-RPC configurável
+                  — Apenas para subir seu servidor próprio via Docker (<code className="font-mono">docker compose up -d</code>);{' '}
+                  <strong>não envie este .zip no importador do WordPress</strong>.
                 </li>
                 <li>
                   <strong className="font-mono text-zinc-900 dark:text-zinc-200">
-                    lumina-bridge.php
+                    Stack do Kit
                   </strong>{' '}
-                  — Plugin WordPress com shortcode{' '}
-                  <code className="font-mono">[lumina_feed]</code> e endpoint REST
+                  — PHP {state.wordpress.phpVersion}, {state.wordpress.dbEngine}, Nginx
+                  {state.wordpress.redisCache ? ', Redis' : ''}, prefixo{' '}
+                  <code className="font-mono">{state.wordpress.tablePrefix}</code>.
                 </li>
               </ul>
             </section>

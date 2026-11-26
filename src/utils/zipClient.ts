@@ -120,6 +120,45 @@ export interface WordPressKitConfig {
   siteVersion: string;
 }
 
+export function buildLuminaBridgePluginPhp(wp: Pick<WordPressKitConfig, 'siteTitle' | 'siteVersion'>): string {
+  return `<?php
+/**
+ * Plugin Name: Lumina Self-Hosted Bridge
+ * Description: Integra publicações, usuários e feed da rede social Lumina ao seu WordPress auto-hospedado.
+ * Version: ${wp.siteVersion}
+ * Author: ${wp.siteTitle}
+ */
+
+if (!defined('ABSPATH')) exit;
+
+add_shortcode('lumina_feed', function ($atts) {
+    $atts = shortcode_atts(['limit' => '12'], $atts);
+    return '<div id="lumina-wp-embed" data-limit="' . esc_attr($atts['limit']) . '">Lumina Feed conectado.</div>';
+});
+
+add_action('rest_api_init', function () {
+    register_rest_route('lumina/v1', '/health', [
+        'methods' => 'GET',
+        'permission_callback' => '__return_true',
+        'callback' => function () {
+            return ['status' => 'ok', 'self_hosted' => true, 'version' => '${wp.siteVersion}'];
+        },
+    ]);
+});
+`;
+}
+
+export function buildWordPressPluginEntries(
+  wp: Pick<WordPressKitConfig, 'siteTitle' | 'siteVersion'>
+): BrowserZipEntry[] {
+  return [
+    {
+      name: 'lumina-bridge/lumina-bridge.php',
+      content: buildLuminaBridgePluginPhp(wp),
+    },
+  ];
+}
+
 export function buildWordPressKitEntries(wp: WordPressKitConfig): {
   domain: string;
   entries: BrowserZipEntry[];
@@ -242,31 +281,7 @@ ${
 }
 `;
 
-  const luminaPlugin = `<?php
-/**
- * Plugin Name: Lumina Self-Hosted Bridge
- * Description: Integra publicações, usuários e feed da rede social Lumina ao seu WordPress auto-hospedado.
- * Version: ${wp.siteVersion}
- * Author: ${wp.siteTitle}
- */
-
-if (!defined('ABSPATH')) exit;
-
-add_shortcode('lumina_feed', function ($atts) {
-    $atts = shortcode_atts(['limit' => '12'], $atts);
-    return '<div id="lumina-wp-embed" data-limit="' . esc_attr($atts['limit']) . '">Lumina Feed conectado.</div>';
-});
-
-add_action('rest_api_init', function () {
-    register_rest_route('lumina/v1', '/health', [
-        'methods' => 'GET',
-        'permission_callback' => '__return_true',
-        'callback' => function () {
-            return ['status' => 'ok', 'self_hosted' => true, 'version' => '${wp.siteVersion}'];
-        },
-    ]);
-});
-`;
+  const luminaPlugin = buildLuminaBridgePluginPhp(wp);
 
   const readme = `# WordPress Auto-Hospedado — ${wp.siteTitle}
 
