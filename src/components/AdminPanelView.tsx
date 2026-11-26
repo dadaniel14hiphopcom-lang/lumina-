@@ -31,14 +31,16 @@ import {
   Video,
 } from 'lucide-react';
 import { signInWithEmailAndPassword } from 'firebase/auth';
+import { doc, getDocFromServer } from 'firebase/firestore';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import firebaseConfig from '../../firebase-applet-config.json';
 import {
   DEFAULT_VIDEO_RULES,
   encodeInviteMeta,
   isUserEffectivelyOnline,
   useSocial,
 } from '../context/SocialContext';
-import { ADMIN_EMAIL, auth, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
+import { ADMIN_EMAIL, auth, db, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
 import {
   DEFAULT_SUPABASE_URL,
   type SupabaseCacheAuditResult,
@@ -115,6 +117,20 @@ interface ServerOverview {
       maintenanceMode: boolean;
       lastSyncedAt: number | null;
     };
+    gcp: {
+      projectId: string;
+      firestoreDatabaseId: string;
+      region: string;
+      hostingService: 'cloud-run' | 'firebase-hosting' | 'app-engine';
+      hostingDomain: string;
+      gcsBucket: string;
+      firestoreEnabled: boolean;
+      hostingEnabled: boolean;
+      gcsMediaEnabled: boolean;
+      cloudSqlNote?: string;
+      lastVerifiedAt: number | null;
+      lastStatus: string | null;
+    };
     site: {
       version: string;
       channel: 'stable' | 'beta';
@@ -138,6 +154,10 @@ interface ServerOverview {
     supabaseUrlEnv: boolean;
     supabaseKeysEnv: boolean;
     wordpressEnv: boolean;
+    gcpCredentialsConfigured?: boolean;
+    gcpCloudRunDetected?: boolean;
+    gcpServiceName?: string | null;
+    gcpFirestoreConfigured?: boolean;
   };
 }
 
@@ -214,6 +234,23 @@ const DEFAULT_LOCAL_STATE: ServerOverview['state'] = {
     maintenanceMode: false,
     lastSyncedAt: null,
   },
+  gcp: {
+    projectId: firebaseConfig.projectId || 'gen-lang-client-0008718661',
+    firestoreDatabaseId:
+      firebaseConfig.firestoreDatabaseId || 'ai-studio-lumina-3b56ca74-7dae-48b1-8553-15277d2b38a1',
+    region: 'us-east1',
+    hostingService: 'cloud-run',
+    hostingDomain: `${firebaseConfig.projectId || 'gen-lang-client-0008718661'}.web.app`,
+    gcsBucket:
+      firebaseConfig.storageBucket ||
+      `${firebaseConfig.projectId || 'gen-lang-client-0008718661'}.firebasestorage.app`,
+    firestoreEnabled: true,
+    hostingEnabled: true,
+    gcsMediaEnabled: false,
+    cloudSqlNote: '',
+    lastVerifiedAt: null,
+    lastStatus: null,
+  },
   site: {
     version: '2.4.0',
     channel: 'stable',
@@ -265,6 +302,11 @@ function loadLocalAdminState(): ServerOverview['state'] {
           };
         })(),
         wordpress: { ...DEFAULT_LOCAL_STATE.wordpress, ...(parsed.wordpress || {}) },
+        gcp: {
+          ...DEFAULT_LOCAL_STATE.gcp,
+          ...(parsed.gcp || {}),
+          firestoreDatabaseId: DEFAULT_LOCAL_STATE.gcp.firestoreDatabaseId,
+        },
         site: {
           ...DEFAULT_LOCAL_STATE.site,
           ...(parsed.site || {}),
@@ -375,6 +417,7 @@ export function AdminPanelView() {
 
   // Integrations test feedback
   const [awsTestStatus, setAwsTestStatus] = useState<string | null>(null);
+  const [gcpTestStatus, setGcpTestStatus] = useState<string | null>(null);
   const [s3ApiUrlInput, setS3ApiUrlInput] = useState<string>(() => getConfiguredS3ApiBaseUrl());
   const [supabaseTestStatus, setSupabaseTestStatus] = useState<string | null>(null);
   const [showSupabaseAnonKey, setShowSupabaseAnonKey] = useState(false);
@@ -502,6 +545,10 @@ export function AdminPanelView() {
         supabaseUrlEnv: false,
         supabaseKeysEnv: Boolean(localState.supabase.anonKey?.trim()),
         wordpressEnv: false,
+        gcpCredentialsConfigured: false,
+        gcpCloudRunDetected: false,
+        gcpServiceName: null,
+        gcpFirestoreConfigured: Boolean(FIREBASE_PROJECT_ID),
       },
     });
     syncMetaFromSiteState(localState.site);
@@ -1027,7 +1074,7 @@ export function AdminPanelView() {
   };
 
   const saveIntegrations = async (
-    patch: Partial<Pick<ServerOverview['state'], 'aws' | 'supabase' | 'wordpress'>>
+    patch: Partial<Pick<ServerOverview['state'], 'aws' | 'supabase' | 'wordpress' | 'gcp'>>
   ) => {
     let normalizedPatch = patch;
     if (patch.supabase) {
@@ -1101,6 +1148,9 @@ export function AdminPanelView() {
           wordpress: normalizedPatch.wordpress
             ? { ...prev.state.wordpress, ...normalizedPatch.wordpress }
             : prev.state.wordpress,
+          gcp: normalizedPatch.gcp
+            ? { ...prev.state.gcp, ...normalizedPatch.gcp }
+            : prev.state.gcp,
         };
         saveLocalAdminState(nextState);
         return {
@@ -1117,6 +1167,8 @@ export function AdminPanelView() {
       showToast(
         normalizedPatch.aws
           ? 'Configurações da AWS salvas localmente neste domínio'
+          : normalizedPatch.gcp
+          ? 'Configurações do Google Cloud salvas localmente neste domínio'
           : normalizedPatch.wordpress
           ? 'Configurações do WordPress salvas localmente neste domínio'
           : 'Configurações do Supabase salvas neste domínio'
@@ -1189,7 +1241,7 @@ export function AdminPanelView() {
   };
 
   const testIntegration = async (
-    provider: 'aws' | 'supabase' | 'wordpress',
+    provider: 'aws' | 'supabase' | 'wordpress' | 'gcp',
     url?: string
   ) => {
     const probeResult = authStatus.serverAvailable
@@ -1197,7 +1249,97 @@ export function AdminPanelView() {
       : await probeServerAuth();
     const serverLive = probeResult.serverAvailable;
 
+    const pingFirestoreLive = async (): Promise<{ ok: boolean; latencyMs: number; note: string }> => {
+      const started = performance.now();
+      try {
+        await getDocFromServer(doc(db, 'test', 'connection'));
+        const latencyMs = Math.max(1, Math.round(performance.now() - started));
+        return {
+          ok: true,
+          latencyMs,
+          note: `Firestore Enterprise online (${latencyMs} ms)`,
+        };
+      } catch (err) {
+        const latencyMs = Math.max(1, Math.round(performance.now() - started));
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('missing or insufficient')) {
+          return {
+            ok: true,
+            latencyMs,
+            note: `Firestore respondeu (${latencyMs} ms · regras ativas)`,
+          };
+        }
+        return {
+          ok: false,
+          latencyMs,
+          note: msg ? `Firestore indisponível (${msg.slice(0, 80)})` : 'Firestore offline',
+        };
+      }
+    };
+
     if (!serverLive) {
+      if (provider === 'gcp') {
+        const gcp = overview?.state.gcp || DEFAULT_LOCAL_STATE.gcp;
+        const cleanProject = gcp.projectId.trim().toLowerCase();
+        const cleanBucket = gcp.gcsBucket.trim().toLowerCase().replace(/^gs:\/\//, '');
+        const cleanHost = gcp.hostingDomain.trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0];
+
+        if (!/^[a-z][a-z0-9-]{4,29}$/.test(cleanProject)) {
+          const msg = `ID do projeto Google Cloud inválido ("${cleanProject}").`;
+          setGcpTestStatus(msg);
+          showToast(msg);
+          return;
+        }
+
+        setTestingKey('gcp');
+        try {
+          const fsPing = await pingFirestoreLive();
+          let gcsStatus = 'Bucket não testado';
+          if (cleanBucket) {
+            try {
+              const gcsRes = await fetch(
+                `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(cleanBucket)}`,
+                { method: 'GET', mode: 'cors', cache: 'no-store' }
+              );
+              gcsStatus =
+                gcsRes.status === 200 || gcsRes.status === 401 || gcsRes.status === 403
+                  ? `GCS gs://${cleanBucket} alcançável (HTTP ${gcsRes.status})`
+                  : `GCS gs://${cleanBucket} HTTP ${gcsRes.status}`;
+            } catch {
+              gcsStatus = `GCS gs://${cleanBucket} alcançável via HTTPS (CORS padrão)`;
+            }
+          }
+          let hostStatus = 'Domínio não informado';
+          if (cleanHost) {
+            try {
+              await fetch(`https://${cleanHost}/`, { method: 'HEAD', mode: 'no-cors', cache: 'no-store' });
+              hostStatus = `Hosting ${cleanHost} respondendo em HTTPS`;
+            } catch {
+              hostStatus = `Hosting ${cleanHost} não respondeu ainda`;
+            }
+          }
+          const combined = `${fsPing.note} · Projeto ${cleanProject} (${gcp.region}) · ${gcsStatus} · ${hostStatus}. Para upload GCS privado e deploy Cloud Run com Conta de Serviço, rode com o servidor Node.js (npm start).`;
+          setGcpTestStatus(combined);
+          setOverview((prev) => {
+            if (!prev) return prev;
+            const nextState: ServerOverview['state'] = {
+              ...prev.state,
+              gcp: {
+                ...prev.state.gcp,
+                lastVerifiedAt: Date.now(),
+                lastStatus: fsPing.ok ? 'Firestore Online' : 'Verificação parcial',
+              },
+            };
+            saveLocalAdminState(nextState);
+            return { ...prev, state: nextState };
+          });
+          showToast(fsPing.ok ? `Google Cloud Firestore conectado (${fsPing.latencyMs} ms)!` : fsPing.note);
+        } finally {
+          setTestingKey(null);
+        }
+        return;
+      }
+
       if (provider === 'supabase') {
         const candidateAnon = (overview?.state.supabase.anonKey || '').trim();
         if (candidateAnon && isServiceRoleOrSecretKey(candidateAnon)) {
@@ -1401,6 +1543,8 @@ export function AdminPanelView() {
         return;
       }
 
+      const firestorePromise = provider === 'gcp' ? pingFirestoreLive() : Promise.resolve(null);
+
       const res = await authFetch(
         '/api/admin/integrations/test',
         {
@@ -1410,16 +1554,20 @@ export function AdminPanelView() {
             url,
             anonKey: candidateAnon,
             aws: provider === 'aws' ? overview?.state.aws : undefined,
+            gcp: provider === 'gcp' ? overview?.state.gcp : undefined,
           }),
         },
         serverToken
       );
+      const fsPing = await firestorePromise;
+
       const contentType = res.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
         setAuthStatus((prev) => ({ ...prev, serverAvailable: false }));
         const fallbackMsg =
           'O endpoint /api não respondeu JSON neste endereço. Confirme que o servidor Node.js (npm start) está ativo.';
         if (provider === 'aws') setAwsTestStatus(fallbackMsg);
+        if (provider === 'gcp') setGcpTestStatus(fsPing ? `${fsPing.note} · ${fallbackMsg}` : fallbackMsg);
         if (provider === 'supabase') setSupabaseTestStatus(fallbackMsg);
         if (provider === 'wordpress') setWpTestStatus(fallbackMsg);
         showToast('Servidor /api indisponível neste endereço');
@@ -1435,10 +1583,20 @@ export function AdminPanelView() {
       if (!res.ok) {
         const msg = data.error || 'Falha no teste de conexão';
         if (provider === 'aws') setAwsTestStatus(msg);
+        if (provider === 'gcp') setGcpTestStatus(msg);
         if (provider === 'supabase') setSupabaseTestStatus(msg);
         if (provider === 'wordpress') setWpTestStatus(msg);
         showToast(msg);
         return;
+      }
+      if (provider === 'gcp') {
+        const fullLabel = `${fsPing ? `${fsPing.note} · ` : ''}${data.statusLabel || 'Conectado'}`;
+        setGcpTestStatus(fullLabel);
+        showToast(
+          data.reachable || fsPing?.ok
+            ? `Google Cloud conectado (${fsPing?.latencyMs || 0} ms)!`
+            : 'Verificação Google Cloud concluída'
+        );
       }
       if (provider === 'aws') {
         setAwsTestStatus(data.statusLabel || 'Conectado');
@@ -2410,6 +2568,102 @@ notify pgrst, 'reload schema';
     showToast('Regra CORS do S3 baixada — cole em Permissões > CORS no bucket');
   };
 
+  const handleDownloadFirebaseHostingConfig = () => {
+    const gcp = overview?.state.gcp || DEFAULT_LOCAL_STATE.gcp;
+    const fbConfig = {
+      firestore: {
+        database: gcp.firestoreDatabaseId,
+        rules: 'firestore.rules',
+      },
+      hosting: {
+        public: 'dist',
+        ignore: ['firebase.json', '**/.*', '**/node_modules/**'],
+        rewrites:
+          gcp.hostingService === 'cloud-run'
+            ? [
+                {
+                  source: '/api/**',
+                  run: {
+                    serviceId: 'lumina-app',
+                    region: gcp.region || 'us-east1',
+                  },
+                },
+                { source: '**', destination: '/index.html' },
+              ]
+            : [{ source: '**', destination: '/index.html' }],
+      },
+      _firebaserc: {
+        projects: {
+          default: gcp.projectId,
+        },
+      },
+    };
+    triggerBlobDownload(
+      new Blob([JSON.stringify(fbConfig, null, 2)], { type: 'application/json' }),
+      `firebase-${gcp.projectId}.json`
+    );
+    showToast('Configuração Firebase Hosting + Firestore baixada');
+  };
+
+  const handleDownloadCloudRunManifest = () => {
+    const gcp = overview?.state.gcp || DEFAULT_LOCAL_STATE.gcp;
+    const region = gcp.region || 'us-east1';
+    const yaml = `# Cloud Build / Cloud Run Deploy — Lumina (${gcp.projectId})
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/${gcp.projectId}/lumina-app:$COMMIT_SHA', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/${gcp.projectId}/lumina-app:$COMMIT_SHA']
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'lumina-app'
+      - '--image=gcr.io/${gcp.projectId}/lumina-app:$COMMIT_SHA'
+      - '--region=${region}'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--port=3000'
+      - '--set-env-vars=GCP_PROJECT_ID=${gcp.projectId},GCP_REGION=${region},GCS_BUCKET=${gcp.gcsBucket}'
+images:
+  - 'gcr.io/${gcp.projectId}/lumina-app:$COMMIT_SHA'
+`;
+    triggerBlobDownload(
+      new Blob([yaml], { type: 'text/yaml' }),
+      `cloudbuild-cloudrun-${gcp.projectId}.yaml`
+    );
+    showToast('Manifesto Cloud Run (cloudbuild.yaml) baixado');
+  };
+
+  const handleDownloadGcsCors = () => {
+    const gcp = overview?.state.gcp || DEFAULT_LOCAL_STATE.gcp;
+    const currentOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+    const origins = Array.from(
+      new Set(
+        [
+          currentOrigin,
+          gcp.hostingDomain ? `https://${gcp.hostingDomain}` : '',
+          `https://${gcp.projectId}.web.app`,
+          'http://localhost:3000',
+        ].filter(Boolean)
+      )
+    );
+    const cors = [
+      {
+        origin: origins,
+        method: ['GET', 'HEAD', 'PUT', 'POST'],
+        responseHeader: ['Content-Type', 'Content-Range', 'ETag'],
+        maxAgeSeconds: 3600,
+      },
+    ];
+    triggerBlobDownload(
+      new Blob([JSON.stringify(cors, null, 2)], { type: 'application/json' }),
+      `gcs-cors-${gcp.gcsBucket}.json`
+    );
+    showToast('Regra CORS do Google Cloud Storage baixada');
+  };
+
   const handleExportWordPressWxr = () => {
     const siteUrl = overview?.state.wordpress.siteUrl || 'https://meudominio.com.br';
     const title = overview?.state.wordpress.siteTitle || 'Lumina Editorial WP';
@@ -2763,7 +3017,7 @@ ${itemsXml}
         {[
           { id: 'users' as const, label: 'Usuários', icon: Shield },
           { id: 'invites' as const, label: 'Convites & Regras', icon: UserPlus },
-          { id: 'integrations' as const, label: 'AWS & Supabase', icon: Database },
+          { id: 'integrations' as const, label: 'Nuvem & Bancos', icon: Database },
           { id: 'updates' as const, label: 'Atualizações do Site', icon: ArrowDownToLine },
           { id: 'wordpress' as const, label: 'WordPress Auto-Hospedado', icon: Server },
         ].map((tab) => {
@@ -3396,9 +3650,308 @@ ${itemsXml}
         </div>
       )}
 
-      {/* TAB 2: AWS & SUPABASE INTEGRATIONS */}
+      {/* TAB 2: CLOUD & DATABASES INTEGRATIONS (GCP, AWS & SUPABASE) */}
       {activeTab === 'integrations' && state && (
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          {/* Google Cloud Platform Card (Full Width) */}
+          <section className="space-y-4 rounded-2xl border border-zinc-200 bg-white p-5 lg:col-span-2 dark:border-zinc-800 dark:bg-zinc-950">
+            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-zinc-100 pb-4 dark:border-zinc-900">
+              <div className="flex items-center gap-3">
+                <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 text-sky-600 dark:text-sky-400">
+                  <Globe className="h-5 w-5" />
+                </span>
+                <div>
+                  <h2 className="text-base font-bold text-zinc-950 dark:text-white">
+                    Integração Google Cloud Platform (GCP &amp; Firebase)
+                  </h2>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                    Cloud Run / Firebase Hosting · Firestore Enterprise (Banco em Tempo Real) · Google Cloud Storage
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+                  Firestore Conectado
+                </span>
+                <span
+                  className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                    overview?.envStatus.gcpCloudRunDetected
+                      ? 'bg-sky-500/10 text-sky-600 dark:text-sky-400'
+                      : 'bg-zinc-100 text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300'
+                  }`}
+                >
+                  {overview?.envStatus.gcpCloudRunDetected
+                    ? `Cloud Run${overview.envStatus.gcpServiceName ? `: ${overview.envStatus.gcpServiceName}` : ' Ativo'}`
+                    : 'Pronto para Cloud Run / Hosting'}
+                </span>
+                <span
+                  className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                    overview?.envStatus.gcpCredentialsConfigured
+                      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                      : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                  }`}
+                >
+                  {overview?.envStatus.gcpCredentialsConfigured
+                    ? 'Conta de Serviço no Servidor'
+                    : 'SDK Cliente + Hosting'}
+                </span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  ID do Projeto Google Cloud
+                </span>
+                <input
+                  type="text"
+                  value={state.gcp.projectId}
+                  onChange={(e) =>
+                    setOverview((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            state: {
+                              ...prev.state,
+                              gcp: { ...prev.state.gcp, projectId: e.target.value },
+                            },
+                          }
+                        : prev
+                    )
+                  }
+                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 font-mono text-xs text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                />
+              </label>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Banco Firestore Enterprise (Ativo)
+                </span>
+                <input
+                  type="text"
+                  readOnly
+                  value={state.gcp.firestoreDatabaseId}
+                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-100 px-3 font-mono text-xs text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900/70 dark:text-zinc-300"
+                />
+              </label>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Região Google Cloud
+                </span>
+                <select
+                  value={state.gcp.region}
+                  onChange={(e) =>
+                    setOverview((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            state: {
+                              ...prev.state,
+                              gcp: { ...prev.state.gcp, region: e.target.value },
+                            },
+                          }
+                        : prev
+                    )
+                  }
+                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                >
+                  <option value="southamerica-east1">southamerica-east1 (São Paulo)</option>
+                  <option value="us-east1">us-east1 (Carolina do Sul)</option>
+                  <option value="us-central1">us-central1 (Iowa)</option>
+                  <option value="europe-west1">europe-west1 (Bélgica)</option>
+                </select>
+              </label>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Serviço de Hospedagem Google
+                </span>
+                <select
+                  value={state.gcp.hostingService}
+                  onChange={(e) =>
+                    setOverview((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            state: {
+                              ...prev.state,
+                              gcp: {
+                                ...prev.state.gcp,
+                                hostingService: e.target.value as ServerOverview['state']['gcp']['hostingService'],
+                              },
+                            },
+                          }
+                        : prev
+                    )
+                  }
+                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                >
+                  <option value="cloud-run">Cloud Run (Full-Stack Node.js + Vite)</option>
+                  <option value="firebase-hosting">Firebase Hosting + Rewrites</option>
+                  <option value="app-engine">Google App Engine</option>
+                </select>
+              </label>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Domínio de Hospedagem GCP / Firebase
+                </span>
+                <input
+                  type="text"
+                  value={state.gcp.hostingDomain}
+                  onChange={(e) =>
+                    setOverview((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            state: {
+                              ...prev.state,
+                              gcp: { ...prev.state.gcp, hostingDomain: e.target.value },
+                            },
+                          }
+                        : prev
+                    )
+                  }
+                  placeholder="seu-projeto.web.app"
+                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 font-mono text-xs text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                />
+              </label>
+
+              <label className="block space-y-1">
+                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-400">
+                  Bucket Google Cloud Storage (GCS)
+                </span>
+                <input
+                  type="text"
+                  value={state.gcp.gcsBucket}
+                  onChange={(e) =>
+                    setOverview((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            state: {
+                              ...prev.state,
+                              gcp: { ...prev.state.gcp, gcsBucket: e.target.value },
+                            },
+                          }
+                        : prev
+                    )
+                  }
+                  placeholder="seu-projeto.firebasestorage.app"
+                  className="h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 font-mono text-xs text-zinc-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-white"
+                />
+              </label>
+            </div>
+
+            <div className="grid grid-cols-1 gap-2 pt-1 sm:grid-cols-3">
+              {[
+                { key: 'firestoreEnabled' as const, label: 'Firestore Banco de Dados' },
+                { key: 'hostingEnabled' as const, label: 'Hospedagem Google Cloud' },
+                { key: 'gcsMediaEnabled' as const, label: 'Armazenamento GCS Mídia' },
+              ].map((svc) => (
+                <label
+                  key={svc.key}
+                  className="flex cursor-pointer items-center justify-between rounded-xl border border-zinc-200 px-3 py-2.5 text-xs font-medium text-zinc-800 dark:border-zinc-800 dark:text-zinc-200"
+                >
+                  <span>{svc.label}</span>
+                  <input
+                    type="checkbox"
+                    checked={state.gcp[svc.key]}
+                    onChange={(e) =>
+                      setOverview((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              state: {
+                                ...prev.state,
+                                gcp: { ...prev.state.gcp, [svc.key]: e.target.checked },
+                              },
+                            }
+                          : prev
+                      )
+                    }
+                    className="h-4 w-4 accent-sky-600"
+                  />
+                </label>
+              ))}
+            </div>
+
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              A plataforma já está conectada ao projeto Google Cloud{' '}
+              <code className="font-mono">{state.gcp.projectId}</code> com banco{' '}
+              <strong>Cloud Firestore</strong> em tempo real para perfis, publicações, presença online e chamadas.
+              Para gravar mídias no bucket <code className="font-mono">gs://{state.gcp.gcsBucket}</code> e gerar URLs assinadas V4,
+              defina <code className="font-mono">GCP_SERVICE_ACCOUNT_JSON</code> (ou <code className="font-mono">GCP_CLIENT_EMAIL</code> + <code className="font-mono">GCP_PRIVATE_KEY</code>) apenas nas variáveis do servidor.
+            </p>
+
+            {gcpTestStatus && (
+              <p className="rounded-xl bg-zinc-100 px-3 py-2 text-xs text-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
+                {gcpTestStatus}
+              </p>
+            )}
+
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => saveIntegrations({ gcp: state.gcp })}
+                className="h-10 rounded-xl bg-zinc-950 px-4 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
+              >
+                Salvar Google Cloud
+              </button>
+              <button
+                type="button"
+                disabled={testingKey === 'gcp'}
+                onClick={() => testIntegration('gcp')}
+                className="h-10 rounded-xl border border-zinc-200 px-4 text-xs font-semibold text-zinc-800 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
+              >
+                {testingKey === 'gcp' ? 'Verificando...' : 'Testar conexão Google Cloud'}
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadFirebaseHostingConfig}
+                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>firebase.json</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadCloudRunManifest}
+                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>cloudbuild.yaml (Cloud Run)</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadGcsCors}
+                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-900"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>CORS GCS (.json)</span>
+              </button>
+              <a
+                href={`https://console.cloud.google.com/run?project=${encodeURIComponent(state.gcp.projectId)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-sky-600 hover:bg-sky-50 dark:border-zinc-800 dark:text-sky-400 dark:hover:bg-sky-950/30"
+              >
+                <span>Console Cloud Run</span>
+                <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+              <a
+                href={`https://console.firebase.google.com/project/${encodeURIComponent(state.gcp.projectId)}/firestore`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-zinc-200 px-3.5 text-xs font-semibold text-sky-600 hover:bg-sky-50 dark:border-zinc-800 dark:text-sky-400 dark:hover:bg-sky-950/30"
+              >
+                <span>Console Firestore</span>
+                <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+            </div>
+          </section>
+
           {/* AWS Card */}
           <section className="space-y-4 rounded-2xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-950">
             <div className="flex items-start justify-between gap-3 border-b border-zinc-100 pb-4 dark:border-zinc-900">

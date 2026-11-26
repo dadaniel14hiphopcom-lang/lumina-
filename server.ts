@@ -25,6 +25,20 @@ import {
   sanitizeS3Bucket,
   uploadReelToS3,
 } from './server/s3Service.ts';
+import {
+  detectGoogleCloudRuntime,
+  getGcpServiceAccountFromEnv,
+  getSignedGcsDownloadUrl,
+  isSafeGcsObjectKey,
+  probeGcsBucket,
+  readFirebaseAppletConfig,
+  resolveGcsPlaybackUrl,
+  sanitizeGcpHostingDomain,
+  sanitizeGcpProjectId,
+  sanitizeGcpRegion,
+  sanitizeGcsBucket,
+  uploadMediaToGcs,
+} from './server/gcpService.ts';
 import { normalizeVideoFileForWeb } from './server/videoTranscoder.ts';
 import {
   DEFAULT_SUPABASE_URL,
@@ -428,6 +442,20 @@ interface IntegrationState {
     maintenanceMode: boolean;
     lastSyncedAt: number | null;
   };
+  gcp: {
+    projectId: string;
+    firestoreDatabaseId: string;
+    region: string;
+    hostingService: 'cloud-run' | 'firebase-hosting' | 'app-engine';
+    hostingDomain: string;
+    gcsBucket: string;
+    firestoreEnabled: boolean;
+    hostingEnabled: boolean;
+    gcsMediaEnabled: boolean;
+    cloudSqlNote?: string;
+    lastVerifiedAt: number | null;
+    lastStatus: string | null;
+  };
   site: {
     version: string;
     channel: 'stable' | 'beta';
@@ -507,6 +535,26 @@ const DEFAULT_ADMIN_STATE: IntegrationState = {
     maintenanceMode: false,
     lastSyncedAt: null,
   },
+  gcp: (() => {
+    const fbDefaults = readFirebaseAppletConfig();
+    return {
+      projectId: sanitizeGcpProjectId(process.env.GCP_PROJECT_ID, fbDefaults.projectId),
+      firestoreDatabaseId: fbDefaults.firestoreDatabaseId,
+      region: sanitizeGcpRegion(process.env.GCP_REGION, 'us-east1'),
+      hostingService: 'cloud-run',
+      hostingDomain: sanitizeGcpHostingDomain(
+        process.env.GCP_HOSTING_DOMAIN,
+        fbDefaults.hostingDomain
+      ),
+      gcsBucket: sanitizeGcsBucket(process.env.GCS_BUCKET, fbDefaults.storageBucket),
+      firestoreEnabled: true,
+      hostingEnabled: true,
+      gcsMediaEnabled: false,
+      cloudSqlNote: '',
+      lastVerifiedAt: null,
+      lastStatus: null,
+    };
+  })(),
   site: {
     version: '2.4.0',
     channel: 'stable',
@@ -572,6 +620,11 @@ function readAdminState(): IntegrationState {
           };
         })(),
         wordpress: { ...DEFAULT_ADMIN_STATE.wordpress, ...(parsed.wordpress || {}) },
+        gcp: {
+          ...DEFAULT_ADMIN_STATE.gcp,
+          ...(parsed.gcp || {}),
+          firestoreDatabaseId: DEFAULT_ADMIN_STATE.gcp.firestoreDatabaseId,
+        },
         site: {
           ...DEFAULT_ADMIN_STATE.site,
           ...(parsed.site || {}),
@@ -1673,11 +1726,16 @@ async function startServer() {
     const creds = getAwsCredentialsFromEnv();
     const target = resolveAwsMediaTarget(state);
     const awsReady = Boolean(creds && state.aws.s3Enabled);
+    const gcpCreds = getGcpServiceAccountFromEnv();
+    const gcsReady = Boolean(gcpCreds && state.gcp.gcsMediaEnabled && state.gcp.gcsBucket);
     res.json({
       uploadAvailable: true,
-      storageProvider: awsReady ? 'aws-s3' : 'server-disk',
+      storageProvider: awsReady ? 'aws-s3' : gcsReady ? 'google-cloud-storage' : 'server-disk',
       awsCredentialsConfigured: Boolean(creds),
       s3Enabled: state.aws.s3Enabled,
+      gcpCredentialsConfigured: Boolean(gcpCreds),
+      gcsMediaEnabled: state.gcp.gcsMediaEnabled,
+      gcsBucket: state.gcp.gcsBucket,
       cloudFrontActive: awsReady && target.hasRealCloudFront,
       region: target.region,
       bucket: target.bucket,
@@ -1993,7 +2051,37 @@ async function startServer() {
         }
         console.error(`AWS S3 chunk upload HTTP ${uploadResult.status}: ${uploadResult.message}`);
       } catch (err) {
-        console.error('AWS S3 chunk upload failed, falling back to server stream:', err);
+        console.error('AWS S3 chunk upload failed, falling back to next storage provider:', err);
+      }
+    }
+
+    const gcpCreds = getGcpServiceAccountFromEnv();
+    if (gcpCreds && state.gcp.gcsMediaEnabled && state.gcp.gcsBucket) {
+      try {
+        const bodyBuffer = fs.readFileSync(finalPath);
+        const gcsResult = await uploadMediaToGcs({
+          key: finalObjectKey,
+          body: bodyBuffer,
+          contentType: finalContentType,
+          bucket: state.gcp.gcsBucket,
+          creds: gcpCreds,
+        });
+        if (gcsResult.ok) {
+          cleanupPart();
+          cleanupNormalized();
+          res.json({
+            ok: true,
+            url: resolveGcsPlaybackUrl(finalObjectKey),
+            storageProvider: 'google-cloud-storage',
+            key: finalObjectKey,
+            sizeBytes: finalSizeBytes,
+            contentType: finalContentType,
+          });
+          return;
+        }
+        console.error(`GCS chunk upload HTTP ${gcsResult.status}: ${gcsResult.message}`);
+      } catch (err) {
+        console.error('GCS chunk upload failed, falling back to server stream:', err);
       }
     }
 
@@ -2132,7 +2220,34 @@ async function startServer() {
           }
           console.error(`AWS S3 upload HTTP ${uploadResult.status}: ${uploadResult.message}`);
         } catch (err) {
-          console.error('AWS S3 upload failed, falling back to server media stream:', err);
+          console.error('AWS S3 upload failed, falling back to next storage provider:', err);
+        }
+      }
+
+      const gcpCreds = getGcpServiceAccountFromEnv();
+      if (gcpCreds && state.gcp.gcsMediaEnabled && state.gcp.gcsBucket) {
+        try {
+          const gcsResult = await uploadMediaToGcs({
+            key: objectKey,
+            body: finalBuffer,
+            contentType: finalContentType,
+            bucket: state.gcp.gcsBucket,
+            creds: gcpCreds,
+          });
+          if (gcsResult.ok) {
+            res.json({
+              ok: true,
+              url: resolveGcsPlaybackUrl(objectKey),
+              storageProvider: 'google-cloud-storage',
+              key: objectKey,
+              sizeBytes: finalBuffer.length,
+              contentType: finalContentType,
+            });
+            return;
+          }
+          console.error(`GCS upload HTTP ${gcsResult.status}: ${gcsResult.message}`);
+        } catch (err) {
+          console.error('GCS upload failed, falling back to server media stream:', err);
         }
       }
 
@@ -2175,6 +2290,29 @@ async function startServer() {
       key: rawKey,
       expiresSec: 3600,
       config: target,
+    });
+    res.setHeader('Cache-Control', 'private, max-age=3000');
+    res.redirect(302, signedUrl);
+  });
+
+  // Redirect to a short-lived Google Cloud Storage V4 signed GET URL
+  app.get('/api/media/gcs/*', (req, res) => {
+    const rawKey = String((req.params as Record<string, string>)[0] || '').trim();
+    if (!isSafeGcsObjectKey(rawKey)) {
+      res.status(400).json({ error: 'Chave GCS inválida.' });
+      return;
+    }
+    const gcpCreds = getGcpServiceAccountFromEnv();
+    if (!gcpCreds) {
+      res.status(503).json({ error: 'Credenciais Google Cloud não configuradas no servidor.' });
+      return;
+    }
+    const state = readAdminState();
+    const signedUrl = getSignedGcsDownloadUrl({
+      key: rawKey,
+      bucket: state.gcp.gcsBucket,
+      expiresSec: 3600,
+      creds: gcpCreds,
     });
     res.setHeader('Cache-Control', 'private, max-age=3000');
     res.redirect(302, signedUrl);
@@ -2423,6 +2561,8 @@ async function startServer() {
   // Protected Admin Overview
   app.get('/api/admin/overview', requireAdminAuth, (_req, res) => {
     const state = readAdminState();
+    const gcpRuntime = detectGoogleCloudRuntime();
+    const gcpCreds = getGcpServiceAccountFromEnv();
     res.json({
       state,
       envStatus: {
@@ -2437,6 +2577,10 @@ async function startServer() {
             (state.supabase.anonKey && !isSecretSupabaseKey(state.supabase.anonKey))
         ),
         wordpressEnv: Boolean(process.env.WORDPRESS_SITE_URL),
+        gcpCredentialsConfigured: Boolean(gcpCreds),
+        gcpCloudRunDetected: gcpRuntime.cloudRunDetected,
+        gcpServiceName: gcpRuntime.serviceName,
+        gcpFirestoreConfigured: Boolean(FIREBASE_PROJECT_ID),
       },
     });
   });
@@ -2545,6 +2689,46 @@ async function startServer() {
       };
     }
 
+    if (body.gcp && typeof body.gcp === 'object') {
+      const hostingService =
+        body.gcp.hostingService === 'firebase-hosting' || body.gcp.hostingService === 'app-engine'
+          ? body.gcp.hostingService
+          : 'cloud-run';
+      const rawHostingDomain = String(body.gcp.hostingDomain || '').trim();
+      let cleanHostingDomain = '';
+      if (rawHostingDomain) {
+        const domainCandidate = rawHostingDomain
+          .replace(/^https?:\/\//i, '')
+          .split('/')[0]
+          .split(':')[0]
+          .trim()
+          .toLowerCase();
+        const sanitizedDomain = sanitizeGcpHostingDomain(domainCandidate, '__invalid__');
+        if (sanitizedDomain === '__invalid__') {
+          res.status(400).json({
+            error:
+              'Domínio de hospedagem Google Cloud inválido (informe um domínio público válido, ex.: seu-projeto.web.app).',
+          });
+          return;
+        }
+        cleanHostingDomain = sanitizedDomain;
+      }
+
+      current.gcp = {
+        ...current.gcp,
+        projectId: sanitizeGcpProjectId(String(body.gcp.projectId || ''), current.gcp.projectId),
+        firestoreDatabaseId: DEFAULT_ADMIN_STATE.gcp.firestoreDatabaseId,
+        region: sanitizeGcpRegion(String(body.gcp.region || ''), current.gcp.region),
+        hostingService,
+        hostingDomain: cleanHostingDomain,
+        gcsBucket: sanitizeGcsBucket(String(body.gcp.gcsBucket || ''), current.gcp.gcsBucket),
+        firestoreEnabled: Boolean(body.gcp.firestoreEnabled),
+        hostingEnabled: Boolean(body.gcp.hostingEnabled),
+        gcsMediaEnabled: Boolean(body.gcp.gcsMediaEnabled),
+        cloudSqlNote: String(body.gcp.cloudSqlNote || '').slice(0, 180),
+      };
+    }
+
     writeAdminState(current);
     supabaseUsersCache = null;
     supabaseContentCache = null;
@@ -2645,6 +2829,116 @@ async function startServer() {
           statusLabel: `Credenciais AWS configuradas, mas não foi possível alcançar s3://${target.bucket} (${target.region}).`,
         });
       }
+      return;
+    }
+
+    if (provider === 'gcp') {
+      const gcpInput =
+        req.body?.gcp && typeof req.body.gcp === 'object'
+          ? (req.body.gcp as Record<string, unknown>)
+          : null;
+
+      if (gcpInput && typeof gcpInput.projectId === 'string' && gcpInput.projectId.trim()) {
+        if (sanitizeGcpProjectId(gcpInput.projectId, '__invalid__') === '__invalid__') {
+          res.status(400).json({
+            ok: false,
+            error: 'ID do projeto Google Cloud inválido (use 6 a 30 letras minúsculas, números ou hífens).',
+          });
+          return;
+        }
+      }
+      if (gcpInput && typeof gcpInput.region === 'string' && gcpInput.region.trim()) {
+        if (sanitizeGcpRegion(gcpInput.region, '__invalid__') === '__invalid__') {
+          res.status(400).json({
+            ok: false,
+            error: 'Região Google Cloud inválida (ex.: southamerica-east1, us-east1).',
+          });
+          return;
+        }
+      }
+      if (gcpInput && typeof gcpInput.gcsBucket === 'string' && gcpInput.gcsBucket.trim()) {
+        if (sanitizeGcsBucket(gcpInput.gcsBucket, '__invalid__') === '__invalid__') {
+          res.status(400).json({
+            ok: false,
+            error: 'Nome do bucket Google Cloud Storage inválido.',
+          });
+          return;
+        }
+      }
+
+      const effectiveProjectId =
+        typeof gcpInput?.projectId === 'string'
+          ? sanitizeGcpProjectId(gcpInput.projectId, state.gcp.projectId)
+          : state.gcp.projectId;
+      const effectiveRegion =
+        typeof gcpInput?.region === 'string'
+          ? sanitizeGcpRegion(gcpInput.region, state.gcp.region)
+          : state.gcp.region;
+      const effectiveBucket =
+        typeof gcpInput?.gcsBucket === 'string'
+          ? sanitizeGcsBucket(gcpInput.gcsBucket, state.gcp.gcsBucket)
+          : state.gcp.gcsBucket;
+      const rawHostingInput =
+        typeof gcpInput?.hostingDomain === 'string'
+          ? gcpInput.hostingDomain.trim()
+          : state.gcp.hostingDomain;
+
+      let hostingReachable = false;
+      let hostingStatusLabel = 'Domínio não informado';
+      if (rawHostingInput) {
+        try {
+          const cleanHost = rawHostingInput.replace(/^https?:\/\//i, '').split('/')[0];
+          const validatedHosting = await validateExternalUrl(`https://${cleanHost}`);
+          const hostResp = await fetch(validatedHosting.origin, {
+            method: 'HEAD',
+            signal: AbortSignal.timeout(4500),
+          });
+          hostingReachable = hostResp.status > 0 && hostResp.status < 500;
+          hostingStatusLabel = `Hosting HTTPS (${validatedHosting.hostname}): HTTP ${hostResp.status}`;
+        } catch (err) {
+          hostingStatusLabel =
+            err instanceof Error
+              ? `Hosting (${rawHostingInput}): ${err.message}`
+              : `Hosting (${rawHostingInput}): inacessível`;
+        }
+      }
+
+      const gcpCreds = getGcpServiceAccountFromEnv();
+      const gcpRuntime = detectGoogleCloudRuntime();
+      let bucketProbe: Awaited<ReturnType<typeof probeGcsBucket>>;
+      try {
+        bucketProbe = await probeGcsBucket(effectiveBucket, gcpCreds);
+      } catch {
+        bucketProbe = { reachable: false, authenticated: false, status: 0 };
+      }
+
+      const runtimeText = gcpRuntime.cloudRunDetected
+        ? `Cloud Run ativo${gcpRuntime.serviceName ? ` (${gcpRuntime.serviceName})` : ''}`
+        : gcpRuntime.appEngineDetected
+        ? 'App Engine ativo'
+        : 'Servidor Node.js pronto para Cloud Run';
+      const bucketText = bucketProbe.reachable
+        ? `GCS gs://${effectiveBucket} alcançável (HTTP ${bucketProbe.status}${
+            bucketProbe.authenticated ? ', autenticado via Conta de Serviço' : ''
+          })`
+        : `GCS gs://${effectiveBucket} retornou HTTP ${bucketProbe.status || 'timeout'}`;
+      const credsText = gcpCreds
+        ? 'Conta de serviço GCP configurada no servidor'
+        : 'Sem GCP_SERVICE_ACCOUNT_JSON no servidor (Firestore via Firebase SDK ativo; defina segredos para upload GCS privado)';
+
+      state.gcp.lastVerifiedAt = Date.now();
+      state.gcp.lastStatus = bucketProbe.reachable || Boolean(FIREBASE_PROJECT_ID)
+        ? 'Conectado (Firestore + GCP)'
+        : 'Configuração parcial';
+      writeAdminState(state);
+
+      res.json({
+        ok: true,
+        reachable: Boolean(FIREBASE_PROJECT_ID) || bucketProbe.reachable || hostingReachable,
+        httpStatus: bucketProbe.status,
+        hostingReachable,
+        statusLabel: `Projeto ${effectiveProjectId} (${effectiveRegion}) · Firestore Enterprise ativo (${DEFAULT_ADMIN_STATE.gcp.firestoreDatabaseId}) · ${runtimeText} · ${bucketText} · ${hostingStatusLabel} · ${credsText}.`,
+      });
       return;
     }
 
