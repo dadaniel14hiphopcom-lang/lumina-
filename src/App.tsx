@@ -18,7 +18,7 @@ import { ShareSheetModal } from './components/ShareSheetModal';
 import { StoryBar } from './components/StoryBar';
 import { StoryViewer } from './components/StoryViewer';
 import { SocialProvider, useSocial } from './context/SocialContext';
-import { isExclusiveAdminUser } from './lib/firebase';
+import { ADMIN_EMAIL, isExclusiveAdminUser } from './lib/firebase';
 
 function FeedStage({ onAddStory }: { onAddStory: () => void }) {
   const { posts, currentUser, users } = useSocial();
@@ -121,13 +121,13 @@ function LuminaShell() {
     isAuthenticated,
     guestBrowsing,
     firebaseUser,
-    adminMemoryToken,
     currentUser,
     notifications,
     markNotificationsRead,
   } = useSocial();
   const canSeeAdminEntry =
-    !isAuthenticated || isExclusiveAdminUser(firebaseUser) || Boolean(adminMemoryToken);
+    isExclusiveAdminUser(firebaseUser) ||
+    (isAuthenticated && currentUser.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase());
   const [createMode, setCreateMode] = useState<'post' | 'story' | 'reel'>('post');
 
   useEffect(() => {
@@ -213,7 +213,9 @@ function LuminaShell() {
         {activeNav === 'messages' && <MessagesView />}
         {activeNav === 'notifications' && <NotificationsView />}
         {activeNav === 'profile' && <ProfileView />}
-        {activeNav === 'admin' && <AdminPanelView />}
+        {activeNav === 'admin' && (
+          canSeeAdminEntry ? <AdminPanelView /> : <FeedStage onAddStory={() => openCreateWithMode('story')} />
+        )}
       </main>
 
       {/* Modals & Real-time Call Overlay */}

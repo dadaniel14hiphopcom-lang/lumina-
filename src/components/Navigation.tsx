@@ -13,9 +13,10 @@ import {
   Sun,
 } from 'lucide-react';
 import { useSocial } from '../context/SocialContext';
-import { isExclusiveAdminUser } from '../lib/firebase';
+import { ADMIN_EMAIL, isExclusiveAdminUser } from '../lib/firebase';
 import { NavSection } from '../types';
 import { AvatarRing } from './AvatarRing';
+import { GlobalSearchBar } from './GlobalSearchBar';
 
 interface NavigationProps {
   onOpenCreate: () => void;
@@ -32,13 +33,13 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
     toggleTheme,
     isAuthenticated,
     firebaseUser,
-    adminMemoryToken,
     logout,
     openAuthModal,
   } = useSocial();
 
   const canSeeAdminNav =
-    !isAuthenticated || isExclusiveAdminUser(firebaseUser) || Boolean(adminMemoryToken);
+    isExclusiveAdminUser(firebaseUser) ||
+    (isAuthenticated && currentUser.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase());
 
   const myIds = new Set([currentUser.id, currentUser.uid || ''].filter(Boolean));
 
@@ -77,7 +78,7 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
     <>
       {/* Desktop Left Sidebar Rail */}
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-20 flex-col justify-between border-r border-zinc-200 bg-white px-3 py-6 dark:border-zinc-800/80 dark:bg-[#050505] lg:flex xl:w-64 xl:px-4">
-        <div className="space-y-6">
+        <div className="space-y-4">
           {/* Brand Wordmark */}
           <button
             type="button"
@@ -91,6 +92,9 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
               Lumina
             </span>
           </button>
+
+          {/* Global Real-time Search */}
+          <GlobalSearchBar mode="sidebar" />
 
           {/* Nav Links */}
           <nav className="space-y-1" aria-label="Navegação principal">
@@ -255,6 +259,7 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
         </button>
 
         <div className="flex items-center gap-0.5">
+          <GlobalSearchBar mode="mobile" />
           {canSeeAdminNav && (
             <button
               type="button"

@@ -421,7 +421,7 @@ const DEFAULT_SITE_META: SiteMeta = {
   version: '2.4.0',
   announcementBanner: '',
   maintenanceMode: false,
-  realUsersOnly: false,
+  realUsersOnly: true,
   videoRules: DEFAULT_VIDEO_RULES,
 };
 
@@ -1151,6 +1151,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       const res = await fetch('/api/site/meta');
       const contentType = res.headers.get('content-type') || '';
       if (res.ok && contentType.includes('application/json')) {
+        setServerSyncAvailable(true);
         const data = (await res.json()) as Partial<SiteMeta> & {
           supabase?: Partial<BrowserSupabaseConfig>;
         };
@@ -1350,6 +1351,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   isAuthenticatedRef.current = Boolean(state.isAuthenticated);
   const usersRef = useRef(state.users);
   usersRef.current = state.users;
+  const postsRef = useRef(state.posts);
+  postsRef.current = state.posts;
 
   const hydrateGoogleProfileSession = (
     fbUser: FirebaseUser,
@@ -2162,7 +2165,10 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
                     lu.username.toLowerCase() === ru.username.toLowerCase())
               )
           );
-          if (isNewerTimestamp || hasUnseenUsers) {
+          const hasUnseenPosts = remote.posts.some(
+            (rp) => !postsRef.current.some((lp) => lp.id === rp.id)
+          );
+          if (isNewerTimestamp || hasUnseenUsers || hasUnseenPosts) {
             if (remote.updatedAt) {
               lastServerUpdatedAtRef.current = Math.max(
                 lastServerUpdatedAtRef.current,
@@ -2892,6 +2898,16 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     [state.users, state.currentUserId]
   );
 
+  useEffect(() => {
+    if (activeNav !== 'admin' || !state.isAuthenticated) return;
+    const isAdminEmailMatch =
+      isExclusiveAdminUser(firebaseUser) ||
+      currentUser.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+    if (!isAdminEmailMatch) {
+      setActiveNav('feed');
+    }
+  }, [activeNav, state.isAuthenticated, firebaseUser, currentUser.email]);
+
   const visibleUsers = useMemo(() => {
     const nonRestricted = state.users.filter((u) => !u.restricted || u.id === state.currentUserId);
     if (!siteMeta.realUsersOnly) return nonRestricted;
@@ -3421,6 +3437,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       isAuthenticated: true,
     }));
     setGuestBrowsing(false);
+    setAdminMemoryToken(null);
 
     if (auth.currentUser && auth.currentUser.emailVerified) {
       void upsertOwnProfileInCloud(newUser, auth.currentUser).catch(() => {});
@@ -3608,6 +3625,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       isAuthenticated: true,
     }));
     setGuestBrowsing(false);
+    setAdminMemoryToken(null);
     setPendingInviteCode(null);
     setPendingInviteMeta(null);
     setIsInviteModalOpen(false);
@@ -3618,6 +3636,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     if (auth.currentUser && auth.currentUser.emailVerified) {
       void upsertOwnProfileInCloud(newUser, auth.currentUser).catch(() => {});
     }
+    void refreshPublicUsersFromSupabase();
 
     showToast(
       supabaseSynced
@@ -3772,6 +3791,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
               isAuthenticated: true,
             }));
             setGuestBrowsing(false);
+            setAdminMemoryToken(null);
             setViewingProfileId(null);
             setIsInviteModalOpen(false);
             showToast(`Conectado como @${targetUser.username}`);
@@ -3841,16 +3861,32 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           email: sbLogin.email || supabaseEmail,
           password,
         });
+        const resolvedSbEmail = (sbLogin.email || supabaseEmail).trim().toLowerCase();
+        const isSbAdmin = resolvedSbEmail === ADMIN_EMAIL.toLowerCase();
+        const enrichedSbProfile: UserProfile = {
+          ...fallbackProfile,
+          email: resolvedSbEmail || fallbackProfile.email,
+          verified: isSbAdmin ? true : fallbackProfile.verified,
+        };
         setState((prev) => ({
           ...prev,
-          users: mergeUsersSmart(prev.users, [fallbackProfile]),
+          users: mergeUsersSmart(prev.users, [enrichedSbProfile]),
           currentUserId: resolvedProfileId,
           isAuthenticated: true,
         }));
+        if (isSbAdmin) {
+          setAdminMemoryToken(`firebase_admin_sb_${resolvedProfileId}`);
+        } else {
+          setAdminMemoryToken(null);
+        }
         setGuestBrowsing(false);
         setViewingProfileId(null);
         setIsInviteModalOpen(false);
-        showToast(`Conectado como @${fallbackProfile.username}`);
+        showToast(
+          isSbAdmin
+            ? `Administrador conectado: @${enrichedSbProfile.username}`
+            : `Conectado como @${enrichedSbProfile.username}`
+        );
         void refreshPublicUsersFromSupabase();
         return { ok: true };
       }
@@ -3897,6 +3933,8 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             } catch {
               setAdminMemoryToken(`firebase_admin_${fbCred.user.uid}`);
             }
+          } else {
+            setAdminMemoryToken(null);
           }
           const profile = await hydrateGoogleProfileSession(fbCred.user, {
             openAdminIfEligible: false,

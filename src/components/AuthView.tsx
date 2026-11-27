@@ -8,7 +8,6 @@ import {
   LogIn,
   Moon,
   Share2,
-  Shield,
   Sun,
   UserPlus,
 } from 'lucide-react';
@@ -33,7 +32,6 @@ export function AuthView() {
     openAuthModal,
     hasPasswordForUser,
     setGuestBrowsing,
-    setActiveNav,
     showToast,
   } = useSocial();
 
@@ -100,8 +98,7 @@ export function AuthView() {
     const cleanId = identifier.trim().toLowerCase();
     const cleanHandle = cleanId.replace(/^@/, '');
     if (cleanId === ADMIN_EMAIL.toLowerCase() || cleanHandle === 'dadaniel14hiphop') {
-      setActiveNav('admin');
-      showToast('Use o botão "Esqueci — redefinir senha de ADM neste navegador" ou entre com Google.');
+      setHint(`Entre com sua conta Google (${ADMIN_EMAIL}) ou com sua senha cadastrada no Firebase para acessar o Painel Administrativo.`);
       return;
     }
     if (!cleanId.includes('@')) {
@@ -170,14 +167,6 @@ export function AuthView() {
           >
             <Share2 className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Compartilhar</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveNav('admin')}
-            className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-zinc-200 bg-white px-3 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300 dark:hover:bg-zinc-900"
-          >
-            <Shield className="h-3.5 w-3.5" />
-            <span>Painel Admin</span>
           </button>
           <button
             type="button"

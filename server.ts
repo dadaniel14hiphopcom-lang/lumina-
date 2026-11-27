@@ -560,7 +560,7 @@ const DEFAULT_ADMIN_STATE: IntegrationState = {
     channel: 'stable',
     announcementBanner: '',
     maintenanceMode: false,
-    realUsersOnly: false,
+    realUsersOnly: true,
     videoRules: {
       maxVideoSizeMB: 25,
       maxReelDurationSec: 60,
@@ -643,7 +643,8 @@ function readAdminState(): IntegrationState {
   } catch {
     // Fallback to default state
   }
-  return structuredClone(DEFAULT_ADMIN_STATE);
+  memoryAdminState = structuredClone(DEFAULT_ADMIN_STATE);
+  return memoryAdminState;
 }
 
 function writeAdminState(state: IntegrationState): void {
@@ -5453,12 +5454,42 @@ Este pacote dá controle total da infraestrutura ao administrador:
     res.send(zipBuffer);
   });
 
+  // Prune expired ephemeral typing/signaling entries so long-running containers stay lean
+  const cleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of typingStateMap.entries()) {
+      if (now - entry.updatedAt > 10_000) {
+        typingStateMap.delete(key);
+      }
+    }
+    const signalCutoff = now - 45_000;
+    for (const [uid, queue] of callSignalQueueMap.entries()) {
+      const active = queue.filter((s) => s.createdAt >= signalCutoff);
+      if (active.length === 0) {
+        callSignalQueueMap.delete(uid);
+      } else if (active.length !== queue.length) {
+        callSignalQueueMap.set(uid, active);
+      }
+    }
+  }, 60_000);
+  cleanupTimer.unref();
+
   // Development vs Production static serving with dynamic OpenGraph preview tags
-  if (process.env.NODE_ENV === 'production') {
-    const distDir = path.join(ROOT_DIR, 'dist');
-    const distIndexPath = path.join(distDir, 'index.html');
-    app.use(express.static(distDir, { index: false }));
+  const distDir = path.join(ROOT_DIR, 'dist');
+  const distIndexPath = path.join(distDir, 'index.html');
+  const hasDistBuild = fs.existsSync(distIndexPath);
+  const isExplicitDev =
+    process.env.NODE_ENV === 'development' || process.env.npm_lifecycle_event === 'dev';
+  const shouldServeStaticDist =
+    process.env.NODE_ENV === 'production' || (!isExplicitDev && hasDistBuild);
+
+  if (shouldServeStaticDist) {
+    app.use(express.static(distDir, { index: false, maxAge: '1h' }));
     app.get('*', (req, res) => {
+      if (!fs.existsSync(distIndexPath)) {
+        res.status(503).send('Build de produção ausente. Execute npm run build.');
+        return;
+      }
       try {
         const rawHtml = fs.readFileSync(distIndexPath, 'utf8');
         const html = injectLinkPreviewMeta(rawHtml, req);
@@ -5470,7 +5501,20 @@ Este pacote dá controle total da infraestrutura ao administrador:
   } else {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        watch:
+          process.env.DISABLE_HMR === 'true'
+            ? null
+            : {
+                ignored: [
+                  '**/node_modules/**',
+                  '**/.lumina-uploads/**',
+                  '**/dist/**',
+                  '**/.git/**',
+                ],
+              },
+      },
       appType: 'spa',
     });
 
@@ -5503,7 +5547,9 @@ Este pacote dá controle total da infraestrutura ao administrador:
   }
 
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Lumina server running on http://0.0.0.0:${PORT}`);
+    console.log(
+      `Lumina server running on http://0.0.0.0:${PORT} (${shouldServeStaticDist ? 'production-static' : 'vite-dev'})`
+    );
   });
 }
 

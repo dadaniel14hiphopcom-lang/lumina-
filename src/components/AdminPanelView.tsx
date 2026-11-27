@@ -41,6 +41,7 @@ import {
   useSocial,
 } from '../context/SocialContext';
 import { ADMIN_EMAIL, auth, db, FIREBASE_PROJECT_ID, isExclusiveAdminUser } from '../lib/firebase';
+import { syncSiteMetaToCloud } from '../lib/firestoreSync';
 import {
   DEFAULT_SUPABASE_URL,
   type SupabaseCacheAuditResult,
@@ -283,7 +284,7 @@ const DEFAULT_LOCAL_STATE: ServerOverview['state'] = {
     channel: 'stable',
     announcementBanner: '',
     maintenanceMode: false,
-    realUsersOnly: false,
+    realUsersOnly: true,
     videoRules: DEFAULT_VIDEO_RULES,
     updateHistory: [
       {
@@ -384,6 +385,8 @@ export function AdminPanelView() {
     demoMigrationStatus,
     migrateDemoToFirestore,
     firebaseUser,
+    isAuthenticated,
+    setActiveNav,
     adminMemoryToken,
     setAdminMemoryToken,
     activateAdminProfileSession,
@@ -711,6 +714,14 @@ export function AdminPanelView() {
       void authenticateExclusiveAdminWithFirebase(firebaseUser, true);
       return;
     }
+    if (!authStatus.serverAvailable && isExclusiveAdminUser(firebaseUser) && !adminToken && firebaseUser) {
+      const fbToken = `firebase_admin_${firebaseUser.uid}`;
+      setAdminToken(fbToken);
+      setAdminMemoryToken(fbToken);
+      activateAdminProfileSession(fbToken);
+      loadLocalOverview();
+      return;
+    }
     if (!adminToken && adminMemoryToken) {
       setAdminToken(adminMemoryToken);
       void loadOverview(adminMemoryToken, authStatus.serverAvailable);
@@ -774,66 +785,89 @@ export function AdminPanelView() {
     if (!authStatus.serverAvailable) {
       setAuthSubmitting(true);
       try {
-        if (isFirstRunClaim) {
+        if (isFirstRunClaim && !isExclusiveAdminUser(firebaseUser)) {
+          setAuthError(
+            `Somente a conta verificada ${ADMIN_EMAIL} pode entrar ou configurar o Painel Administrativo.`
+          );
+          return;
+        }
+        if (isFirstRunClaim && isExclusiveAdminUser(firebaseUser)) {
           const claimRes = await claimOrUpdateStaticAdminPasscode(passcodeInput.trim());
           if (!claimRes.ok) {
             setAuthError(claimRes.error || 'Não foi possível salvar a senha administrativa.');
             return;
           }
-        } else {
-          const valid = await verifyStaticAdminPasscode(passcodeInput.trim());
-          if (!valid) {
-            // Also verify against exclusive Firebase Email/Password for cross-device admin access
-            try {
-              const fbCred = await signInWithEmailAndPassword(auth, ADMIN_EMAIL, passcodeInput.trim());
-              if (
-                fbCred.user &&
-                fbCred.user.emailVerified &&
-                fbCred.user.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase()
-              ) {
-                await claimOrUpdateStaticAdminPasscode(passcodeInput.trim()).catch(() => {});
-                const fbToken = `firebase_admin_${fbCred.user.uid}`;
-                setManualLock(false);
-                setAdminToken(fbToken);
-                setAdminMemoryToken(fbToken);
-                activateAdminProfileSession(fbToken);
-                setPasscodeInput('');
-                setConfirmInput('');
-                setShowPasscode(false);
-                setAuthStatus((prev) => ({ ...prev, claimed: true }));
-                loadLocalOverview();
-                showToast(`Administrador conectado (${ADMIN_EMAIL}).`);
-                return;
-              }
-              if (fbCred.user && !fbCred.user.emailVerified) {
-                setAuthError(`Confirme o e-mail ${ADMIN_EMAIL} no Firebase antes de entrar.`);
-                return;
-              }
-            } catch {
-              // Fall through to local mismatch error
-            }
-            setAuthError('Senha administrativa incorreta neste navegador.');
+          const fbToken = `firebase_admin_${firebaseUser!.uid}`;
+          setManualLock(false);
+          setAdminToken(fbToken);
+          setAdminMemoryToken(fbToken);
+          activateAdminProfileSession(fbToken);
+          setPasscodeInput('');
+          setConfirmInput('');
+          setShowPasscode(false);
+          setAuthStatus((prev) => ({ ...prev, claimed: true }));
+          loadLocalOverview();
+          showToast(`Senha de ADM salva para ${ADMIN_EMAIL}! Painel desbloqueado.`);
+          return;
+        }
+
+        // Verify exclusive Firebase Email/Password for ADMIN_EMAIL across any browser
+        try {
+          const fbCred = await signInWithEmailAndPassword(auth, ADMIN_EMAIL, passcodeInput.trim());
+          if (
+            fbCred.user &&
+            fbCred.user.emailVerified &&
+            fbCred.user.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase()
+          ) {
+            await claimOrUpdateStaticAdminPasscode(passcodeInput.trim()).catch(() => {});
+            const fbToken = `firebase_admin_${fbCred.user.uid}`;
+            setManualLock(false);
+            setAdminToken(fbToken);
+            setAdminMemoryToken(fbToken);
+            activateAdminProfileSession(fbToken);
+            setPasscodeInput('');
+            setConfirmInput('');
+            setShowPasscode(false);
+            setAuthStatus((prev) => ({ ...prev, claimed: true }));
+            loadLocalOverview();
+            showToast(`Administrador conectado (${ADMIN_EMAIL}).`);
             return;
           }
+          if (fbCred.user && !fbCred.user.emailVerified) {
+            setAuthError(`Confirme o e-mail ${ADMIN_EMAIL} no Firebase antes de entrar.`);
+            return;
+          }
+        } catch {
+          // Fall through to local static passcode check only if already authenticated as ADMIN_EMAIL
         }
-        const staticToken = 'static_admin_local';
-        setManualLock(false);
-        setAdminToken(staticToken);
-        setAdminMemoryToken(staticToken);
-        activateAdminProfileSession(staticToken);
-        setPasscodeInput('');
-        setConfirmInput('');
-        setShowPasscode(false);
-        setAuthStatus((prev) => ({ ...prev, claimed: true }));
-        loadLocalOverview();
-        showToast(
-          isFirstRunClaim
-            ? `Senha de ADM salva nesta hospedagem para ${ADMIN_EMAIL}! Painel desbloqueado.`
-            : `Bem-vindo, administrador (${ADMIN_EMAIL}).`
+
+        if (isExclusiveAdminUser(firebaseUser) && (await verifyStaticAdminPasscode(passcodeInput.trim()))) {
+          const fbToken = `firebase_admin_${firebaseUser!.uid}`;
+          setManualLock(false);
+          setAdminToken(fbToken);
+          setAdminMemoryToken(fbToken);
+          activateAdminProfileSession(fbToken);
+          setPasscodeInput('');
+          setConfirmInput('');
+          setShowPasscode(false);
+          loadLocalOverview();
+          showToast(`Bem-vindo, administrador (${ADMIN_EMAIL}).`);
+          return;
+        }
+
+        setAuthError(
+          `Acesso restrito a ${ADMIN_EMAIL}. Entre com Google ou com a senha verificada da conta administradora.`
         );
       } finally {
         setAuthSubmitting(false);
       }
+      return;
+    }
+
+    if (isFirstRunClaim && !isExclusiveAdminUser(firebaseUser)) {
+      setAuthError(
+        `Primeiro entre com a conta Google ${ADMIN_EMAIL} antes de definir a senha administrativa no servidor.`
+      );
       return;
     }
 
@@ -1005,6 +1039,19 @@ export function AdminPanelView() {
     saveLocalAdminState(nextState);
     setOverview((prev) => (prev ? { ...prev, state: nextState } : prev));
     syncMetaFromSiteState(mergedSite);
+
+    if (isExclusiveAdminUser(auth.currentUser)) {
+      void syncSiteMetaToCloud(
+        {
+          version: mergedSite.version,
+          announcementBanner: mergedSite.announcementBanner,
+          maintenanceMode: Boolean(mergedSite.maintenanceMode),
+          realUsersOnly: Boolean(mergedSite.realUsersOnly),
+          videoRules: mergedSite.videoRules,
+        },
+        auth.currentUser!
+      ).catch(() => {});
+    }
 
     if (!authStatus.serverAvailable) {
       showToast('Regras e configurações aplicadas');
@@ -2881,6 +2928,74 @@ images:
     showToast('Regra CORS do Google Cloud Storage baixada');
   };
 
+  const handleDownloadEnvFile = () => {
+    const cur = overview?.state || DEFAULT_LOCAL_STATE;
+    const sanitizeEnvVal = (raw?: string) =>
+      String(raw || '')
+        .replace(/[\r\n]+/g, '')
+        .trim();
+    const quoteEnv = (val: string) =>
+      val.includes(' ') || val.includes('#') ? `"${val.replace(/"/g, '\\"')}"` : val;
+
+    const appUrl =
+      typeof window !== 'undefined' && window.location.origin
+        ? sanitizeEnvVal(window.location.origin)
+        : '';
+    const rawAnon = sanitizeEnvVal(cur.supabase.anonKey);
+    const safeAnonKey =
+      rawAnon && !/^sb_secret_/i.test(rawAnon) && !/service_role/i.test(rawAnon) ? rawAnon : '';
+
+    const envContent = `# ==========================================================
+# Lumina — Variáveis de Ambiente (.env)
+# Preencha apenas as chaves secretas abaixo no seu servidor.
+# Nunca compartilhe ou envie este arquivo preenchido para repositórios públicos.
+# ==========================================================
+
+# Runtime & Aplicação
+PORT=3000
+NODE_ENV=production
+APP_URL=${quoteEnv(appUrl)}
+GEMINI_API_KEY=
+
+# Administração & Sessão
+ADMIN_PASSCODE=
+SESSION_SECRET=
+
+# AWS S3 & CloudFront
+AWS_REGION=${quoteEnv(sanitizeEnvVal(cur.aws.region || 'sa-east-1'))}
+AWS_S3_BUCKET=${quoteEnv(sanitizeEnvVal(cur.aws.bucket))}
+AWS_CLOUDFRONT_DOMAIN=${quoteEnv(sanitizeEnvVal(cur.aws.cloudFrontDomain))}
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_SESSION_TOKEN=
+VITE_S3_API_URL=
+
+# Supabase (Servidor e Cliente VITE_)
+SUPABASE_URL=${quoteEnv(sanitizeEnvVal(cur.supabase.projectUrl))}
+SUPABASE_ANON_KEY=${quoteEnv(safeAnonKey)}
+SUPABASE_SERVICE_ROLE_KEY=
+VITE_SUPABASE_URL=${quoteEnv(sanitizeEnvVal(cur.supabase.projectUrl))}
+VITE_SUPABASE_ANON_KEY=${quoteEnv(safeAnonKey)}
+
+# Google Cloud Platform (Servidor)
+GCP_PROJECT_ID=${quoteEnv(sanitizeEnvVal(cur.gcp.projectId))}
+GCP_REGION=${quoteEnv(sanitizeEnvVal(cur.gcp.region || 'us-east1'))}
+GCS_BUCKET=${quoteEnv(sanitizeEnvVal(cur.gcp.gcsBucket))}
+GCP_HOSTING_DOMAIN=${quoteEnv(sanitizeEnvVal(cur.gcp.hostingDomain))}
+GCP_CLIENT_EMAIL=
+GCP_PRIVATE_KEY=
+GCP_SERVICE_ACCOUNT_JSON=
+
+# WordPress Auto-Hospedado
+WORDPRESS_SITE_URL=${quoteEnv(sanitizeEnvVal(cur.wordpress.siteUrl))}
+WORDPRESS_APP_USER=
+WORDPRESS_APP_PASSWORD=
+`;
+
+    triggerBlobDownload(new Blob([envContent], { type: 'text/plain;charset=utf-8' }), '.env');
+    showToast('Arquivo .env baixado com as variáveis da Lumina');
+  };
+
   const handleDownloadWordPressPluginZip = () => {
     const entries = buildWordPressPluginEntries({
       siteTitle: overview?.state.wordpress.siteTitle || 'Lumina Editorial WP',
@@ -3011,7 +3126,36 @@ ${itemsXml}
   if (!adminToken) {
     const signedWrongGoogleAccount =
       Boolean(firebaseUser) && !isExclusiveAdminUser(firebaseUser);
+    const signedWrongAppAccount =
+      isAuthenticated &&
+      !isExclusiveAdminUser(firebaseUser) &&
+      currentUser.email?.toLowerCase() !== ADMIN_EMAIL.toLowerCase();
     const isAdminGoogleReady = isExclusiveAdminUser(firebaseUser);
+
+    if (signedWrongAppAccount) {
+      return (
+        <div className="mx-auto flex min-h-[calc(100vh-6rem)] w-full max-w-md items-center justify-center px-4 py-10">
+          <div className="w-full space-y-4 rounded-2xl border border-zinc-200 bg-white p-6 text-center dark:border-zinc-800 dark:bg-zinc-950">
+            <span className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl bg-rose-500/10 text-rose-600 dark:text-rose-400">
+              <Shield className="h-5 w-5" />
+            </span>
+            <h1 className="text-base font-bold text-zinc-950 dark:text-white">
+              Acesso restrito ao administrador
+            </h1>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              O Painel ADM é exclusivo para a conta <strong>{ADMIN_EMAIL}</strong>.
+            </p>
+            <button
+              type="button"
+              onClick={() => setActiveNav('feed')}
+              className="h-10 w-full rounded-xl bg-zinc-950 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
+            >
+              Voltar para o Feed
+            </button>
+          </div>
+        </div>
+      );
+    }
 
     return (
       <div className="mx-auto flex min-h-[calc(100vh-6rem)] w-full max-w-md items-center justify-center px-4 py-10">
@@ -3057,22 +3201,6 @@ ${itemsXml}
               {authError && (
                 <div className="space-y-2.5 rounded-xl border border-rose-500/30 bg-rose-50 px-3.5 py-3 text-xs font-medium text-rose-700 dark:bg-rose-950/40 dark:text-rose-300">
                   <p>{authError}</p>
-                  {!authStatus.serverAvailable && authStatus.claimed && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        clearStaticAdminPasscode();
-                        setAuthError(null);
-                        setPasscodeInput('');
-                        setConfirmInput('');
-                        setAuthStatus((prev) => ({ ...prev, claimed: false }));
-                        showToast('Senha local removida. Crie ou gere uma nova senha de ADM abaixo.');
-                      }}
-                      className="inline-flex h-9 w-full items-center justify-center rounded-lg bg-rose-600 px-3 text-xs font-semibold text-white hover:bg-rose-700"
-                    >
-                      Limpar senha antiga e redefinir neste navegador
-                    </button>
-                  )}
                 </div>
               )}
 
@@ -3104,6 +3232,7 @@ ${itemsXml}
                 </button>
               )}
 
+              {(isAdminGoogleReady || (authStatus.serverAvailable && (authStatus.claimed || authStatus.envConfigured))) && (
               <div className="border-t border-zinc-200 pt-4 dark:border-zinc-800">
                 <div className="mb-3 flex items-center justify-between gap-2">
                   <div>
@@ -3116,7 +3245,7 @@ ${itemsXml}
                       Vinculada exclusivamente a {ADMIN_EMAIL}
                     </p>
                   </div>
-                  {!authStatus.claimed && !authStatus.envConfigured && (
+                  {isAdminGoogleReady && !authStatus.claimed && !authStatus.envConfigured && (
                     <button
                       type="button"
                       onClick={() => {
@@ -3204,23 +3333,6 @@ ${itemsXml}
                       : 'Entrar com senha de ADM'}
                   </button>
 
-                  {!authStatus.serverAvailable && authStatus.claimed && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        clearStaticAdminPasscode();
-                        setAuthError(null);
-                        setPasscodeInput('');
-                        setConfirmInput('');
-                        setAuthStatus((prev) => ({ ...prev, claimed: false }));
-                        showToast('Senha local limpa. Crie ou gere uma nova senha de ADM para este navegador.');
-                      }}
-                      className="h-9 w-full rounded-xl border border-sky-300 bg-sky-50 text-xs font-semibold text-sky-800 hover:bg-sky-100 dark:border-sky-800/70 dark:bg-sky-950/40 dark:text-sky-300 dark:hover:bg-sky-900/50"
-                    >
-                      Esqueci — redefinir senha de ADM neste navegador
-                    </button>
-                  )}
-
                   {authStatus.serverAvailable && authStatus.claimed && !authStatus.envConfigured && (
                     <button
                       type="button"
@@ -3233,6 +3345,7 @@ ${itemsXml}
                   )}
                 </form>
               </div>
+              )}
 
               {!authStatus.serverAvailable && (
                 <div className="space-y-2 rounded-xl border border-amber-500/30 bg-amber-50 p-3.5 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
@@ -3992,6 +4105,29 @@ ${itemsXml}
       {/* TAB 2: CLOUD & DATABASES INTEGRATIONS (GCP, AWS & SUPABASE) */}
       {activeTab === 'integrations' && state && (
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          {/* Environment (.env) Download Card */}
+          <section className="flex flex-col gap-3 rounded-2xl border border-zinc-200 bg-white p-5 lg:col-span-2 sm:flex-row sm:items-center sm:justify-between dark:border-zinc-800 dark:bg-zinc-950">
+            <div className="min-w-0 space-y-1">
+              <div className="flex items-center gap-2">
+                <FileCode2 className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                <h2 className="text-sm font-bold text-zinc-950 dark:text-white">
+                  Arquivo de Variáveis de Ambiente (.env)
+                </h2>
+              </div>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                Baixe o arquivo <code className="font-mono">.env</code> já preenchido com os domínios, buckets e IDs configurados (chaves secretas ficam em branco por segurança).
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleDownloadEnvFile}
+              className="inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-xl bg-zinc-950 px-4 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950"
+            >
+              <Download className="h-3.5 w-3.5" />
+              <span>Baixar arquivo .env</span>
+            </button>
+          </section>
+
           {/* Google Cloud Platform Card (Full Width) */}
           <section className="space-y-4 rounded-2xl border border-zinc-200 bg-white p-5 lg:col-span-2 dark:border-zinc-800 dark:bg-zinc-950">
             <div className="flex flex-wrap items-start justify-between gap-3 border-b border-zinc-100 pb-4 dark:border-zinc-900">
@@ -5084,6 +5220,15 @@ ${itemsXml}
                     <span>
                       {downloadingCode ? 'Compactando...' : 'Baixar o código (.zip)'}
                     </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleDownloadEnvFile}
+                    className="inline-flex h-10 items-center gap-2 rounded-xl border border-zinc-200 px-4 text-xs font-semibold text-zinc-800 hover:bg-zinc-50 dark:border-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                  >
+                    <Download className="h-4 w-4" />
+                    <span>Baixar .env</span>
                   </button>
                 </div>
               </div>
