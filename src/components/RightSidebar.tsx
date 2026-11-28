@@ -16,6 +16,7 @@ import { isUserEffectivelyOnline, useSocial } from '../context/SocialContext';
 import { formatCompactCount } from '../utils/time';
 import { AvatarRing } from './AvatarRing';
 import { ProfileHoverCard } from './ProfileHoverCard';
+import { SuggestedUsers } from './SuggestedUsers';
 
 export function RightSidebar() {
   const {
@@ -91,19 +92,10 @@ export function RightSidebar() {
       .slice(0, 3);
   }, [users, posts, currentUser.id]);
 
-  const suggestions = useMemo(() => {
-    const trendingIds = new Set(trendingUsers.map((t) => t.user.id));
-    const eligible = users.filter((u) => u.id !== currentUser.id && !u.restricted);
-    const nonTrending = eligible.filter((u) => !trendingIds.has(u.id));
-    const pool = nonTrending.length > 0 ? nonTrending : eligible;
-    return [...pool]
-      .sort((a, b) => {
-        const aReal = a.isDemoSeed ? 0 : 1;
-        const bReal = b.isDemoSeed ? 0 : 1;
-        return bReal - aReal;
-      })
-      .slice(0, 6);
-  }, [users, currentUser.id, trendingUsers]);
+  const trendingIdSet = useMemo(
+    () => new Set(trendingUsers.map((t) => t.user.id)),
+    [trendingUsers]
+  );
 
   const handlePasswordLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -293,62 +285,7 @@ export function RightSidebar() {
         )}
 
         {/* Suggestions */}
-        <div>
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-zinc-500 dark:text-zinc-400">
-              Sugestões para você
-            </h2>
-          </div>
-
-          <div className="space-y-3">
-            {suggestions.map((user) => {
-              const isFollowing = currentUser.following.includes(user.id);
-              return (
-                <div key={user.id} className="flex items-center justify-between gap-3">
-                  <ProfileHoverCard userId={user.id} className="min-w-0 flex-1">
-                    <button
-                      type="button"
-                      onClick={() => openProfile(user.id)}
-                      className="flex w-full min-w-0 items-center gap-3 text-left"
-                    >
-                      <AvatarRing
-                        src={user.avatarUrl}
-                        alt={user.username}
-                        size="sm"
-                        showOnlineIndicator={isUserEffectivelyOnline(user, currentUser.id)}
-                      />
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-1">
-                          <span className="truncate text-sm font-semibold text-zinc-950 hover:underline dark:text-zinc-100">
-                            {user.username}
-                          </span>
-                          {user.verified && (
-                            <BadgeCheck className="h-3.5 w-3.5 shrink-0 text-sky-500" />
-                          )}
-                        </div>
-                        <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
-                          {user.displayName}
-                        </p>
-                      </div>
-                    </button>
-                  </ProfileHoverCard>
-
-                  <button
-                    type="button"
-                    onClick={() => toggleFollow(user.id)}
-                    className={`shrink-0 whitespace-nowrap text-xs font-semibold ${
-                      isFollowing
-                        ? 'text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200'
-                        : 'text-sky-600 hover:text-sky-700 dark:text-sky-400'
-                    }`}
-                  >
-                    {isFollowing ? 'Seguindo' : 'Seguir'}
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        </div>
+        <SuggestedUsers excludeIds={trendingIdSet} limit={5} />
 
         {/* Quiet Footer Links */}
         <footer className="border-t border-zinc-200/80 pt-4 text-xs leading-relaxed text-zinc-400 dark:border-zinc-800/80 dark:text-zinc-500">
