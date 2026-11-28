@@ -9,6 +9,7 @@ import { InviteRegisterModal } from './components/InviteRegisterModal';
 import { MessagesView } from './components/MessagesView';
 import { Navigation } from './components/Navigation';
 import { NotificationsView } from './components/NotificationsView';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import { PostCard } from './components/PostCard';
 import { PostDetailModal } from './components/PostDetailModal';
 import { ProfileView } from './components/ProfileView';
@@ -18,7 +19,6 @@ import { ShareSheetModal } from './components/ShareSheetModal';
 import { StoryBar } from './components/StoryBar';
 import { StoryViewer } from './components/StoryViewer';
 import { SocialProvider, useSocial } from './context/SocialContext';
-import { ADMIN_EMAIL, isExclusiveAdminUser } from './lib/firebase';
 
 function FeedStage({ onAddStory }: { onAddStory: () => void }) {
   const { posts, currentUser, users } = useSocial();
@@ -120,14 +120,12 @@ function LuminaShell() {
     siteMeta,
     isAuthenticated,
     guestBrowsing,
-    firebaseUser,
+    isExclusiveAdmin,
     currentUser,
     notifications,
     markNotificationsRead,
   } = useSocial();
-  const canSeeAdminEntry =
-    isExclusiveAdminUser(firebaseUser) ||
-    (isAuthenticated && currentUser.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase());
+  const canSeeAdminEntry = isExclusiveAdmin;
   const [createMode, setCreateMode] = useState<'post' | 'story' | 'reel'>('post');
 
   useEffect(() => {
@@ -144,7 +142,7 @@ function LuminaShell() {
     setIsCreateOpen(true);
   };
 
-  if (!isAuthenticated && !guestBrowsing && activeNav !== 'admin') {
+  if (!isAuthenticated && !guestBrowsing && !canSeeAdminEntry) {
     return (
       <>
         <AuthView />
@@ -172,6 +170,8 @@ function LuminaShell() {
       }`}
     >
       <Navigation onOpenCreate={() => openCreateWithMode('post')} />
+
+      <OfflineIndicator />
 
       {siteMeta.announcementBanner.trim().length > 0 && (
         <div className="shrink-0 border-b border-zinc-200 bg-white px-4 py-2 text-center text-xs font-medium text-zinc-700 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300">

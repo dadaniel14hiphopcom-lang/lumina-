@@ -466,6 +466,51 @@ function loadInitialInvites(): InviteRecord[] {
   return [];
 }
 
+const OFFLINE_FEED_CACHE_NAME = 'lumina-feed-snapshot-v1';
+const OFFLINE_FEED_CACHE_URL = '/__lumina_offline_feed__.json';
+
+async function writeFeedCacheSnapshot(snapshot: PersistedState): Promise<void> {
+  if (typeof window === 'undefined' || !('caches' in window)) return;
+  try {
+    const cache = await window.caches.open(OFFLINE_FEED_CACHE_NAME);
+    const payload = JSON.stringify({
+      users: snapshot.users.slice(0, 120),
+      posts: snapshot.posts.slice(0, 120),
+      stories: snapshot.stories.slice(0, 60),
+      cachedAt: Date.now(),
+    });
+    await cache.put(
+      OFFLINE_FEED_CACHE_URL,
+      new Response(payload, {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+  } catch {
+    // Ignore Cache Storage quota errors
+  }
+}
+
+async function readFeedCacheSnapshot(): Promise<{
+  users?: UserProfile[];
+  posts?: Post[];
+  stories?: StoryItem[];
+} | null> {
+  if (typeof window === 'undefined' || !('caches' in window)) return null;
+  try {
+    const cache = await window.caches.open(OFFLINE_FEED_CACHE_NAME);
+    const res = await cache.match(OFFLINE_FEED_CACHE_URL);
+    if (!res) return null;
+    const parsed = (await res.json()) as {
+      users?: UserProfile[];
+      posts?: Post[];
+      stories?: StoryItem[];
+    };
+    return parsed && (Array.isArray(parsed.posts) || Array.isArray(parsed.users)) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function loadInitialState(): PersistedState {
   const cachedRealUsers = readCachedProfilesSync();
   try {
@@ -578,6 +623,7 @@ interface SocialContextValue {
   setGuestBrowsing: (guest: boolean) => void;
   firebaseUser: FirebaseUser | null;
   cloudConnected: boolean;
+  isExclusiveAdmin: boolean;
   adminMemoryToken: string | null;
   setAdminMemoryToken: React.Dispatch<React.SetStateAction<string | null>>;
   activateAdminProfileSession: (token: string) => void;
@@ -1550,7 +1596,13 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       if (!fbUser || !fbUser.emailVerified) return;
 
       void ensureAdminDocIfMatched(fbUser).catch(() => {});
-      if (!isAuthenticatedRef.current) {
+      const activeUserNow = usersRef.current.find((u) => u.id === currentUserIdRef.current);
+      const needsAdminEmailRepair =
+        isExclusiveAdminUser(fbUser) &&
+        (!activeUserNow ||
+          activeUserNow.email?.trim().toLowerCase() !== ADMIN_EMAIL.toLowerCase() ||
+          activeUserNow.uid !== fbUser.uid);
+      if (!isAuthenticatedRef.current || needsAdminEmailRepair) {
         let openAdmin = false;
         try {
           openAdmin = sessionStorage.getItem('lumina_google_redirect_target') === 'admin';
@@ -2097,6 +2149,39 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     void hydrateProfileMediaForTarget(viewingProfileId);
   }, [activeNav, viewingProfileId, firebaseUser?.uid, runtimeConfigVersion]);
 
+  // Hydrate offline Cache Storage feed snapshot on startup (ensures feed renders offline even if localStorage was compact)
+  useEffect(() => {
+    let active = true;
+    void readFeedCacheSnapshot().then((cached) => {
+      if (!active || !cached) return;
+      const activeFlags = getActiveAdminFlagOverrides();
+      skipNextStateBroadcastRef.current = true;
+      setState((prev) => {
+        const nextUsers =
+          Array.isArray(cached.users) && cached.users.length > 0
+            ? mergeUsersSmart(prev.users, cached.users, activeFlags)
+            : prev.users;
+        const nextPosts =
+          Array.isArray(cached.posts) && cached.posts.length > 0
+            ? mergeRecordsById(prev.posts, cached.posts).sort((a, b) => b.createdAt - a.createdAt)
+            : prev.posts;
+        const nextStories =
+          Array.isArray(cached.stories) && cached.stories.length > 0
+            ? mergeRecordsById(prev.stories, cached.stories).sort((a, b) => b.createdAt - a.createdAt)
+            : prev.stories;
+        return {
+          ...prev,
+          users: nextUsers,
+          posts: nextPosts,
+          stories: nextStories,
+        };
+      });
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   // Node server + Supabase cross-device sync (parallelized for lower latency)
   useEffect(() => {
     let active = true;
@@ -2312,16 +2397,21 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         setTypingByUserId((prev) => {
           const next: Record<string, number> = {};
           for (const [k, ts] of Object.entries(prev)) {
-            if (now - ts < 4200) next[k] = ts;
+            // Preserve recent WS/BroadcastChannel typing signals briefly so poll lag doesn't flicker
+            if (now - ts < 1600 && !isUserBlocked(k)) {
+              next[k] = ts;
+            }
           }
           for (const id of typingRes.typingFromIds!) {
-            next[id] = now;
+            if (!isUserBlocked(id)) {
+              next[id] = now;
+            }
           }
           const prevKeys = Object.keys(prev);
           const nextKeys = Object.keys(next);
           if (
             prevKeys.length === nextKeys.length &&
-            nextKeys.every((k) => prev[k] !== undefined)
+            nextKeys.every((k) => prev[k] !== undefined && now - prev[k] < 900)
           ) {
             return prev;
           }
@@ -2403,6 +2493,21 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         if (event.type === 'call_signal' && event.signal) {
           handleCallSignalRef.current?.(event.signal);
         } else if (event.type === 'chat_message' || event.type === 'chat_read') {
+          if (event.type === 'chat_message' && event.senderId) {
+            const senderObj = usersRef.current.find(
+              (u) => u.id === event.senderId || u.uid === event.senderId
+            );
+            setTypingByUserId((prev) => {
+              if (!prev[event.senderId] && !(senderObj?.id && prev[senderObj.id]) && !(senderObj?.uid && prev[senderObj.uid])) {
+                return prev;
+              }
+              const next = { ...prev };
+              delete next[event.senderId];
+              if (senderObj?.id) delete next[senderObj.id];
+              if (senderObj?.uid) delete next[senderObj.uid];
+              return next;
+            });
+          }
           void pullMessagesNowRef.current?.();
         } else if (event.type === 'social_update') {
           void pullServerStateNowRef.current?.();
@@ -2426,12 +2531,21 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
             }),
           }));
         } else if (event.type === 'chat_typing' && event.fromUserId) {
+          if (
+            isUserBlocked(event.fromUserId) ||
+            (event.fromUid && isUserBlocked(event.fromUid))
+          ) {
+            return;
+          }
           setTypingByUserId((prev) => {
             const next = { ...prev };
+            const now = Date.now();
             if (event.isTyping) {
-              next[event.fromUserId] = Date.now();
+              next[event.fromUserId] = now;
+              if (event.fromUid) next[event.fromUid] = now;
             } else {
               delete next[event.fromUserId];
+              if (event.fromUid) delete next[event.fromUid];
             }
             return next;
           });
@@ -2611,14 +2725,26 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
           return;
         }
         if (payload.type === 'typing_sync' && payload.fromUserId) {
+          if (
+            isUserBlocked(payload.fromUserId) ||
+            (payload.fromUid && isUserBlocked(payload.fromUid))
+          ) {
+            return;
+          }
           const me = usersRef.current.find((u) => u.id === currentUserIdRef.current);
           const myIds = new Set([currentUserIdRef.current, me?.uid || ''].filter(Boolean));
-          if (!payload.toUserId || myIds.has(payload.toUserId)) {
+          const toUid = (payload as { toUid?: string }).toUid;
+          if (
+            (!payload.toUserId && !toUid) ||
+            (payload.toUserId && myIds.has(payload.toUserId)) ||
+            (toUid && myIds.has(toUid))
+          ) {
             setTypingByUserId((prev) => {
               const next = { ...prev };
+              const now = Date.now();
               if (payload.isTyping) {
-                next[payload.fromUserId!] = Date.now();
-                if (payload.fromUid) next[payload.fromUid] = Date.now();
+                next[payload.fromUserId!] = now;
+                if (payload.fromUid) next[payload.fromUid] = now;
               } else {
                 delete next[payload.fromUserId!];
                 if (payload.fromUid) delete next[payload.fromUid];
@@ -2731,6 +2857,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
   latestStateRef.current = state;
 
   const persistLocalStorageNow = (snapshot: PersistedState) => {
+    void writeFeedCacheSnapshot(snapshot);
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
     } catch {
@@ -2898,15 +3025,20 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     [state.users, state.currentUserId]
   );
 
+  const isExclusiveAdmin = Boolean(
+    isExclusiveAdminUser(firebaseUser) ||
+      (state.isAuthenticated &&
+        currentUser?.email?.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase() &&
+        (!firebaseUser?.email ||
+          firebaseUser.email.trim().toLowerCase() === ADMIN_EMAIL.toLowerCase()))
+  );
+
   useEffect(() => {
-    if (activeNav !== 'admin' || !state.isAuthenticated) return;
-    const isAdminEmailMatch =
-      isExclusiveAdminUser(firebaseUser) ||
-      currentUser.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase();
-    if (!isAdminEmailMatch) {
+    if (activeNav !== 'admin') return;
+    if (!isExclusiveAdmin) {
       setActiveNav('feed');
     }
-  }, [activeNav, state.isAuthenticated, firebaseUser, currentUser.email]);
+  }, [activeNav, isExclusiveAdmin]);
 
   const visibleUsers = useMemo(() => {
     const nonRestricted = state.users.filter((u) => !u.restricted || u.id === state.currentUserId);
@@ -3694,14 +3826,33 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         (c.email && c.email.toLowerCase() === rawId)
     );
 
-    if (localCred) {
+    const isAdminLocalCred = Boolean(
+      localCred &&
+        (localCred.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase() ||
+          localCred.username.toLowerCase() === 'dadaniel14hiphop')
+    );
+
+    if (localCred && (!isAdminLocalCred || !serverSyncAvailable)) {
       const candidateHash = await derivePasswordHash(password, localCred.salt);
       if (constantTimeEqual(candidateHash, localCred.hash)) {
         const targetUser =
           state.users.find((u) => u.id === localCred.userId) ||
           state.users.find((u) => u.username.toLowerCase() === localCred.username.toLowerCase());
         if (targetUser) {
-          setState((prev) => ({ ...prev, currentUserId: targetUser.id, isAuthenticated: true }));
+          const resolvedEmail = targetUser.email || localCred.email;
+          setState((prev) => ({
+            ...prev,
+            users: resolvedEmail
+              ? prev.users.map((u) =>
+                  u.id === targetUser.id ? { ...u, email: resolvedEmail } : u
+                )
+              : prev.users,
+            currentUserId: targetUser.id,
+            isAuthenticated: true,
+          }));
+          if (isAdminLocalCred) {
+            setAdminMemoryToken(`static_admin_${targetUser.id}`);
+          }
           setGuestBrowsing(false);
           setViewingProfileId(null);
           setIsInviteModalOpen(false);
@@ -3782,11 +3933,15 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
               email: data.email || targetUser.email,
               password,
             });
+            const resolvedEmail = data.email || targetUser.email || localCred?.email;
             setState((prev) => ({
               ...prev,
-              users: incomingProfile
+              users: (incomingProfile
                 ? mergeUsersSmart(prev.users, [incomingProfile])
-                : prev.users,
+                : prev.users
+              ).map((u) =>
+                u.id === targetUser.id && resolvedEmail ? { ...u, email: resolvedEmail } : u
+              ),
               currentUserId: targetUser.id,
               isAuthenticated: true,
             }));
@@ -5324,14 +5479,19 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
     if (!state.isAuthenticated || !recipientId || currentUser.isDemoSeed) return;
     const resolved = getUserById(recipientId);
     const canonicalRecipientId = resolved?.id || recipientId;
-    if (isUserBlocked(canonicalRecipientId)) return;
+    const recipientUid = resolved?.uid;
+    if (isUserBlocked(canonicalRecipientId) || (recipientUid && isUserBlocked(recipientUid))) return;
 
     const now = Date.now();
-    const emitKey = `${canonicalRecipientId}:${isTyping ? '1' : '0'}`;
-    if (isTyping && now - (lastTypingEmitRef.current[emitKey] || 0) < 1600) {
-      return;
+    const activeKey = `${canonicalRecipientId}:1`;
+    if (isTyping) {
+      if (now - (lastTypingEmitRef.current[activeKey] || 0) < 1600) {
+        return;
+      }
+      lastTypingEmitRef.current[activeKey] = now;
+    } else {
+      delete lastTypingEmitRef.current[activeKey];
     }
-    lastTypingEmitRef.current[emitKey] = now;
 
     channelRef.current?.postMessage({
       senderTabId: tabIdRef.current,
@@ -5339,23 +5499,29 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
       fromUserId: currentUser.id,
       fromUid: currentUser.uid,
       toUserId: canonicalRecipientId,
+      toUid: recipientUid,
       isTyping,
     });
 
-    wsHandleRef.current?.send({
+    const sentViaWs = wsHandleRef.current?.send({
       type: 'chat_typing',
       fromUserId: currentUser.id,
+      fromUid: currentUser.uid,
       toUserId: canonicalRecipientId,
+      toUid: recipientUid,
+      threadId,
       isTyping,
     });
 
-    if (serverSyncAvailable) {
+    if (!sentViaWs && serverSyncAvailable) {
       void fetch('/api/social/typing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fromUserId: currentUser.id,
+          fromUid: currentUser.uid,
           toUserId: canonicalRecipientId,
+          toUid: recipientUid,
           threadId,
           isTyping,
         }),
@@ -6388,6 +6554,7 @@ export function SocialProvider({ children }: { children: React.ReactNode }) {
         },
         firebaseUser,
         cloudConnected,
+        isExclusiveAdmin,
         adminMemoryToken,
         setAdminMemoryToken,
         activateAdminProfileSession,

@@ -339,6 +339,7 @@ export function MessagesView() {
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const draftInputRef = useRef<HTMLInputElement | null>(null);
+  const typingIdleTimerRef = useRef<number | null>(null);
 
   // Audio recording state
   const [isRecordingAudio, setIsRecordingAudio] = useState(false);
@@ -488,6 +489,7 @@ export function MessagesView() {
   const recipientBlocked = Boolean(
     recipient && (isUserBlocked(recipient.id) || (recipient.uid && isUserBlocked(recipient.uid)))
   );
+  const recipientTyping = isUserActivelyTyping(recipient);
 
   const activeThread = useMemo(() => {
     if (!selectedRecipientId) return undefined;
@@ -567,6 +569,10 @@ export function MessagesView() {
     setThreadSearchQuery('');
     setThreadSearchIdx(0);
     return () => {
+      if (typingIdleTimerRef.current) {
+        window.clearTimeout(typingIdleTimerRef.current);
+        typingIdleTimerRef.current = null;
+      }
       if (selectedRecipientId) {
         setTypingStatus(selectedRecipientId, false);
       }
@@ -578,6 +584,12 @@ export function MessagesView() {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
   }, [activeThread?.messages.length, threadSearchOpen]);
+
+  useEffect(() => {
+    if (recipientTyping && !threadSearchOpen) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [recipientTyping, threadSearchOpen]);
 
   useEffect(() => {
     if (
@@ -631,10 +643,26 @@ export function MessagesView() {
         }
       : {};
 
+  const clearTypingIdleTimer = () => {
+    if (typingIdleTimerRef.current) {
+      window.clearTimeout(typingIdleTimerRef.current);
+      typingIdleTimerRef.current = null;
+    }
+  };
+
   const handleDraftChange = (val: string) => {
     setDraft(val);
-    if (selectedRecipientId && !recipientBlocked) {
-      setTypingStatus(selectedRecipientId, val.trim().length > 0, activeThread?.id);
+    if (!selectedRecipientId || recipientBlocked) return;
+    const isActive = val.trim().length > 0;
+    setTypingStatus(selectedRecipientId, isActive, activeThread?.id);
+    clearTypingIdleTimer();
+    if (isActive) {
+      const targetRecipientId = selectedRecipientId;
+      const targetThreadId = activeThread?.id;
+      typingIdleTimerRef.current = window.setTimeout(() => {
+        typingIdleTimerRef.current = null;
+        setTypingStatus(targetRecipientId, false, targetThreadId);
+      }, 3000);
     }
   };
 
@@ -651,6 +679,7 @@ export function MessagesView() {
     setReplyingTo(null);
     setPendingAttachment(null);
     setMobileTrayOpen(false);
+    clearTypingIdleTimer();
     setTypingStatus(selectedRecipientId, false, activeThread?.id);
   };
 
@@ -1051,8 +1080,6 @@ export function MessagesView() {
     return null;
   }, [activeThread?.messages, currentUser.id, currentUser.uid]);
 
-  const recipientTyping = isUserActivelyTyping(recipient);
-
   const scrollToMessage = (msgId?: string) => {
     if (!msgId) return;
     const el = document.getElementById(`msg-${msgId}`);
@@ -1251,8 +1278,13 @@ export function MessagesView() {
                         Bloqueado · toque para gerenciar
                       </p>
                     ) : isTypingContact ? (
-                      <p className="truncate text-xs font-medium text-sky-600 dark:text-sky-400">
-                        Digitando...
+                      <p className="flex items-center gap-1.5 truncate text-xs font-medium text-sky-600 dark:text-sky-400">
+                        <span className="inline-flex items-center gap-0.5" aria-hidden="true">
+                          <span className="animate-typing-dot h-1 w-1 rounded-full bg-current [animation-delay:-0.3s]" />
+                          <span className="animate-typing-dot h-1 w-1 rounded-full bg-current [animation-delay:-0.15s]" />
+                          <span className="animate-typing-dot h-1 w-1 rounded-full bg-current" />
+                        </span>
+                        <span>Digitando...</span>
                       </p>
                     ) : (
                       <p
@@ -1322,8 +1354,13 @@ export function MessagesView() {
                         Usuário bloqueado
                       </p>
                     ) : recipientTyping ? (
-                      <p className="truncate text-[11px] font-medium text-sky-600 dark:text-sky-400">
-                        Digitando...
+                      <p className="flex items-center gap-1.5 truncate text-[11px] font-medium text-sky-600 dark:text-sky-400">
+                        <span className="inline-flex items-center gap-0.5" aria-hidden="true">
+                          <span className="animate-typing-dot h-1 w-1 rounded-full bg-current [animation-delay:-0.3s]" />
+                          <span className="animate-typing-dot h-1 w-1 rounded-full bg-current [animation-delay:-0.15s]" />
+                          <span className="animate-typing-dot h-1 w-1 rounded-full bg-current" />
+                        </span>
+                        <span>Digitando...</span>
                       </p>
                     ) : (
                       <p className="truncate text-[11px] text-zinc-500 dark:text-zinc-400">
@@ -1881,15 +1918,30 @@ export function MessagesView() {
               })}
 
               {/* Live Typing Bubble */}
-              {recipientTyping && (
-                <div className="flex items-start">
-                  <div className="inline-flex items-center gap-2 rounded-2xl bg-zinc-100 px-3.5 py-2 text-xs text-zinc-600 dark:bg-zinc-900 dark:text-zinc-300">
-                    <span className="flex items-center gap-1">
-                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-zinc-400 [animation-delay:-0.2s]" />
-                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-zinc-400 [animation-delay:-0.1s]" />
-                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-zinc-400" />
+              {recipientTyping && !recipientBlocked && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="flex items-end gap-2 pt-1"
+                >
+                  <img
+                    src={recipient.avatarUrl}
+                    alt=""
+                    aria-hidden="true"
+                    className="h-6 w-6 shrink-0 rounded-full border border-zinc-200 object-cover dark:border-zinc-800"
+                  />
+                  <div className="inline-flex items-center gap-2.5 rounded-2xl rounded-bl-md border border-zinc-200/80 bg-zinc-100 px-3.5 py-2.5 shadow-2xs dark:border-zinc-800 dark:bg-zinc-900">
+                    <span className="flex items-center gap-1" aria-hidden="true">
+                      <span className="animate-typing-dot h-1.5 w-1.5 rounded-full bg-sky-500 [animation-delay:-0.3s] dark:bg-sky-400" />
+                      <span className="animate-typing-dot h-1.5 w-1.5 rounded-full bg-sky-500 [animation-delay:-0.15s] dark:bg-sky-400" />
+                      <span className="animate-typing-dot h-1.5 w-1.5 rounded-full bg-sky-500 dark:bg-sky-400" />
                     </span>
-                    <span>Digitando...</span>
+                    <span className="text-xs font-medium text-zinc-600 dark:text-zinc-300">
+                      Digitando...
+                    </span>
+                    <span className="sr-only">
+                      {recipient.displayName} está digitando uma mensagem
+                    </span>
                   </div>
                 </div>
               )}
@@ -2169,6 +2221,7 @@ export function MessagesView() {
                         value={draft}
                         onChange={(e) => handleDraftChange(e.target.value)}
                         onBlur={() => {
+                          clearTypingIdleTimer();
                           if (selectedRecipientId) {
                             setTypingStatus(selectedRecipientId, false, activeThread?.id);
                           }

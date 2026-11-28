@@ -46,8 +46,24 @@
   animation: kenburns-slow 14s ease-in-out infinite;
 }
 
+@keyframes lumina-typing-dot {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.45;
+  }
+  30% {
+    transform: translateY(-3.5px);
+    opacity: 1;
+  }
+}
+
+.animate-typing-dot {
+  animation: lumina-typing-dot 1.15s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .animate-kenburns {
+  .animate-kenburns,
+  .animate-typing-dot {
     animation: none;
   }
 }

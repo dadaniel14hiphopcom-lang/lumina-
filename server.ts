@@ -235,7 +235,14 @@ let supabaseContentCache: {
 const deletedPostIds = new Set<string>();
 const typingStateMap = new Map<
   string,
-  { fromUserId: string; toUserId: string; threadId?: string; updatedAt: number }
+  {
+    fromUserId: string;
+    fromUid?: string;
+    toUserId: string;
+    toUid?: string;
+    threadId?: string;
+    updatedAt: number;
+  }
 >();
 
 let memoryUserBlocks: Record<string, string[]> | null = null;
@@ -1665,6 +1672,12 @@ async function startServer() {
         const parsed = JSON.parse(String(rawData || '')) as {
           type?: string;
           signal?: Record<string, unknown>;
+          fromUserId?: string;
+          fromUid?: string;
+          toUserId?: string;
+          toUid?: string;
+          threadId?: string;
+          isTyping?: boolean;
         };
         if (parsed?.type === 'call_signal' && parsed.signal && typeof parsed.signal === 'object') {
           const sig = parsed.signal;
@@ -1693,6 +1706,55 @@ async function startServer() {
           }
 
           enqueueCallSignalForUserIds(resolveCallRecipientIds(toId, toUid), sig);
+        } else if (parsed?.type === 'chat_typing') {
+          const fromUserId =
+            typeof parsed.fromUserId === 'string' ? parsed.fromUserId.trim().slice(0, 128) : '';
+          const fromUid =
+            typeof parsed.fromUid === 'string' ? parsed.fromUid.trim().slice(0, 128) : undefined;
+          const toUserId =
+            typeof parsed.toUserId === 'string' ? parsed.toUserId.trim().slice(0, 128) : '';
+          const toUid =
+            typeof parsed.toUid === 'string' ? parsed.toUid.trim().slice(0, 128) : undefined;
+          const threadId =
+            typeof parsed.threadId === 'string' ? parsed.threadId.trim().slice(0, 160) : undefined;
+          const isTyping = Boolean(parsed.isTyping);
+          if (!fromUserId || !toUserId) return;
+          if (
+            isUserBlockedPair(fromUserId, toUserId) ||
+            (toUid && isUserBlockedPair(fromUserId, toUid))
+          ) {
+            return;
+          }
+
+          const key = `${fromUserId}=>${toUserId}`;
+          if (isTyping) {
+            if (typingStateMap.size > 500) {
+              const cutoff = Date.now() - 4500;
+              for (const [k, v] of typingStateMap.entries()) {
+                if (v.updatedAt < cutoff) typingStateMap.delete(k);
+              }
+            }
+            typingStateMap.set(key, {
+              fromUserId,
+              fromUid,
+              toUserId,
+              toUid,
+              threadId,
+              updatedAt: Date.now(),
+            });
+          } else {
+            typingStateMap.delete(key);
+          }
+
+          sendRealtimeToUserIds(resolveCallRecipientIds(toUserId, toUid), {
+            type: 'chat_typing',
+            fromUserId,
+            ...(fromUid ? { fromUid } : {}),
+            toUserId,
+            ...(toUid ? { toUid } : {}),
+            ...(threadId ? { threadId } : {}),
+            isTyping,
+          });
         }
       } catch {
         // Ignore malformed client WS frame
@@ -1709,6 +1771,20 @@ async function startServer() {
         else anyStillConnected = true;
       }
       if (boundIds.length > 0 && !anyStillConnected) {
+        const boundSet = new Set(boundIds);
+        for (const [k, entry] of typingStateMap.entries()) {
+          if (boundSet.has(entry.fromUserId) || (entry.fromUid && boundSet.has(entry.fromUid))) {
+            typingStateMap.delete(k);
+            sendRealtimeToUserIds(resolveCallRecipientIds(entry.toUserId, entry.toUid), {
+              type: 'chat_typing',
+              fromUserId: entry.fromUserId,
+              ...(entry.fromUid ? { fromUid: entry.fromUid } : {}),
+              toUserId: entry.toUserId,
+              ...(entry.toUid ? { toUid: entry.toUid } : {}),
+              isTyping: false,
+            });
+          }
+        }
         const now = Date.now();
         const pres = setUserPresenceInSharedState(boundIds, false, now);
         broadcastRealtimeEvent({
@@ -3969,11 +4045,27 @@ async function startServer() {
           String(u.id || '') === match.userId ||
           (typeof u.username === 'string' && u.username.toLowerCase() === match.username.toLowerCase())
       );
+      const isMatchAdmin =
+        (match.email && match.email.toLowerCase() === ADMIN_EMAIL.toLowerCase()) ||
+        match.username.toLowerCase() === 'dadaniel14hiphop';
       if (matchedProfile) {
         const { email: _stripEmail, ...publicProfile } = matchedProfile;
-        res.json({ ok: true, userId: match.userId, username: match.username, user: publicProfile });
+        res.json({
+          ok: true,
+          userId: match.userId,
+          username: match.username,
+          email: match.email,
+          ...(isMatchAdmin ? { isAdmin: true, adminToken: signSessionToken() } : {}),
+          user: publicProfile,
+        });
       } else {
-        res.json({ ok: true, userId: match.userId, username: match.username });
+        res.json({
+          ok: true,
+          userId: match.userId,
+          username: match.username,
+          email: match.email,
+          ...(isMatchAdmin ? { isAdmin: true, adminToken: signSessionToken() } : {}),
+        });
       }
       return;
     }
@@ -4019,12 +4111,14 @@ async function startServer() {
               users: mergeSharedUsersList(shared.users, [sbLogin.user]),
             });
           }
+          const isSbAdmin = resolvedEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase();
           res.json({
             ok: true,
             userId: resolvedId,
             username: resolvedUsername,
             displayName: sbLogin.displayName,
             email: resolvedEmail,
+            ...(isSbAdmin ? { isAdmin: true, adminToken: signSessionToken() } : {}),
             user: sbLogin.user,
           });
           return;
@@ -4729,7 +4823,17 @@ async function startServer() {
       updatedAt: Date.now(),
       threads: nextThreads,
     });
-    typingStateMap.delete(`${senderId}=>${recipientId}`);
+    const senderResolvedSet = new Set(resolveCallRecipientIds(senderId));
+    const recipientResolvedIds = resolveCallRecipientIds(recipientId);
+    const recipientResolvedSet = new Set(recipientResolvedIds);
+    for (const [k, entry] of typingStateMap.entries()) {
+      if (
+        (senderResolvedSet.has(entry.fromUserId) || (entry.fromUid && senderResolvedSet.has(entry.fromUid))) &&
+        (recipientResolvedSet.has(entry.toUserId) || (entry.toUid && recipientResolvedSet.has(entry.toUid)))
+      ) {
+        typingStateMap.delete(k);
+      }
+    }
 
     const adminState = readAdminState();
     let synced = false;
@@ -4773,7 +4877,7 @@ async function startServer() {
         synced = await upsertMessageToSupabase(adminState.supabase, msgPayload);
       }
     }
-    sendRealtimeToUserIds([recipientId], {
+    sendRealtimeToUserIds(recipientResolvedIds, {
       type: 'chat_message',
       threadId,
       senderId,
@@ -4939,14 +5043,26 @@ async function startServer() {
   app.post('/api/social/typing', express.json({ limit: '8kb' }), (req, res) => {
     const fromUserId =
       typeof req.body?.fromUserId === 'string' ? req.body.fromUserId.trim().slice(0, 128) : '';
+    const fromUid =
+      typeof req.body?.fromUid === 'string' ? req.body.fromUid.trim().slice(0, 128) : undefined;
     const toUserId =
       typeof req.body?.toUserId === 'string' ? req.body.toUserId.trim().slice(0, 128) : '';
+    const toUid =
+      typeof req.body?.toUid === 'string' ? req.body.toUid.trim().slice(0, 128) : undefined;
     const threadId =
       typeof req.body?.threadId === 'string' ? req.body.threadId.trim().slice(0, 160) : undefined;
     const isTyping = Boolean(req.body?.isTyping);
 
     if (!fromUserId || !toUserId) {
       res.status(400).json({ error: 'Parâmetros de digitação inválidos.' });
+      return;
+    }
+
+    if (
+      isUserBlockedPair(fromUserId, toUserId) ||
+      (toUid && isUserBlockedPair(fromUserId, toUid))
+    ) {
+      res.json({ ok: true });
       return;
     }
 
@@ -4960,7 +5076,9 @@ async function startServer() {
       }
       typingStateMap.set(key, {
         fromUserId,
+        fromUid,
         toUserId,
+        toUid,
         threadId,
         updatedAt: Date.now(),
       });
@@ -4968,10 +5086,13 @@ async function startServer() {
       typingStateMap.delete(key);
     }
 
-    sendRealtimeToUserIds([toUserId], {
+    sendRealtimeToUserIds(resolveCallRecipientIds(toUserId, toUid), {
       type: 'chat_typing',
       fromUserId,
+      ...(fromUid ? { fromUid } : {}),
       toUserId,
+      ...(toUid ? { toUid } : {}),
+      ...(threadId ? { threadId } : {}),
       isTyping,
     });
 
@@ -4994,8 +5115,10 @@ async function startServer() {
         typingStateMap.delete(k);
         continue;
       }
-      if (myIds.size === 0 || myIds.has(entry.toUserId)) {
+      const targetIds = resolveCallRecipientIds(entry.toUserId, entry.toUid);
+      if (myIds.size === 0 || targetIds.some((id) => myIds.has(id))) {
         typingFromIds.push(entry.fromUserId);
+        if (entry.fromUid) typingFromIds.push(entry.fromUid);
       }
     }
     res.json({ ok: true, typingFromIds: Array.from(new Set(typingFromIds)) });
@@ -5484,7 +5607,23 @@ Este pacote dá controle total da infraestrutura ao administrador:
     process.env.NODE_ENV === 'production' || (!isExplicitDev && hasDistBuild);
 
   if (shouldServeStaticDist) {
-    app.use(express.static(distDir, { index: false, maxAge: '1h' }));
+    app.use(
+      express.static(distDir, {
+        index: false,
+        maxAge: '1h',
+        setHeaders: (res, filePath) => {
+          if (
+            filePath.endsWith(`${path.sep}sw.js`) ||
+            filePath.endsWith(`${path.sep}registerSW.js`)
+          ) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+          } else if (filePath.endsWith('.webmanifest')) {
+            res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache');
+          }
+        },
+      })
+    );
     app.get('*', (req, res) => {
       if (!fs.existsSync(distIndexPath)) {
         res.status(503).send('Build de produção ausente. Execute npm run build.');

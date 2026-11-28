@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Settings,
   Share2,
+  Shield,
   Sun,
   Upload,
   X,
@@ -60,6 +61,7 @@ export function ProfileView() {
     logout,
     openAuthModal,
     cloudConnected,
+    isExclusiveAdmin,
     loginWithGoogle,
     hasPasswordForCurrentUser,
     changePassword,
@@ -478,6 +480,16 @@ export function ProfileView() {
 
             {isOwnProfile ? (
               <div className="flex flex-wrap items-center gap-2">
+                {isExclusiveAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveNav('admin')}
+                    className="inline-flex h-9 items-center gap-1.5 whitespace-nowrap rounded-lg bg-zinc-950 px-3.5 text-xs font-semibold text-white hover:bg-zinc-800 dark:bg-white dark:text-zinc-950 dark:hover:bg-zinc-200"
+                  >
+                    <Shield className="h-3.5 w-3.5" />
+                    <span>Painel Admin</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => openEditModal('profile')}

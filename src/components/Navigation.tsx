@@ -13,10 +13,10 @@ import {
   Sun,
 } from 'lucide-react';
 import { useSocial } from '../context/SocialContext';
-import { ADMIN_EMAIL, isExclusiveAdminUser } from '../lib/firebase';
 import { NavSection } from '../types';
 import { AvatarRing } from './AvatarRing';
 import { GlobalSearchBar } from './GlobalSearchBar';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface NavigationProps {
   onOpenCreate: () => void;
@@ -32,14 +32,12 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
     theme,
     toggleTheme,
     isAuthenticated,
-    firebaseUser,
+    isExclusiveAdmin,
     logout,
     openAuthModal,
   } = useSocial();
 
-  const canSeeAdminNav =
-    isExclusiveAdminUser(firebaseUser) ||
-    (isAuthenticated && currentUser.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase());
+  const canSeeAdminNav = isExclusiveAdmin;
 
   const myIds = new Set([currentUser.id, currentUser.uid || ''].filter(Boolean));
 
@@ -77,7 +75,7 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
   return (
     <>
       {/* Desktop Left Sidebar Rail */}
-      <aside className="fixed inset-y-0 left-0 z-30 hidden w-20 flex-col justify-between border-r border-zinc-200 bg-white px-3 py-6 dark:border-zinc-800/80 dark:bg-[#050505] lg:flex xl:w-64 xl:px-4">
+      <aside className="fixed inset-y-0 left-0 z-30 hidden w-20 flex-col justify-between gap-4 overflow-y-auto border-r border-zinc-200 bg-white px-3 py-6 dark:border-zinc-800/80 dark:bg-[#050505] lg:flex xl:w-64 xl:px-4">
         <div className="space-y-4">
           {/* Brand Wordmark */}
           <button
@@ -191,6 +189,8 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
             </button>
           )}
 
+          <PWAInstallButton />
+
           <div
             role="group"
             aria-label="Seletor de tema"
@@ -244,34 +244,36 @@ export function Navigation({ onOpenCreate }: NavigationProps) {
       </aside>
 
       {/* Mobile Compact Top Header (<= 52px) */}
-      <header className="sticky top-0 z-30 flex h-13 shrink-0 items-center justify-between border-b border-zinc-200 bg-white/95 px-4 backdrop-blur-md dark:border-zinc-800/80 dark:bg-[#050505]/95 lg:hidden">
+      <header className="sticky top-0 z-30 flex h-13 shrink-0 items-center justify-between gap-2 border-b border-zinc-200 bg-white/95 px-3 backdrop-blur-md dark:border-zinc-800/80 dark:bg-[#050505]/95 sm:px-4 lg:hidden">
         <button
           type="button"
           onClick={() => setActiveNav('feed')}
-          className="flex items-center gap-2"
+          className="flex min-w-0 items-center gap-2"
         >
-          <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-tr from-amber-500 via-rose-500 to-fuchsia-600 text-white">
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-tr from-amber-500 via-rose-500 to-fuchsia-600 text-white">
             <Camera className="h-4 w-4" />
           </span>
-          <span className="font-display text-lg font-bold tracking-tight text-zinc-950 dark:text-white">
+          <span className="font-display truncate text-lg font-bold tracking-tight text-zinc-950 dark:text-white">
             Lumina
           </span>
         </button>
 
-        <div className="flex items-center gap-0.5">
+        <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
           <GlobalSearchBar mode="mobile" />
           {canSeeAdminNav && (
             <button
               type="button"
               onClick={() => setActiveNav('admin')}
               aria-label="Painel Admin"
-              className={`flex h-11 w-11 items-center justify-center rounded-full transition-colors ${
+              title="Painel Admin"
+              className={`inline-flex h-9 items-center gap-1 rounded-lg px-2 text-xs font-semibold transition-colors ${
                 activeNav === 'admin'
-                  ? 'bg-zinc-100 text-zinc-950 dark:bg-zinc-900 dark:text-white'
-                  : 'text-zinc-800 dark:text-zinc-200'
+                  ? 'bg-zinc-950 text-white dark:bg-white dark:text-zinc-950'
+                  : 'border border-zinc-200 bg-zinc-50 text-zinc-900 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800'
               }`}
             >
-              <Shield className="h-5 w-5" />
+              <Shield className="h-4 w-4 shrink-0" />
+              <span className="hidden sm:inline">Admin</span>
             </button>
           )}
 

@@ -3,7 +3,15 @@ import type { CallSignalPayload } from '../types';
 export type RealtimeServerEvent =
   | { type: 'call_signal'; signal: CallSignalPayload }
   | { type: 'chat_message'; threadId: string; senderId: string; recipientId: string }
-  | { type: 'chat_typing'; fromUserId: string; toUserId: string; isTyping: boolean }
+  | {
+      type: 'chat_typing';
+      fromUserId: string;
+      fromUid?: string;
+      toUserId: string;
+      toUid?: string;
+      threadId?: string;
+      isTyping: boolean;
+    }
   | { type: 'chat_read'; threadId: string; readerIds: string[] }
   | { type: 'social_update'; scope: 'posts' | 'stories' | 'users' | 'all'; updatedAt?: number }
   | { type: 'site_meta_update'; updatedAt?: number }
